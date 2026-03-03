@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "podrun"
+dynamic = ["version"]
+description = "A podman run superset with host identity overlays."
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    { name = "Kyle Schwab" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Utilities",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-xdist>=3.0",
+    "filelock",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "shellcheck-py",
+    "vulture",
+]
+
+[project.urls]
+Homepage = "https://github.com/kschwab/podrun"
+
+[project.scripts]
+podrun = "podrun:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "podrun.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--dist loadscope --cov=podrun --cov-report=term-missing"
+markers = [
+    "live: live container integration tests (require podman)",
+    "devcontainer: devcontainer CLI integration tests (require devcontainer + podman)",
+]
+
+[tool.coverage.run]
+source = ["podrun"]
+omit = ["*/test*"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+include = ["podrun/podrun.py"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["C901"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true

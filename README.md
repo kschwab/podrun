@@ -224,6 +224,7 @@ directory (searching upward). Supported fields:
             "autoAttach": true,
             "autoReplace": false,
             "exports": ["/opt/sdk/bin:./local-sdk"],
+            "fuseOverlayfs": false,
             "configScript": "/path/to/config.sh",
             "podmanArgs": [
                 "--memory=4g",
@@ -328,6 +329,42 @@ Podrun maintains a static set of podman value flags to correctly parse
 mixed argument lists. Use `--check-flags` to compare the static set against
 your installed podman version and identify any flags that need updating.
 
+### Fuse-Overlayfs
+
+Rootless podman uses `--userns=keep-id` to map the host user identity into
+the container. On kernels that support native overlay idmap
+(`CONFIG_OVERLAY_FS_IDMAP`, added in kernel 5.19), this is instant. On older
+or custom kernels that lack this feature, podman falls back to creating an
+ID-mapped copy of every image layer — which can hang for minutes on large
+images.
+
+The `--fuse-overlayfs` flag tells podrun to use
+[fuse-overlayfs](https://github.com/containers/fuse-overlayfs) as the overlay
+mount program. Fuse-overlayfs handles UID remapping at the FUSE level,
+bypassing the kernel limitation entirely.
+
+**When to use this flag:**
+
+- Container creation hangs or is extremely slow with `--user-overlay` (or any
+  overlay that implies it) on large images
+- Your kernel is older than 5.19 or lacks `CONFIG_OVERLAY_FS_IDMAP`
+- `fuse-overlayfs` is installed on the host (`/usr/bin/fuse-overlayfs`)
+
+**Performance implications:**
+
+- **Container filesystem I/O** (reads/writes within the image layers):
+  ~0-5% overhead compared to native overlay. Negligible for most workloads.
+- **Bind mount I/O** (host-mounted volumes via `-v`): **zero overhead**.
+  Bind mounts go directly through the kernel VFS and bypass FUSE entirely.
+  Simulation workloads that operate on mounted host directories see identical
+  performance with or without fuse-overlayfs.
+- **Overlay volume mounts (`:O`):** fuse-overlayfs can only overlay
+  directories, not individual files. When `--fuse-overlayfs` is enabled,
+  podrun automatically converts `:O` to `:ro` for single-file volume mounts
+  (e.g. `-v=~/.gitconfig:/home/user/.gitconfig:O` becomes
+  `-v=~/.gitconfig:/home/user/.gitconfig:ro`). Directory `:O` mounts are
+  unaffected.
+
 ### Podman Local Storage (Podrun Store)
 
 `podrun store init` creates a venv-style project-local podrun store with
@@ -419,7 +456,7 @@ The `-n` flag controls both parallelism and test scope:
 | `-n3` | alpine + ubuntu + fedora | excluded | full parallel coverage |
 
 ```bash
-python3 -m pytest tests/ -v         # full suite (serial, all images + lint)
+python3 -m pytest tests/ -n0 -v     # full suite (serial, all images + lint)
 python3 -m pytest tests/ -n1 -v     # smoke (alpine only, no lint)
 python3 -m pytest tests/ -n3 -v     # full parallel (all images, no lint)
 ```
@@ -494,6 +531,7 @@ frequent with parallel execution (`-n3`) due to shared podman infrastructure
 | `--config PATH` | Explicit path to devcontainer.json |
 | `--no-devconfig` | Skip devcontainer.json discovery |
 | `--config-script PATH` | Run script and inline its stdout as args |
+| `--fuse-overlayfs` | Use fuse-overlayfs for overlay mounts (see [Fuse-Overlayfs](#fuse-overlayfs)) |
 | `--check-flags` | Diff static podman flags against installed podman |
 | `--completion SHELL` | Generate shell completion script (`bash`, `zsh`, `fish`) and exit |
 | `--version` | Show version and exit |

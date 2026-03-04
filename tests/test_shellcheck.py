@@ -117,8 +117,7 @@ class TestShellcheckWrapperScripts:
             '#!/bin/sh\nexec /usr/bin/podman'
             ' --root /store/graphroot'
             ' --runroot /store/runroot'
-            ' --storage-driver overlay'
-            ' --storage-opt overlay.ignore_chown_errors=true "$@"\n'
+            ' --storage-driver overlay "$@"\n'
         )
         result = _run_shellcheck(str(wrapper), shell=dialect)
         assert result.returncode == 0, f'shellcheck ({dialect}) errors:\n{result.stdout}'
@@ -130,8 +129,7 @@ class TestShellcheckWrapperScripts:
             '#!/bin/sh\nexec /usr/bin/python3 -m podrun'
             ' --root /store/graphroot'
             ' --runroot /store/runroot'
-            ' --storage-driver overlay'
-            ' --storage-opt overlay.ignore_chown_errors=true "$@"\n'
+            ' --storage-driver overlay "$@"\n'
         )
         result = _run_shellcheck(str(wrapper), shell=dialect)
         assert result.returncode == 0, f'shellcheck ({dialect}) errors:\n{result.stdout}'

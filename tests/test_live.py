@@ -595,10 +595,10 @@ class TestAutoAttach:
     def test_auto_attach_rejects_non_overlay_container(
         self, distro_image, podman_run, podman_env, podman_store_flags, container_name
     ):
-        """auto-attach to a container created without overlay should error.
+        """auto-attach to a stopped container created without overlay → warns, exits 0.
 
         Reproduces: podrun run --auto-attach alpine → exits →
-                    podrun run --adhoc --auto-attach alpine → should fail.
+                    podrun run --auto-attach alpine → can't attach (non-running).
         """
         name = container_name('podrun-test-autoattach-nooverlay')
         # Step 1: Create a bare container (no overlay) via podrun
@@ -608,15 +608,15 @@ class TestAutoAttach:
             podman_store_flags=podman_store_flags,
         )
         try:
-            # Container is now in Exited state, created without podrun overlay.
-            # Step 2: Try auto-attach — should be rejected by overlay guard
+            # Container is now in Exited state. auto-attach warns (non-running).
             result = _run_podrun(
                 ['--auto-attach', f'--name={name}', distro_image],
                 podman_env,
                 podman_store_flags=podman_store_flags,
             )
-            assert result.returncode != 0, f'Expected error, got: {result.stdout}'
-            assert 'not created with podrun user overlay' in result.stderr
+            assert result.returncode == 0
+            assert 'Cannot auto-attach' in result.stderr
+            assert 'non-running' in result.stderr
         finally:
             podman_run(['rm', '-f', '-t', '0', name])
 
@@ -688,11 +688,11 @@ class TestAutoAttach:
     def test_adhoc_auto_attach_rejects_bare_container(
         self, distro_image, podman_run, podman_env, podman_store_flags, container_name
     ):
-        """The exact user scenario: run bare → run --adhoc --auto-attach → error.
+        """The exact user scenario: run bare → run --adhoc --auto-attach → warns, exits 0.
 
         ``podrun run --auto-attach alpine`` creates alpine-latest (no overlay).
         ``podrun run --adhoc --auto-attach alpine`` finds the stopped container
-        and should refuse to attach because exec-entrypoint.sh is missing.
+        and warns that it can't attach (non-running state).
         """
         name = container_name('podrun-test-adhoc-bare')
         # Step 1: Bare run (no overlay, exits immediately) via podrun
@@ -702,15 +702,15 @@ class TestAutoAttach:
             podman_store_flags=podman_store_flags,
         )
         try:
-            # Step 2: --adhoc --auto-attach should fail the overlay guard
+            # Step 2: --adhoc --auto-attach warns (non-running), exits 0
             result = _run_podrun(
                 ['--adhoc', '--auto-attach', f'--name={name}', distro_image],
                 podman_env,
                 podman_store_flags=podman_store_flags,
             )
-            assert result.returncode != 0, f'Expected error, got: {result.stdout}'
-            assert 'not created with podrun user overlay' in result.stderr
-            assert '--auto-replace' in result.stderr
+            assert result.returncode == 0
+            assert 'Cannot auto-attach' in result.stderr
+            assert 'non-running' in result.stderr
         finally:
             podman_run(['rm', '-f', '-t', '0', name])
 
@@ -2043,10 +2043,11 @@ class TestContainerLifecycleEndToEnd:
         finally:
             podman_run(['rm', '-f', '-t', '0', name])
 
-    def test_start_stopped_prints_exec(
+    def test_stopped_auto_attach_warns(
         self, distro_image, podman_run, podman_env, podman_store_flags, container_name
     ):
-        name = container_name('podrun-test-start-stopped')
+        """Stopped + --auto-attach → warns can't attach, exits 0."""
+        name = container_name('podrun-test-stopped-warn')
         _start_detached(distro_image, podman_env, podman_store_flags, name=name)
         podman_run(['stop', '-t', '0', name])
         try:
@@ -2056,7 +2057,7 @@ class TestContainerLifecycleEndToEnd:
                 podman_store_flags=podman_store_flags,
             )
             assert result.returncode == 0, f'stderr: {result.stderr}'
-            assert 'exec' in result.stdout
+            assert 'cannot auto-attach' in result.stderr.lower()
         finally:
             podman_run(['rm', '-f', '-t', '0', name])
 
@@ -2079,11 +2080,11 @@ class TestContainerLifecycleEndToEnd:
         finally:
             podman_run(['rm', '-f', '-t', '0', name])
 
-    def test_auto_attach_wins_over_auto_replace(
+    def test_stopped_both_flags_replace_wins(
         self, distro_image, podman_run, podman_env, podman_store_flags, container_name
     ):
-        """When both --auto-attach and --auto-replace are set, attach wins."""
-        name = container_name('podrun-test-attach-wins-replace')
+        """Stopped + both --auto-attach and --auto-replace → can't attach, falls through to replace (prints run)."""
+        name = container_name('podrun-test-replace-wins')
         _start_detached(distro_image, podman_env, podman_store_flags, name=name)
         podman_run(['stop', '-t', '0', name])
         try:
@@ -2100,7 +2101,8 @@ class TestContainerLifecycleEndToEnd:
                 podman_store_flags=podman_store_flags,
             )
             assert result.returncode == 0, f'stderr: {result.stderr}'
-            assert 'exec' in result.stdout
+            assert 'cannot auto-attach' in result.stderr.lower()
+            assert 'run' in result.stdout
         finally:
             podman_run(['rm', '-f', '-t', '0', name])
 

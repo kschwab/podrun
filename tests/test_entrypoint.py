@@ -121,7 +121,6 @@ class TestGenerateEntrypoint:
         with open(path) as f:
             content = f.read()
         assert 'zsh' in content
-        assert 'configured default shell' in content
 
     def test_caps_in_content(self, make_config, podrun_tmp):
         config = make_config(

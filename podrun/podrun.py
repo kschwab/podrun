@@ -23,7 +23,7 @@ A podman run superset with host identity overlays.
 #  2. MINOR version when you add functionality in a backwards compatible manner
 #  3. PATCH version when you make backwards compatible bug fixes
 # Additional labels for pre-release and build metadata are available as extensions to the MAJOR.MINOR.PATCH format.
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 __title__ = 'podrun'
 __uri__ = 'https://github.com/kschwab/podrun'
 __author__ = 'Kyle Schwab'
@@ -260,6 +260,7 @@ class Config:
     passthrough_args: List[str] = dataclasses.field(default_factory=list)
     exports: List[str] = dataclasses.field(default_factory=list)
     podman_path: Optional[str] = dataclasses.field(default_factory=lambda: shutil.which('podman'))
+    fuse_overlayfs: bool = False
 
     def resolve(self):
         """Sort set-like lists so downstream output is deterministic.
@@ -308,13 +309,17 @@ def yes_no_prompt(prompt_msg: str, answer_default: bool, is_interactive: bool) -
     answer_default_str = 'yes' if answer_default else 'no'
     prompt_str = f'{prompt_msg} [{prompt_default}]: '
     if is_interactive:
-        answer = input(prompt_str).lower() or answer_default_str
+        sys.stderr.write(prompt_str)
+        sys.stderr.flush()
+        answer = input().lower() or answer_default_str
     else:
         answer = answer_default_str
-        print(f'{prompt_str}{answer}')
+        print(f'{prompt_str}{answer}', file=sys.stderr)
     while answer[:1] not in ['y', 'n']:
-        print('Please answer yes or no...')
-        answer = input(prompt_str).lower() or answer_default_str
+        print('Please answer yes or no...', file=sys.stderr)
+        sys.stderr.write(prompt_str)
+        sys.stderr.flush()
+        answer = input().lower() or answer_default_str
     return answer[:1] == 'y'
 
 
@@ -360,9 +365,22 @@ def _print_version(podman_path):
 def find_devcontainer_json(start_dir=None):
     start = pathlib.Path(start_dir) if start_dir else pathlib.Path.cwd()
     for path in [start, *start.parents]:
+        # 1. Standard location
         candidate = path / '.devcontainer' / 'devcontainer.json'
         if candidate.exists():
             return candidate
+        # 2. Root-level shorthand
+        candidate = path / '.devcontainer.json'
+        if candidate.exists():
+            return candidate
+        # 3. Named configurations (.devcontainer/<subfolder>/devcontainer.json)
+        devcontainer_dir = path / '.devcontainer'
+        if devcontainer_dir.is_dir():
+            for child in sorted(devcontainer_dir.iterdir()):
+                if child.is_dir():
+                    candidate = child / 'devcontainer.json'
+                    if candidate.exists():
+                        return candidate
     return None
 
 
@@ -409,7 +427,19 @@ def _strip_jsonc(text: str) -> str:
 def parse_devcontainer_json(path):
     if path is None:
         return {}
-    text = pathlib.Path(path).read_text()
+    p = pathlib.Path(path)
+    if p.is_dir():
+        # Check for devcontainer.json directly inside the given directory first,
+        # then fall back to full spec discovery rooted at that directory.
+        candidate = p / 'devcontainer.json'
+        if candidate.exists():
+            p = candidate
+        else:
+            p = find_devcontainer_json(p)
+            if p is None:
+                print(f'Error: no devcontainer.json found under {path}', file=sys.stderr)
+                sys.exit(1)
+    text = p.read_text()
     return json.loads(_strip_jsonc(text))
 
 
@@ -1346,10 +1376,7 @@ def _store_init(args, podman_path):
     python_link.symlink_to(sys.executable)
 
     store_flags = (
-        f' --root "{graphroot}"'
-        f' --runroot "{runroot_target}"'
-        f' --storage-driver "{storage_driver}"'
-        f' --storage-opt overlay.ignore_chown_errors=true'
+        f' --root "{graphroot}" --runroot "{runroot_target}" --storage-driver "{storage_driver}"'
     )
 
     # bin/podman wrapper
@@ -1357,9 +1384,13 @@ def _store_init(args, podman_path):
     podman_wrapper.write_text(f'#!/bin/sh\nexec "{podman_path}"{store_flags} "$@"\n')
     podman_wrapper.chmod(0o755)
 
-    # bin/podrun wrapper
+    # bin/podrun wrapper — resolve the path to this script so the wrapper
+    # works regardless of whether podrun was invoked as a module or script.
+    podrun_script = str(pathlib.Path(__file__).resolve())
     podrun_wrapper = bin_dir / 'podrun'
-    podrun_wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m podrun{store_flags} "$@"\n')
+    podrun_wrapper.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{podrun_script}"{store_flags} "$@"\n'
+    )
     podrun_wrapper.chmod(0o755)
 
     # Optional registries.conf
@@ -1663,6 +1694,13 @@ def _build_parser():
         action='store_true',
         default=False,
         help='Skip devcontainer.json discovery (--config-script still applies)',
+    )
+    parser.add_argument(
+        '--fuse-overlayfs',
+        action='store_true',
+        default=None,
+        help='Use fuse-overlayfs for overlay mounts (avoids ID-mapped '
+        'layer copy on kernels without native overlay idmap support)',
     )
     parser.add_argument(
         '--config-script',
@@ -1971,6 +2009,7 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
         passthrough_args=passthrough_args,
         exports=exports,
         podman_path=podman_path or shutil.which('podman'),
+        fuse_overlayfs=_first(cli_args.fuse_overlayfs, podrun_cfg.get('fuseOverlayfs'), False),
     )
 
 
@@ -2031,16 +2070,20 @@ def handle_container_state(  # noqa: C901 — inherent state×config decision tr
             return 'replace'
         return None
 
-    # stopped
+    # non-running — cannot attach to a non-running container (no exec target).
+    # Warn if auto_attach was requested, then fall through to replace logic.
     if auto_attach:
-        return 'start'
+        print(
+            f'Warning: Cannot auto-attach to container {name!r} when in non-running state',
+            file=sys.stderr,
+        )
     if auto_replace:
         return 'replace'
-    if is_interactive:
-        if yes_no_prompt('Start and attach to stopped instance?', True, is_interactive):
-            return 'start'
-        if yes_no_prompt('Replace stopped instance?', False, is_interactive):
-            return 'replace'
+    # Both explicitly set and non-interactive -- don't replace
+    if auto_attach is False and auto_replace is False and not is_interactive:
+        return None
+    if yes_no_prompt('Replace stopped instance?', False, is_interactive):
+        return 'replace'
     return None
 
 
@@ -2160,11 +2203,12 @@ def generate_run_entrypoint(config: Config) -> str:
 
         # Create home directory and populate from /etc/skel
         # (requires CAP_DAC_OVERRIDE for /etc/skel access, CAP_CHOWN for ownership)
+        # Uses -xdev to skip bind-mounted files/dirs (different filesystem).
         mkdir -p /home/{UNAME}
         if [ -d /etc/skel ]; then
           cp -a /etc/skel/. /home/{UNAME}/ 2>/dev/null || true
         fi
-        chown -R {UID}:{GID} /home/{UNAME}
+        find /home/{UNAME} -xdev -exec chown {UID}:{GID} {{}} + 2>/dev/null || true
 
         # Opportunistic sudo setup (requires CAP_DAC_OVERRIDE to write sudoers)
         if command -v sudo > /dev/null 2>&1; then
@@ -2201,9 +2245,9 @@ def generate_run_entrypoint(config: Config) -> str:
         # Drop from both inheritable and ambient sets so effective caps
         # are cleared after exec (ambient caps drive effective in userns).
         if command -v setpriv > /dev/null 2>&1; then
-          _drop="{','.join('-' + c.removeprefix('CAP_').lower() for c in caps_to_drop)}"
+          _drop="{','.join('-' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}"
           if ! setpriv --inh-caps="$_drop" --ambient-caps="$_drop" true 2>/dev/null; then
-            _drop="{','.join('-cap_' + c.removeprefix('CAP_').lower() for c in caps_to_drop)}"
+            _drop="{','.join('-cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}"
           fi
           if [ $# -eq 0 ]; then
             exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" $SHELL
@@ -2215,7 +2259,7 @@ def generate_run_entrypoint(config: Config) -> str:
           # --drop removes from bounding.
           _capsh_args=""
           # shellcheck disable=SC2043
-          for _cap in {' '.join('cap_' + c.removeprefix('CAP_').lower() for c in caps_to_drop)}; do
+          for _cap in {' '.join('cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}; do
             _capsh_args="$_capsh_args --delamb=$_cap --drop=$_cap"
           done
           # shellcheck disable=SC2086
@@ -2778,16 +2822,24 @@ def _main_run(config, global_flags=None):  # noqa: C901 — linear pipeline with
         )
         sys.exit(1)
 
-    # Container state management
+    # Container state management.
+    # --print-cmd allows prompts so the printed command reflects the user's choice.
+    # None bypasses the 'is False' guard to reach the prompt path; non-interactive
+    # prompts use defaults (attach for running, start for stopped).
+    if config.print_cmd and not config.auto_attach and not config.auto_replace:
+        config = dataclasses.replace(config, auto_attach=None, auto_replace=None)
     action = handle_container_state(config, global_flags=gf, podman_path=config.podman_path)
     if action is None:
         sys.exit(0)
     pm = shlex.quote(config.podman_path)
     gf_str = ' '.join(shlex.quote(f) for f in gf) + ' ' if gf else ''
+    replace_rm_cmd = None
     if action == 'replace':
-        run_os_cmd(f'{pm} {gf_str}rm -f {shlex.quote(config.name)}')
+        replace_rm_cmd = f'{pm} {gf_str}rm -f {shlex.quote(config.name)}'
+        if not config.print_cmd:
+            run_os_cmd(replace_rm_cmd)
         action = 'run'
-    if action in ('start', 'attach'):
+    if action == 'attach':
         container_workdir, container_overlays = query_container_info(
             config.name, global_flags=gf, podman_path=config.podman_path
         )
@@ -2800,10 +2852,6 @@ def _main_run(config, global_flags=None):  # noqa: C901 — linear pipeline with
                 file=sys.stderr,
             )
             sys.exit(1)
-    if action == 'start':
-        run_os_cmd(f'{pm} {gf_str}start {shlex.quote(config.name)}')
-        action = 'attach'
-    if action == 'attach':
         cmd = (
             [config.podman_path]
             + gf
@@ -2828,8 +2876,38 @@ def _main_run(config, global_flags=None):  # noqa: C901 — linear pipeline with
         run_os_cmd(f'find {PODRUN_TMP} -mtime +1 -delete 2>/dev/null')
 
     podman_args = build_podman_args(config, entrypoint_path, rc_path, exec_entry_path)
+
+    # fuse-overlayfs: inject --storage-opt when enabled and available.
+    if config.fuse_overlayfs:
+        fuse_path = shutil.which('fuse-overlayfs')
+        if fuse_path:
+            gf = gf + ['--storage-opt', f'overlay.mount_program={fuse_path}']
+        else:
+            print(
+                'Error: --fuse-overlayfs requested but fuse-overlayfs not found in PATH',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # fuse-overlayfs cannot overlay single files — only directories.
+        # Convert :O to :ro for file-type volume mounts.
+        converted = []
+        for arg in podman_args:
+            m = re.match(r'^(-v=|--volume=)(.+)$', arg)
+            if not m:
+                converted.append(arg)
+                continue
+            prefix, spec = m.group(1), m.group(2)
+            parts = spec.split(':')
+            if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
+                parts[-1] = 'ro'
+            converted.append(prefix + ':'.join(parts))
+        podman_args = converted
+
     cmd = [config.podman_path] + gf + podman_args
     if config.print_cmd:
+        if replace_rm_cmd:
+            print(replace_rm_cmd)
         print(shlex.join(cmd))
         sys.exit(0)
     os.execvpe(config.podman_path, cmd, os.environ.copy())

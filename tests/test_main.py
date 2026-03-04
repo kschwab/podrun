@@ -150,6 +150,128 @@ class TestMain:
         assert '/no/such/podman' in err
 
 
+class TestFuseOverlayfsInjection:
+    """Test --fuse-overlayfs injects --storage-opt into the podman command."""
+
+    def test_fuse_overlayfs_injects_storage_opt(self, mock_run_os_cmd, capsys, monkeypatch):
+        """--fuse-overlayfs with fuse-overlayfs in PATH → --storage-opt in command."""
+        mock_run_os_cmd.set_return(returncode=1)
+        _real_which = podrun_mod.shutil.which
+        monkeypatch.setattr(
+            podrun_mod.shutil,
+            'which',
+            lambda x: '/usr/bin/fuse-overlayfs' if x == 'fuse-overlayfs' else _real_which(x),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--fuse-overlayfs', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert '--storage-opt' in out
+        assert 'overlay.mount_program=/usr/bin/fuse-overlayfs' in out
+
+    def test_fuse_overlayfs_not_found_errors(self, mock_run_os_cmd, capsys, monkeypatch):
+        """--fuse-overlayfs without fuse-overlayfs in PATH → error exit."""
+        mock_run_os_cmd.set_return(returncode=1)
+        _real_which = podrun_mod.shutil.which
+        monkeypatch.setattr(
+            podrun_mod.shutil,
+            'which',
+            lambda x: None if x == 'fuse-overlayfs' else _real_which(x),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--fuse-overlayfs', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--fuse-overlayfs requested but fuse-overlayfs not found' in err
+
+    def test_fuse_overlayfs_storage_opt_before_run_args(self, mock_run_os_cmd, capsys, monkeypatch):
+        """--storage-opt from fuse-overlayfs appears as a global flag (before 'run')."""
+        mock_run_os_cmd.set_return(returncode=1)
+        _real_which = podrun_mod.shutil.which
+        monkeypatch.setattr(
+            podrun_mod.shutil,
+            'which',
+            lambda x: '/usr/bin/fuse-overlayfs' if x == 'fuse-overlayfs' else _real_which(x),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--fuse-overlayfs', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        parts = capsys.readouterr().out.strip().split()
+        storage_opt_idx = parts.index('--storage-opt')
+        run_idx = parts.index('run')
+        assert storage_opt_idx < run_idx
+
+    def test_no_fuse_overlayfs_no_storage_opt(self, mock_run_os_cmd, capsys):
+        """Without --fuse-overlayfs, no --storage-opt injected."""
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'overlay.mount_program' not in out
+
+    def test_fuse_overlayfs_converts_overlay_file_mount(
+        self, mock_run_os_cmd, capsys, monkeypatch, tmp_path
+    ):
+        """--fuse-overlayfs converts :O to :ro for single-file volume mounts."""
+        mock_run_os_cmd.set_return(returncode=1)
+        _real_which = podrun_mod.shutil.which
+        monkeypatch.setattr(
+            podrun_mod.shutil,
+            'which',
+            lambda x: '/usr/bin/fuse-overlayfs' if x == 'fuse-overlayfs' else _real_which(x),
+        )
+        # Create a real file so os.path.isfile returns True
+        fake_file = tmp_path / '.gitconfig'
+        fake_file.write_text('[user]\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--fuse-overlayfs',
+                    '--print-cmd',
+                    f'-v={fake_file}:/home/user/.gitconfig:O',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        # :O should be converted to :ro
+        assert f'-v={fake_file}:/home/user/.gitconfig:ro' in out
+        assert ':O' not in out
+
+    def test_fuse_overlayfs_preserves_overlay_dir_mount(
+        self, mock_run_os_cmd, capsys, monkeypatch, tmp_path
+    ):
+        """--fuse-overlayfs preserves :O for directory volume mounts."""
+        mock_run_os_cmd.set_return(returncode=1)
+        _real_which = podrun_mod.shutil.which
+        monkeypatch.setattr(
+            podrun_mod.shutil,
+            'which',
+            lambda x: '/usr/bin/fuse-overlayfs' if x == 'fuse-overlayfs' else _real_which(x),
+        )
+        # Create a real directory so os.path.isfile returns False
+        fake_dir = tmp_path / '.ssh'
+        fake_dir.mkdir()
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--fuse-overlayfs',
+                    '--print-cmd',
+                    f'-v={fake_dir}:/home/user/.ssh:O',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        # :O should be preserved for directories
+        assert f'-v={fake_dir}:/home/user/.ssh:O' in out
+
+
 class TestRunOsCmd:
     def test_real_run_os_cmd(self):
         """Cover the real run_os_cmd function (lines 221-223).
@@ -492,6 +614,347 @@ class TestGlobalFlagsPassthrough:
         assert parts[1] == '--root=/store'
         assert parts[2] == 'run'
         assert '--userns=keep-id' in parts
+
+
+class TestPrintCmdContainerState:
+    """End-to-end tests through main() with --print-cmd for container state handling.
+
+    Verifies that --print-cmd allows prompts (on stderr) when no auto flag is set,
+    uses defaults in non-interactive mode, and avoids side effects (no podman start, no rm).
+    """
+
+    @staticmethod
+    def _has_podman_subcmd(calls, subcmd):
+        """Check if any mock_run_os_cmd call contains subcmd as a discrete podman token."""
+        for call in calls:
+            tokens = call.split()
+            if subcmd in tokens:
+                return True
+        return False
+
+    def test_running_prints_exec(self, mock_run_os_cmd, capsys, monkeypatch):
+        """Running container + --print-cmd (no explicit auto flags) → prompts on stderr, prints exec on stdout."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(
+                    args='', returncode=0, stdout='PODRUN_OVERLAYS=user\n', stderr=''
+                ),
+            ]
+        )
+        monkeypatch.setattr(
+            'builtins.input',
+            lambda *a: (_ for _ in ()).throw(AssertionError('input() should not be called')),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--print-cmd', '--name', 'test', 'alpine'])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert 'exec' in captured.out
+        assert 'Attach to already running instance?' in captured.err
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'start')
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+
+    def test_stopped_no_action(self, mock_run_os_cmd, capsys, monkeypatch):
+        """Stopped container + --print-cmd (no explicit auto flags) → non-interactive defaults to no replace, exits 0."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        monkeypatch.setattr(
+            'builtins.input',
+            lambda *a: (_ for _ in ()).throw(AssertionError('input() should not be called')),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--print-cmd', '--name', 'test', 'alpine'])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert 'Replace stopped instance?' in captured.err
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'start')
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+
+    def test_none_prints_run(self, mock_run_os_cmd, capsys):
+        """No container + --print-cmd → prints run cmd, exit 0."""
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--print-cmd', '--name', 'test', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'run' in out
+
+    def test_running_no_prompt(self, mock_run_os_cmd, monkeypatch):
+        """Running container + --print-cmd (non-interactive) → input() is never called."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(
+                    args='', returncode=0, stdout='PODRUN_OVERLAYS=user\n', stderr=''
+                ),
+            ]
+        )
+        called = []
+        monkeypatch.setattr('builtins.input', lambda *a: called.append(1) or 'y')
+        with pytest.raises(SystemExit):
+            main(['run', '--no-devconfig', '--print-cmd', '--name', 'test', 'alpine'])
+        assert len(called) == 0
+
+    def test_running_explicit_auto_attach(self, mock_run_os_cmd, capsys):
+        """Running + --print-cmd + --auto-attach → prints exec, no start."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(
+                    args='', returncode=0, stdout='PODRUN_OVERLAYS=user\n', stderr=''
+                ),
+            ]
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--print-cmd',
+                    '--auto-attach',
+                    '--name',
+                    'test',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'exec' in out
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'start')
+
+    def test_stopped_explicit_auto_attach_warns(self, mock_run_os_cmd, capsys):
+        """Stopped + --print-cmd + --auto-attach → warns, exits 0 (no action)."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--print-cmd',
+                    '--auto-attach',
+                    '--name',
+                    'test',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert 'cannot auto-attach to container' in captured.err.lower()
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'start')
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+
+    def test_running_explicit_auto_replace_prints_rm_and_run(self, mock_run_os_cmd, capsys):
+        """Running + --print-cmd + --auto-replace → prints rm + run, no side effects."""
+        mock_run_os_cmd.set_return(stdout='running\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--print-cmd',
+                    '--auto-replace',
+                    '--name',
+                    'test',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert 'rm' in lines[0]
+        assert 'run' in lines[1]
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+
+    def test_stopped_explicit_auto_replace_prints_rm_and_run(self, mock_run_os_cmd, capsys):
+        """Stopped + --print-cmd + --auto-replace → prints rm + run, no side effects."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--print-cmd',
+                    '--auto-replace',
+                    '--name',
+                    'test',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert 'rm' in lines[0]
+        assert 'run' in lines[1]
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+
+
+class TestContainerStateWithoutPrintCmd:
+    """End-to-end tests through main() WITHOUT --print-cmd.
+
+    Verifies that real side effects (execvpe, podman rm) occur for auto flag
+    combinations.  Stopped containers cannot be attached to — only replaced.
+    """
+
+    @staticmethod
+    def _has_podman_subcmd(calls, subcmd):
+        """Check if any mock_run_os_cmd call contains subcmd as a discrete podman token."""
+        for call in calls:
+            tokens = call.split()
+            if subcmd in tokens:
+                return True
+        return False
+
+    def test_running_auto_attach_execvpe_exec(self, mock_run_os_cmd, monkeypatch):
+        """Running + --auto-attach → execvpe with exec cmd."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(
+                    args='', returncode=0, stdout='PODRUN_OVERLAYS=user\n', stderr=''
+                ),
+            ]
+        )
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['run', '--no-devconfig', '--auto-attach', '--name', 'test', 'alpine'])
+        assert len(execvpe_calls) == 1
+        assert 'exec' in execvpe_calls[0][1]
+
+    def test_stopped_auto_attach_warns_exits(self, mock_run_os_cmd, capsys):
+        """Stopped + --auto-attach → warns can't attach, exits 0 (no action)."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--auto-attach', '--name', 'test', 'alpine'])
+        assert exc_info.value.code == 0
+        assert 'cannot auto-attach to container' in capsys.readouterr().err.lower()
+
+    def test_running_auto_replace_rm_then_run(self, mock_run_os_cmd, monkeypatch):
+        """Running + --auto-replace → rm called, then execvpe with run cmd."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr=''),  # rm
+            ]
+        )
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['run', '--no-devconfig', '--auto-replace', '--name', 'test', 'alpine'])
+        assert self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+        assert len(execvpe_calls) == 1
+        assert 'run' in execvpe_calls[0][1]
+
+    def test_stopped_auto_replace_rm_then_run(self, mock_run_os_cmd, monkeypatch):
+        """Stopped + --auto-replace → rm called, then execvpe with run cmd."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='exited\n', stderr=''),
+                subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr=''),  # rm
+            ]
+        )
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['run', '--no-devconfig', '--auto-replace', '--name', 'test', 'alpine'])
+        assert self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+        assert len(execvpe_calls) == 1
+        assert 'run' in execvpe_calls[0][1]
+
+    def test_none_execvpe_run(self, mock_run_os_cmd, monkeypatch):
+        """No container → execvpe with run cmd."""
+        mock_run_os_cmd.set_return(returncode=1)
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['run', '--no-devconfig', '--name', 'test', 'alpine'])
+        assert len(execvpe_calls) == 1
+        assert 'run' in execvpe_calls[0][1]
+
+    def test_running_both_flags_attach_wins(self, mock_run_os_cmd, monkeypatch):
+        """Running + --auto-attach + --auto-replace → attach wins: exec cmd, no rm."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(
+                    args='', returncode=0, stdout='PODRUN_OVERLAYS=user\n', stderr=''
+                ),
+            ]
+        )
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--auto-attach',
+                    '--auto-replace',
+                    '--name',
+                    'test',
+                    'alpine',
+                ]
+            )
+        assert len(execvpe_calls) == 1
+        assert 'exec' in execvpe_calls[0][1]
+        assert not self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+
+    def test_stopped_both_flags_replace_wins(self, mock_run_os_cmd, monkeypatch, capsys):
+        """Stopped + --auto-attach + --auto-replace → can't attach, falls through to replace (rm + run)."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='exited\n', stderr=''),
+                subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr=''),  # rm
+            ]
+        )
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--auto-attach',
+                    '--auto-replace',
+                    '--name',
+                    'test',
+                    'alpine',
+                ]
+            )
+        assert 'cannot auto-attach to container' in capsys.readouterr().err.lower()
+        assert self._has_podman_subcmd(mock_run_os_cmd.calls, 'rm')
+        assert len(execvpe_calls) == 1
+        assert 'run' in execvpe_calls[0][1]
 
 
 class TestDetectSubcommand:

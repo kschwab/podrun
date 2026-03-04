@@ -454,6 +454,30 @@ class TestDevcontainerDedup:
         assert f'--mount={mount}' in config.passthrough_args
 
 
+class TestFuseOverlayfsConfig:
+    """Test --fuse-overlayfs merging into Config."""
+
+    def test_fuse_overlayfs_from_cli(self, make_cli_args):
+        cli = make_cli_args(fuse_overlayfs=True)
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.fuse_overlayfs is True
+
+    def test_fuse_overlayfs_from_podrun_cfg(self, make_cli_args):
+        cli = make_cli_args(fuse_overlayfs=None)
+        config = merge_config(cli, {'fuseOverlayfs': True}, {'image': 'alpine'})
+        assert config.fuse_overlayfs is True
+
+    def test_fuse_overlayfs_cli_wins_over_cfg(self, make_cli_args):
+        cli = make_cli_args(fuse_overlayfs=True)
+        config = merge_config(cli, {'fuseOverlayfs': False}, {'image': 'alpine'})
+        assert config.fuse_overlayfs is True
+
+    def test_fuse_overlayfs_default_false(self, make_cli_args):
+        cli = make_cli_args(fuse_overlayfs=None)
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.fuse_overlayfs is False
+
+
 class TestPodmanPathConfig:
     """Test podman_path resolution via _resolve_podman_path and merge_config."""
 

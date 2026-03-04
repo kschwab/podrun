@@ -152,7 +152,7 @@ class TestStoreInit:
         assert '--root' in content
         assert '--runroot' in content
         assert '--storage-driver' in content
-        assert '-m podrun' in content
+        assert 'podrun.py' in content
 
     def test_bin_python3_is_symlink(self, tmp_path, monkeypatch):
         store_dir = tmp_path / 'test-store'

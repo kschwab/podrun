@@ -130,6 +130,16 @@ class TestParseCliArgs:
             parse_cli_args(['--check-flags'])
 
 
+class TestFuseOverlayfsFlag:
+    def test_fuse_overlayfs_sets_true(self, mock_run_os_cmd):
+        args = parse_cli_args(['--fuse-overlayfs', 'alpine'])
+        assert args.fuse_overlayfs is True
+
+    def test_fuse_overlayfs_default_none(self, mock_run_os_cmd):
+        args = parse_cli_args(['alpine'])
+        assert args.fuse_overlayfs is None
+
+
 class TestLoginFlag:
     def test_login_sets_true(self, mock_run_os_cmd):
         args = parse_cli_args(['--login', 'alpine'])

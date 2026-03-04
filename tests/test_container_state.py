@@ -32,14 +32,14 @@ class TestYesNoPrompt:
     def test_non_interactive_defaults_yes(self, capsys):
         result = yes_no_prompt('Continue?', True, False)
         assert result is True
-        out = capsys.readouterr().out
-        assert 'yes' in out
+        err = capsys.readouterr().err
+        assert 'yes' in err
 
     def test_non_interactive_defaults_no(self, capsys):
         result = yes_no_prompt('Continue?', False, False)
         assert result is False
-        out = capsys.readouterr().out
-        assert 'no' in out
+        err = capsys.readouterr().err
+        assert 'no' in err
 
     def test_interactive_yes(self):
         with patch('builtins.input', return_value='y'):
@@ -109,8 +109,8 @@ class TestHandleContainerState:
             result = handle_container_state(config)
         assert result is None
 
-    def test_stopped_interactive_start_yes(self, mock_run_os_cmd):
-        """Stopped container, interactive, user says yes to start+attach."""
+    def test_stopped_interactive_replace_yes(self, mock_run_os_cmd):
+        """Stopped container, interactive, user accepts replace."""
         mock_run_os_cmd.set_return(stdout='exited\n')
         config = Config(image='alpine', name='test')
         with patch('podrun.podrun.sys.stdin') as mock_stdin, patch(
@@ -118,21 +118,10 @@ class TestHandleContainerState:
         ):
             mock_stdin.isatty.return_value = True
             result = handle_container_state(config)
-        assert result == 'start'
-
-    def test_stopped_interactive_start_no_replace_yes(self, mock_run_os_cmd):
-        """Stopped container, interactive, user declines start but accepts replace."""
-        mock_run_os_cmd.set_return(stdout='exited\n')
-        config = Config(image='alpine', name='test')
-        with patch('podrun.podrun.sys.stdin') as mock_stdin, patch(
-            'builtins.input', side_effect=['n', 'y']
-        ):
-            mock_stdin.isatty.return_value = True
-            result = handle_container_state(config)
         assert result == 'replace'
 
-    def test_stopped_interactive_both_no(self, mock_run_os_cmd):
-        """Stopped container, interactive, user declines both start and replace."""
+    def test_stopped_interactive_replace_no(self, mock_run_os_cmd):
+        """Stopped container, interactive, user declines replace."""
         mock_run_os_cmd.set_return(stdout='exited\n')
         config = Config(image='alpine', name='test')
         with patch('podrun.podrun.sys.stdin') as mock_stdin, patch(
@@ -150,3 +139,60 @@ class TestHandleContainerState:
             mock_stdin.isatty.return_value = False
             result = handle_container_state(config)
         assert result is None
+
+
+class TestAutoFlagPrecedence:
+    """Direct handle_container_state() tests with explicit auto flags.
+
+    No prompting or stdin mocking needed — auto flags bypass interactive paths.
+    """
+
+    def test_running_auto_attach(self, mock_run_os_cmd):
+        """Running + auto_attach=True → 'attach'."""
+        mock_run_os_cmd.set_return(stdout='running\n')
+        config = Config(image='alpine', name='test', auto_attach=True)
+        assert handle_container_state(config) == 'attach'
+
+    def test_running_auto_replace(self, mock_run_os_cmd):
+        """Running + auto_replace=True → 'replace'."""
+        mock_run_os_cmd.set_return(stdout='running\n')
+        config = Config(image='alpine', name='test', auto_replace=True)
+        assert handle_container_state(config) == 'replace'
+
+    def test_running_both_true_attach_wins(self, mock_run_os_cmd):
+        """Running + both True → 'attach' (auto_attach takes precedence)."""
+        mock_run_os_cmd.set_return(stdout='running\n')
+        config = Config(image='alpine', name='test', auto_attach=True, auto_replace=True)
+        assert handle_container_state(config) == 'attach'
+
+    def test_running_both_false_returns_none(self, mock_run_os_cmd):
+        """Running + both False → None (no action)."""
+        mock_run_os_cmd.set_return(stdout='running\n')
+        config = Config(image='alpine', name='test', auto_attach=False, auto_replace=False)
+        assert handle_container_state(config) is None
+
+    def test_stopped_auto_attach_warns_returns_none(self, mock_run_os_cmd, capsys):
+        """Stopped + auto_attach=True → warns and returns None (can't attach to stopped)."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        config = Config(image='alpine', name='test', auto_attach=True)
+        assert handle_container_state(config) is None
+        assert 'cannot auto-attach to container' in capsys.readouterr().err.lower()
+
+    def test_stopped_auto_replace(self, mock_run_os_cmd):
+        """Stopped + auto_replace=True → 'replace'."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        config = Config(image='alpine', name='test', auto_replace=True)
+        assert handle_container_state(config) == 'replace'
+
+    def test_stopped_both_true_replace_wins(self, mock_run_os_cmd, capsys):
+        """Stopped + both True → 'replace' (can't attach to stopped, falls through to replace)."""
+        mock_run_os_cmd.set_return(stdout='exited\n')
+        config = Config(image='alpine', name='test', auto_attach=True, auto_replace=True)
+        assert handle_container_state(config) == 'replace'
+        assert 'cannot auto-attach to container' in capsys.readouterr().err.lower()
+
+    def test_none_both_true_returns_run(self, mock_run_os_cmd):
+        """No container (inspect fails) + both True → 'run'."""
+        mock_run_os_cmd.set_return(returncode=1)
+        config = Config(image='alpine', name='test', auto_attach=True, auto_replace=True)
+        assert handle_container_state(config) == 'run'

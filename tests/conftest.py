@@ -210,6 +210,7 @@ def make_cli_args():
             trailing_args=[],
             explicit_command=[],
             export=None,
+            fuse_overlayfs=None,
             had_config_script=False,
         )
         defaults.update(overrides)
@@ -337,8 +338,6 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
         shared_runroot,
         '--storage-driver',
         'overlay',
-        '--storage-opt',
-        'overlay.ignore_chown_errors=true',
     ]
 
     # Only pull/copy images that will actually be tested.
@@ -387,8 +386,6 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
                 worker_runroot,
                 '--storage-driver',
                 'overlay',
-                '--storage-opt',
-                'overlay.ignore_chown_errors=true',
             ]
             try:
                 for image in images:
@@ -458,8 +455,6 @@ def podman_store_flags(podman_store):
         podman_store['runroot'],
         '--storage-driver',
         podman_store['storage_driver'],
-        '--storage-opt',
-        'overlay.ignore_chown_errors=true',
     ]
 
 

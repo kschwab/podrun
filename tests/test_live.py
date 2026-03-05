@@ -2264,6 +2264,53 @@ class TestConfigScriptLive:
         assert result.returncode == 0, f'stderr: {result.stderr}'
         assert '--init' in result.stdout
 
+    def test_config_script_with_export(
+        self, distro_image, podman_env, podman_store_flags, tmp_path
+    ):
+        """configScript outputs --export; verify it becomes a volume mount, not a podman flag."""
+        script = tmp_path / 'config.sh'
+        script.write_text('#!/bin/sh\necho "--export /etc/profile.d:./host-dir"')
+        script.chmod(0o755)
+        result = _run_podrun(
+            [f'--config-script={script}', '--user-overlay', '--print-cmd', distro_image],
+            podman_env,
+            podman_store_flags=podman_store_flags,
+        )
+        assert result.returncode == 0, f'stderr: {result.stderr}'
+        # --export should NOT appear as a raw podman flag
+        assert '--export' not in result.stdout
+        # The export should produce a volume mount for the export path
+        assert '/etc/profile.d' in result.stdout
+
+    def test_config_script_export_populates_host(
+        self, distro_image, podman_env, podman_store_flags, tmp_path
+    ):
+        """configScript --export of a file actually populates host dir in a live container."""
+        host_dir = tmp_path / 'cs-export-file'
+        script = tmp_path / 'config.sh'
+        script.write_text(
+            f'#!/bin/sh\necho "--export /etc/profile:{host_dir}"'
+        )
+        script.chmod(0o755)
+        result = _run_podrun(
+            [
+                f'--config-script={script}',
+                '--user-overlay',
+                '--rm',
+                distro_image,
+                'cat',
+                '/etc/profile',
+            ],
+            podman_env,
+            podman_store_flags=podman_store_flags,
+            timeout=60,
+        )
+        assert result.returncode == 0, f'stderr: {result.stderr}'
+        assert host_dir.exists(), f'{host_dir} was not created'
+        assert (host_dir / 'profile').exists(), (
+            f'profile not in {host_dir}: {list(host_dir.iterdir())}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestOverlayExpansionLive — Live overlay expansion

@@ -23,7 +23,7 @@ A podman run superset with host identity overlays.
 #  2. MINOR version when you add functionality in a backwards compatible manner
 #  3. PATCH version when you make backwards compatible bug fixes
 # Additional labels for pre-release and build metadata are available as extensions to the MAJOR.MINOR.PATCH format.
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 __title__ = 'podrun'
 __uri__ = 'https://github.com/kschwab/podrun'
 __author__ = 'Kyle Schwab'
@@ -1859,6 +1859,24 @@ def _expand_volume_tilde(args: list) -> list:
     return result
 
 
+def _expand_export_tilde(exports: list) -> list:
+    """Expand ~ in export entries (container_path:host_path[:0]).
+
+    Host ~ expands to USER_HOME, container ~ expands to /home/{UNAME}.
+    Mirrors _expand_volume_tilde but for export specs instead of -v args.
+    """
+    result = []
+    for entry in exports:
+        parts = entry.split(':')
+        if len(parts) >= 2:
+            parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
+            parts[1] = re.sub(r'^~', USER_HOME, parts[1])
+        elif len(parts) == 1:
+            parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
+        result.append(':'.join(parts))
+    return result
+
+
 def _resolve_image_and_command(trailing, explicit_command, devcontainer):
     """Deduplicate image from trailing positional args and devcontainer.json."""
     image = devcontainer.get('image')
@@ -1873,22 +1891,33 @@ def _resolve_image_and_command(trailing, explicit_command, devcontainer):
     return image, command
 
 
-def _resolve_config_script(podrun_cfg, cli_args, podman_args):
-    """Run configScript from devcontainer.json and prepend its output to podman_args.
+def _resolve_config_script(podrun_cfg, cli_args, podman_args, parser):
+    """Run configScript and parse its output through the podrun parser.
 
-    Skipped when --config-script was used on CLI (already expanded inline).
+    Returns (podman_args, script_attrs) where script_attrs is an
+    argparse.Namespace of podrun-specific flags, or None if no script ran.
     """
     config_script = podrun_cfg.get('configScript')
-    if config_script and not getattr(cli_args, 'had_config_script', False):
-        out = run_os_cmd(f'{shlex.quote(config_script)}')
-        if out.returncode == 0:
-            podman_args = shlex.split(out.stdout) + podman_args
-        else:
-            print(
-                f'Warning: configScript {config_script} failed (exit {out.returncode})',
-                file=sys.stderr,
-            )
-    return podman_args
+    if not config_script or getattr(cli_args, 'had_config_script', False):
+        return podman_args, None
+
+    out = run_os_cmd(f'{shlex.quote(config_script)}')
+    if out.returncode != 0:
+        print(
+            f'Warning: configScript {config_script} failed (exit {out.returncode})',
+            file=sys.stderr,
+        )
+        return podman_args, None
+
+    script_tokens = shlex.split(out.stdout)
+    try:
+        script_attrs, script_unknowns = parser.parse_known_args(script_tokens)
+    except SystemExit:
+        # --version or similar exit-action in script output; treat as raw podman args
+        return script_tokens + podman_args, None
+
+    podman_args = script_unknowns + podman_args
+    return podman_args, script_attrs
 
 
 def _devcontainer_run_args(devcontainer: dict) -> list:
@@ -1919,8 +1948,10 @@ def _devcontainer_run_args(devcontainer: dict) -> list:
     return args
 
 
-def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=None) -> Config:
-    """Merge CLI > customizations.podrun > devcontainer.json top-level."""
+def merge_config(  # noqa: C901 — three-way merge across CLI, configScript, and JSON; splitting would scatter a cohesive precedence chain
+    cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=None, parser=None
+) -> Config:
+    """Merge CLI > configScript > customizations.podrun > devcontainer.json top-level."""
 
     def _first(*values):
         for v in values:
@@ -1928,12 +1959,25 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
                 return v
         return None
 
+    def _script_val(script_attrs, attr_name):
+        """Safely extract an attribute from script_attrs Namespace."""
+        if script_attrs is None:
+            return None
+        return getattr(script_attrs, attr_name, None)
+
+    if parser is None:
+        parser = _build_parser()
+
     trailing = getattr(cli_args, 'trailing_args', [])
     explicit_command = getattr(cli_args, 'explicit_command', [])
 
     image, command = _resolve_image_and_command(trailing, explicit_command, devcontainer)
 
-    name = _first(cli_args.name, podrun_cfg.get('name'))
+    podman_args = podrun_cfg.get('podmanArgs', [])
+    podman_args, script_attrs = _resolve_config_script(podrun_cfg, cli_args, podman_args, parser)
+    passthrough_args = getattr(cli_args, 'passthrough_args', [])
+
+    name = _first(cli_args.name, _script_val(script_attrs, 'name'), podrun_cfg.get('name'))
     if name is None and image:
         # derive name from image basename
         name = re.sub(r'[/:@]', '-', image.rsplit('/', 1)[-1])
@@ -1942,9 +1986,6 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
     workspace_mount_src = str(pathlib.Path.cwd())
 
     dc_args = _devcontainer_run_args(devcontainer)
-    podman_args = podrun_cfg.get('podmanArgs', [])
-    podman_args = _resolve_config_script(podrun_cfg, cli_args, podman_args)
-    passthrough_args = getattr(cli_args, 'passthrough_args', [])
 
     # Dedup: remove dc_args already present in higher-precedence sources
     existing = set(podman_args) | set(passthrough_args)
@@ -1961,13 +2002,33 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
             user_caps.add(m.group(1).upper())
     bootstrap_caps = [c for c in BOOTSTRAP_CAPS if c not in user_caps]
 
-    adhoc = _first(cli_args.adhoc, podrun_cfg.get('adhoc'), False)
-    workspace = _first(cli_args.workspace, podrun_cfg.get('workspace'), False)
-    interactive_overlay = _first(
-        cli_args.interactive_overlay, podrun_cfg.get('interactiveOverlay'), False
+    adhoc = _first(
+        cli_args.adhoc, _script_val(script_attrs, 'adhoc'), podrun_cfg.get('adhoc'), False
     )
-    host_overlay = _first(cli_args.host_overlay, podrun_cfg.get('hostOverlay'), False)
-    user_overlay = _first(cli_args.user_overlay, podrun_cfg.get('userOverlay'), False)
+    workspace = _first(
+        cli_args.workspace,
+        _script_val(script_attrs, 'workspace'),
+        podrun_cfg.get('workspace'),
+        False,
+    )
+    interactive_overlay = _first(
+        cli_args.interactive_overlay,
+        _script_val(script_attrs, 'interactive_overlay'),
+        podrun_cfg.get('interactiveOverlay'),
+        False,
+    )
+    host_overlay = _first(
+        cli_args.host_overlay,
+        _script_val(script_attrs, 'host_overlay'),
+        podrun_cfg.get('hostOverlay'),
+        False,
+    )
+    user_overlay = _first(
+        cli_args.user_overlay,
+        _script_val(script_attrs, 'user_overlay'),
+        podrun_cfg.get('userOverlay'),
+        False,
+    )
 
     # Implication chain: adhoc -> workspace, workspace -> host + interactive, host -> user
     if adhoc:
@@ -1978,10 +2039,11 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
     if host_overlay:
         user_overlay = True
 
-    # Exports: config provides baseline, CLI appends
+    # Exports: config provides baseline, script appends, CLI appends last
     cfg_exports = podrun_cfg.get('exports', [])
+    script_exports = _script_val(script_attrs, 'export') or []
     cli_exports = getattr(cli_args, 'export', None) or []
-    exports = cfg_exports + cli_exports
+    exports = _expand_export_tilde(cfg_exports + script_exports + cli_exports)
 
     return Config(
         image=image,
@@ -1993,13 +2055,30 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
         adhoc=adhoc,
         workspace_folder=workspace_folder,
         workspace_mount_src=workspace_mount_src,
-        shell=_first(cli_args.shell, podrun_cfg.get('shell')),
-        x11=_first(cli_args.x11, podrun_cfg.get('x11'), False),
-        dood=_first(cli_args.dood, podrun_cfg.get('dood'), False),
-        login=_first(cli_args.login, podrun_cfg.get('login')),
-        prompt_banner=_first(cli_args.prompt_banner, podrun_cfg.get('promptBanner'), image),
-        auto_attach=_first(cli_args.auto_attach, podrun_cfg.get('autoAttach'), False),
-        auto_replace=_first(cli_args.auto_replace, podrun_cfg.get('autoReplace'), False),
+        shell=_first(cli_args.shell, _script_val(script_attrs, 'shell'), podrun_cfg.get('shell')),
+        x11=_first(cli_args.x11, _script_val(script_attrs, 'x11'), podrun_cfg.get('x11'), False),
+        dood=_first(
+            cli_args.dood, _script_val(script_attrs, 'dood'), podrun_cfg.get('dood'), False
+        ),
+        login=_first(cli_args.login, _script_val(script_attrs, 'login'), podrun_cfg.get('login')),
+        prompt_banner=_first(
+            cli_args.prompt_banner,
+            _script_val(script_attrs, 'prompt_banner'),
+            podrun_cfg.get('promptBanner'),
+            image,
+        ),
+        auto_attach=_first(
+            cli_args.auto_attach,
+            _script_val(script_attrs, 'auto_attach'),
+            podrun_cfg.get('autoAttach'),
+            False,
+        ),
+        auto_replace=_first(
+            cli_args.auto_replace,
+            _script_val(script_attrs, 'auto_replace'),
+            podrun_cfg.get('autoReplace'),
+            False,
+        ),
         print_cmd=cli_args.print_cmd,
         command=command,
         container_env=devcontainer.get('containerEnv', {}),
@@ -2009,7 +2088,12 @@ def merge_config(cli_args, podrun_cfg: dict, devcontainer: dict, podman_path=Non
         passthrough_args=passthrough_args,
         exports=exports,
         podman_path=podman_path or shutil.which('podman'),
-        fuse_overlayfs=_first(cli_args.fuse_overlayfs, podrun_cfg.get('fuseOverlayfs'), False),
+        fuse_overlayfs=_first(
+            cli_args.fuse_overlayfs,
+            _script_val(script_attrs, 'fuse_overlayfs'),
+            podrun_cfg.get('fuseOverlayfs'),
+            False,
+        ),
     )
 
 
@@ -2533,6 +2617,21 @@ def _passthrough_has_short_flag(pt, char):
     return False
 
 
+def _volume_mount_destinations(*arg_lists) -> set:
+    """Extract container destination paths from -v/--volume args across all arg lists."""
+    dests = set()
+    for args in arg_lists:
+        for arg in args:
+            m = re.match(r'^(-v|--volume)=(.*)', arg)
+            if not m:
+                continue
+            parts = m.group(2).split(':')
+            if len(parts) >= 2:
+                dest = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+                dests.add(dest)
+    return dests
+
+
 def _user_overlay_args(config, pt, entrypoint_path, rc_path, exec_entry_path):
     """Build args for --user-overlay: map host user identity into container."""
     args = []
@@ -2867,6 +2966,23 @@ def _main_run(config, global_flags=None):  # noqa: C901 — linear pipeline with
     exec_entry_path = None
 
     if config.user_overlay:
+        # Filter exports that conflict with existing volume mounts (same container dest).
+        if config.exports:
+            mount_dests = _volume_mount_destinations(config.podman_args, config.passthrough_args)
+            filtered = []
+            for entry in config.exports:
+                cp, _, _ = _parse_export(entry)
+                cp = re.sub(r'^~', f'/home/{UNAME}', cp)
+                if cp in mount_dests:
+                    print(
+                        f'Warning: export {entry!r} skipped — {cp} already mounted via -v',
+                        file=sys.stderr,
+                    )
+                else:
+                    filtered.append(entry)
+            if len(filtered) != len(config.exports):
+                config = dataclasses.replace(config, exports=filtered)
+
         # Generate entrypoint, rc.sh, and exec-entrypoint.sh with SHA-based filenames (idempotent).
         entrypoint_path = generate_run_entrypoint(config)
         rc_path = generate_rc_sh(config)
@@ -2993,7 +3109,9 @@ def main(argv=None):
 
         podrun_cfg = extract_podrun_config(devcontainer)
         podman_path = _resolve_podman_path(podrun_cfg, config.podman_path)
-        config = merge_config(cli_args, podrun_cfg, devcontainer, podman_path=podman_path)
+        config = merge_config(
+            cli_args, podrun_cfg, devcontainer, podman_path=podman_path, parser=parser
+        )
         _main_run(config, global_flags=global_flags)
     elif subcmd == 'exec':
         _main_exec(subcmd_argv, global_flags=global_flags, podman_path=config.podman_path)

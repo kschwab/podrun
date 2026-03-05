@@ -1,7 +1,12 @@
 import pytest
 
 import podrun.podrun as podrun_mod
-from podrun.podrun import _devcontainer_run_args, _resolve_podman_path, merge_config
+from podrun.podrun import (
+    _devcontainer_run_args,
+    _resolve_podman_path,
+    _volume_mount_destinations,
+    merge_config,
+)
 
 
 class TestMergeConfigPrecedence:
@@ -182,6 +187,63 @@ class TestConfigScript:
         assert '/bad/script' in captured.err
 
 
+class TestConfigScriptFlagExtraction:
+    """Test that configScript output is parsed through argparse to extract podrun flags."""
+
+    def test_config_script_extracts_export(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--export /etc/profile.d:./host-dir -v /host:/cont')
+        cli = make_cli_args(had_config_script=False)
+        podrun_cfg = {'configScript': '/path/to/script'}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert '/etc/profile.d:./host-dir' in config.exports
+        assert '-v' in config.podman_args
+        assert '/host:/cont' in config.podman_args
+
+    def test_config_script_extracts_podrun_flags(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--user-overlay --shell bash -v /host:/cont')
+        cli = make_cli_args(had_config_script=False)
+        podrun_cfg = {'configScript': '/path/to/script'}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert config.user_overlay is True
+        assert config.shell == 'bash'
+        assert '-v' in config.podman_args
+        assert '/host:/cont' in config.podman_args
+
+    def test_config_script_cli_overrides_script(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--shell fish')
+        cli = make_cli_args(had_config_script=False, shell='zsh')
+        podrun_cfg = {'configScript': '/path/to/script'}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert config.shell == 'zsh'
+
+    def test_config_script_script_overrides_json(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--shell fish')
+        cli = make_cli_args(had_config_script=False)
+        podrun_cfg = {'configScript': '/path/to/script', 'shell': 'bash'}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert config.shell == 'fish'
+
+    def test_config_script_export_three_way_merge(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--export /script:/script-dir')
+        cli = make_cli_args(had_config_script=False, export=['/cli:/cli-dir'])
+        podrun_cfg = {'configScript': '/path/to/script', 'exports': ['/cfg:/cfg-dir']}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert config.exports == ['/cfg:/cfg-dir', '/script:/script-dir', '/cli:/cli-dir']
+
+    def test_config_script_mixed_flags(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--user-overlay --rm --export /a:./b --init')
+        cli = make_cli_args(had_config_script=False)
+        podrun_cfg = {'configScript': '/path/to/script'}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert config.user_overlay is True
+        assert '/a:./b' in config.exports
+        assert '--rm' in config.podman_args
+        assert '--init' in config.podman_args
+        # podrun flags should NOT be in podman_args
+        assert '--user-overlay' not in config.podman_args
+        assert '--export' not in config.podman_args
+
+
 class TestImageDedup:
     """Test image deduplication when devcontainer.json image matches trailing args."""
 
@@ -250,6 +312,63 @@ class TestExportsConfig:
         cli = make_cli_args(export=['/opt/sdk:./sdk:0'])
         config = merge_config(cli, {}, {'image': 'alpine'})
         assert config.exports == ['/opt/sdk:./sdk:0']
+
+
+class TestExportTildeExpansion:
+    """Test tilde expansion in export specs."""
+
+    def test_tilde_expanded_in_container_path(self, make_cli_args):
+        cli = make_cli_args(export=['~/.claude:./claude-data'])
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.exports == ['/home/testuser/.claude:./claude-data']
+
+    def test_tilde_expanded_in_host_path(self, make_cli_args):
+        cli = make_cli_args(export=['/container/path:~/.data'])
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.exports == ['/container/path:/home/testuser/.data']
+
+    def test_tilde_expanded_both_paths(self, make_cli_args):
+        cli = make_cli_args(export=['~/.claude:~/.claude'])
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.exports == ['/home/testuser/.claude:/home/testuser/.claude']
+
+    def test_no_tilde_unchanged(self, make_cli_args):
+        cli = make_cli_args(export=['/opt/sdk:./sdk'])
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.exports == ['/opt/sdk:./sdk']
+
+    def test_tilde_in_config_script_exports(self, make_cli_args, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='--export ~/.claude:~/.claude')
+        cli = make_cli_args(had_config_script=False)
+        podrun_cfg = {'configScript': '/path/to/script'}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        assert config.exports == ['/home/testuser/.claude:/home/testuser/.claude']
+
+
+class TestVolumeMountDestinations:
+    """Test _volume_mount_destinations extracts container destinations."""
+
+    def test_extracts_v_short_form(self):
+        args = ['-v=/host:/container', '--init']
+        assert _volume_mount_destinations(args) == {'/container'}
+
+    def test_extracts_volume_long_form(self):
+        args = ['--volume=/host:/container:ro']
+        assert _volume_mount_destinations(args) == {'/container'}
+
+    def test_multiple_lists(self):
+        a = ['-v=/a:/b']
+        b = ['-v=/c:/d']
+        assert _volume_mount_destinations(a, b) == {'/b', '/d'}
+
+    def test_tilde_expanded(self):
+        args = ['-v=~/.ssh:~/.ssh:O']
+        dests = _volume_mount_destinations(args)
+        assert '/home/testuser/.ssh' in dests
+
+    def test_non_volume_ignored(self):
+        args = ['--rm', '--init', '--name=foo']
+        assert _volume_mount_destinations(args) == set()
 
 
 class TestDevcontainerRunArgs:

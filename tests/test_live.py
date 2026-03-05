@@ -2288,9 +2288,7 @@ class TestConfigScriptLive:
         """configScript --export of a file actually populates host dir in a live container."""
         host_dir = tmp_path / 'cs-export-file'
         script = tmp_path / 'config.sh'
-        script.write_text(
-            f'#!/bin/sh\necho "--export /etc/profile:{host_dir}"'
-        )
+        script.write_text(f'#!/bin/sh\necho "--export /etc/profile:{host_dir}"')
         script.chmod(0o755)
         result = _run_podrun(
             [

@@ -66,6 +66,7 @@ class TestBuildPodmanArgs:
         assert '-v=/src:/app' in args
         assert '-w=/app' in args
         assert '--env=TERM=xterm-256color' in args
+        assert '-v=/etc/localtime:/etc/localtime:ro' in args
 
     def test_env(self, make_config):
         config = make_config(container_env={'FOO': 'bar'}, remote_env={'BAZ': 'qux'})

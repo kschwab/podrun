@@ -2680,6 +2680,8 @@ def _host_overlay_args(config, pt):
         args.append(f'-w={config.workspace_folder}')
     if not _passthrough_has_exact(pt, '--env=TERM=xterm-256color'):
         args.append('--env=TERM=xterm-256color')
+    if os.path.exists('/etc/localtime'):
+        args.append('-v=/etc/localtime:/etc/localtime:ro')
     return args
 
 

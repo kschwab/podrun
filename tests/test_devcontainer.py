@@ -3,6 +3,7 @@ import json
 import pytest
 
 from podrun.podrun import (
+    _find_project_context,
     extract_podrun_config,
     find_devcontainer_json,
     parse_devcontainer_json,
@@ -69,3 +70,38 @@ class TestExtractPodrunConfig:
     def test_missing_podrun_key(self):
         dc = {'customizations': {'vscode': {}}}
         assert extract_podrun_config(dc) == {}
+
+
+class TestFindProjectContext:
+    """Tests for combined _find_project_context() discovery."""
+
+    def test_finds_both_devcontainer_and_store(self, tmp_path):
+        """_find_project_context finds both devcontainer.json and store in one pass."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text('{}')
+        store = dc_dir / '.podrun' / 'store'
+        (store / 'graphroot').mkdir(parents=True)
+        ctx = _find_project_context(start_dir=str(tmp_path))
+        assert ctx.devcontainer_json == dc_file
+        assert ctx.store_dir == str(store)
+
+    def test_finds_devcontainer_without_store(self, tmp_path):
+        """_find_project_context finds devcontainer.json when no store exists."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text('{}')
+        ctx = _find_project_context(start_dir=str(tmp_path))
+        assert ctx.devcontainer_json == dc_file
+        assert ctx.store_dir is None
+
+    def test_finds_store_without_devcontainer(self, tmp_path):
+        """_find_project_context finds store when no devcontainer.json exists."""
+        dc_dir = tmp_path / '.devcontainer'
+        store = dc_dir / '.podrun' / 'store'
+        (store / 'graphroot').mkdir(parents=True)
+        ctx = _find_project_context(start_dir=str(tmp_path))
+        assert ctx.devcontainer_json is None
+        assert ctx.store_dir == str(store)

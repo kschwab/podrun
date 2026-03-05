@@ -853,41 +853,32 @@ class TestStoreInitLive:
     """Verify ``podrun store init`` creates a working project-local store."""
 
     def test_store_init_podman_images(self, live_store, podman_env):
-        """store init → activate → podman images succeeds with correct graphroot."""
+        """store init → podman with store flags succeeds with correct graphroot."""
         store_dir = live_store(name='live-store')
-        assert (store_dir / 'activate').exists()
+        graphroot = str(store_dir / 'graphroot')
+        runroot = os.readlink(str(store_dir / 'runroot'))
 
-        # Source activate and run podman images
+        # Use podman with explicit store flags to verify the store works
         result = subprocess.run(
             [
-                'bash',
-                '-c',
-                f'source "{store_dir}/activate" && '
-                f'podman images --format "{{{{.Repository}}}}" && '
-                f'podman info --format "{{{{.Store.GraphRoot}}}}"',
+                'podman',
+                '--root',
+                graphroot,
+                '--runroot',
+                runroot,
+                '--storage-driver',
+                'overlay',
+                'info',
+                '--format',
+                '{{.Store.GraphRoot}}',
             ],
             capture_output=True,
             text=True,
             timeout=30,
             env=podman_env,
         )
-        assert result.returncode == 0, f'podman failed: {result.stderr}'
-        lines = result.stdout.strip().splitlines()
-        graphroot_line = lines[-1]
-        assert str(store_dir / 'graphroot') == graphroot_line
-
-    def test_store_init_which_podman(self, live_store, podman_env):
-        """After activation, ``which podman`` resolves to the store wrapper."""
-        store_dir = live_store(name='live-store')
-        result = subprocess.run(
-            ['bash', '-c', f'source "{store_dir}/activate" && which podman'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0
-        assert str(store_dir / 'bin' / 'podman') == result.stdout.strip()
+        assert result.returncode == 0, f'podman info failed: {result.stderr}'
+        assert result.stdout.strip() == graphroot
 
     def test_store_destroy_after_init(self, tmp_path, podman_env):
         """store destroy removes both store dir and runroot target."""
@@ -1120,15 +1111,15 @@ class TestPasswdEntry:
         if has_userns:
             assert result.stdout.strip() != '', f'No group entry for GID {HOST_GID}'
 
-    def test_sudo_setup(self, bash_image, has_userns, run_live_rm):
+    def test_sudo_setup(self, distro_image, has_userns, run_live_rm):
         """Passwordless sudo should be configured for the host user."""
         result = run_live_rm(
             [
                 '--user-overlay',
-                bash_image,
+                distro_image,
                 'sh',
                 '-c',
-                'command -v sudo > /dev/null 2>&1 && sudo -n -u root echo sudo-ok || echo no-sudo',
+                'if command -v sudo > /dev/null 2>&1; then sudo -n -u root echo sudo-ok; else echo no-sudo; fi',
             ],
         )
         assert result.returncode == 0, f'stderr: {result.stderr}'
@@ -1791,132 +1782,6 @@ class TestExportPersistence:
 
 
 # ---------------------------------------------------------------------------
-# TestStoreActivateFunctional — Store activate/deactivate in real shells
-# ---------------------------------------------------------------------------
-
-
-class TestStoreActivateFunctional:
-    """Run the activate script in a real shell and verify behavior.
-
-    These tests use the project-local store bootstrapped by the ``podman_store``
-    fixture, so they validate the actual store init output.
-    """
-
-    def test_activate_prepends_bin_to_path(self, live_store, podman_env):
-        """Activation prepends store bin/ to PATH."""
-        store_dir = live_store()
-        result = subprocess.run(
-            ['bash', '-c', f'source "{store_dir}/activate" && echo "$PATH"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert str(store_dir / 'bin') in result.stdout.split(':')[0]
-
-    def test_activate_sets_ps1(self, live_store, podman_env):
-        """Activation adds (podrun-store) prefix to PS1."""
-        store_dir = live_store()
-        result = subprocess.run(
-            ['bash', '-c', f'PS1="$ " && source "{store_dir}/activate" && echo "$PS1"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert '(podrun-store)' in result.stdout
-
-    def test_deactivate_restores_path(self, live_store, podman_env):
-        """Deactivation restores PATH to pre-activation value."""
-        store_dir = live_store()
-        result = subprocess.run(
-            [
-                'bash',
-                '-c',
-                f'OLD_PATH="$PATH" && '
-                f'source "{store_dir}/activate" && '
-                f'deactivate_podrun_store && '
-                f'[ "$PATH" = "$OLD_PATH" ] && echo "PATH_RESTORED"',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert 'PATH_RESTORED' in result.stdout
-
-    def test_deactivate_restores_ps1(self, live_store, podman_env):
-        """Deactivation restores PS1 to pre-activation value."""
-        store_dir = live_store()
-        result = subprocess.run(
-            [
-                'bash',
-                '-c',
-                f'PS1="original$ " && '
-                f'source "{store_dir}/activate" && '
-                f'deactivate_podrun_store && '
-                f'printf "%s\\n" "$PS1"',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert result.stdout.strip() == 'original$'
-
-    def test_activate_creates_runroot_dir(self, live_store, podman_env):
-        """Activation recreates the /tmp runroot dir (post-reboot scenario)."""
-        store_dir = live_store()
-        runroot_target = os.readlink(str(store_dir / 'runroot'))
-        # Simulate reboot: delete the /tmp runroot dir
-        if os.path.exists(runroot_target):
-            os.rmdir(runroot_target)
-        assert not os.path.exists(runroot_target)
-        result = subprocess.run(
-            ['bash', '-c', f'source "{store_dir}/activate" && echo "ok"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert os.path.exists(runroot_target)
-
-    def test_registries_conf_set_and_restored(self, live_store, podman_env):
-        """Activation sets CONTAINERS_REGISTRIES_CONF; deactivation restores it."""
-        store_dir = live_store(
-            extra_args=['--registry', 'mirror.example.com'], name='test-store-reg'
-        )
-        reg_path = str(store_dir / 'registries.conf')
-        # Capture the pre-activation value so we can verify restoration
-        pre_val = podman_env.get('CONTAINERS_REGISTRIES_CONF', '')
-        result = subprocess.run(
-            [
-                'bash',
-                '-c',
-                f'source "{store_dir}/activate" && '
-                f'echo "$CONTAINERS_REGISTRIES_CONF" && '
-                f'deactivate_podrun_store && '
-                f'echo "${{CONTAINERS_REGISTRIES_CONF:-unset}}"',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=podman_env,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        lines = result.stdout.strip().splitlines()
-        assert lines[0] == reg_path
-        # Deactivation restores to whatever was set before activation
-        expected_restored = pre_val if pre_val else 'unset'
-        assert lines[1] == expected_restored
-
-
-# ---------------------------------------------------------------------------
 # TestContainerStateDetection — Live container state detection
 # ---------------------------------------------------------------------------
 
@@ -2279,8 +2144,8 @@ class TestConfigScriptLive:
         assert result.returncode == 0, f'stderr: {result.stderr}'
         # --export should NOT appear as a raw podman flag
         assert '--export' not in result.stdout
-        # The export should produce a volume mount for the export path
-        assert '/etc/profile.d' in result.stdout
+        # The export should produce a volume mount mapping host-dir to a staging path
+        assert 'host-dir:/.podrun/exports/' in result.stdout
 
     def test_config_script_export_populates_host(
         self, distro_image, podman_env, podman_store_flags, tmp_path

@@ -1,10 +1,10 @@
 """Tests for the ``podrun store`` subcommand."""
 
+import json
 import os
 import pathlib
 import shutil
 import subprocess
-import sys
 
 import pytest
 
@@ -13,7 +13,9 @@ from podrun.podrun import (
     PODMAN_SUBCOMMANDS,
     _PODRUN_SUBCOMMANDS,
     _detect_subcommand,
-    _generate_store_activate,
+    _find_project_context,
+    _has_store_conflict,
+    _resolve_store_flags,
     _runroot_path,
     _warn_missing_subids,
     main,
@@ -41,78 +43,6 @@ class TestRunrootPath:
         assert len(result) < 108
 
 
-class TestGenerateStoreActivate:
-    def test_contains_path_manipulation(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        _generate_store_activate(store_dir, bin_dir, '/tmp/podrun-stores/abc')
-        content = (store_dir / 'activate').read_text()
-        assert 'PATH=' in content
-        assert str(bin_dir) in content
-
-    def test_contains_deactivate(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        _generate_store_activate(store_dir, bin_dir, '/tmp/podrun-stores/abc')
-        content = (store_dir / 'activate').read_text()
-        assert 'deactivate_podrun_store' in content
-
-    def test_contains_ps1(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        _generate_store_activate(store_dir, bin_dir, '/tmp/podrun-stores/abc')
-        content = (store_dir / 'activate').read_text()
-        assert 'PS1=' in content
-        assert '(podrun-store)' in content
-
-    def test_no_xdg_config_home(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        _generate_store_activate(store_dir, bin_dir, '/tmp/podrun-stores/abc')
-        content = (store_dir / 'activate').read_text()
-        assert 'XDG_CONFIG_HOME' not in content
-
-    def test_with_registries_conf(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        reg_conf = str(store_dir / 'registries.conf')
-        _generate_store_activate(
-            store_dir, bin_dir, '/tmp/podrun-stores/abc', registries_conf=reg_conf
-        )
-        content = (store_dir / 'activate').read_text()
-        assert 'CONTAINERS_REGISTRIES_CONF' in content
-        assert reg_conf in content
-
-    def test_without_registries_conf(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        _generate_store_activate(store_dir, bin_dir, '/tmp/podrun-stores/abc')
-        content = (store_dir / 'activate').read_text()
-        assert 'CONTAINERS_REGISTRIES_CONF' not in content
-
-    def test_contains_mkdir_runroot(self, tmp_path):
-        store_dir = tmp_path / 'store'
-        store_dir.mkdir()
-        bin_dir = store_dir / 'bin'
-        bin_dir.mkdir()
-        target = '/tmp/podrun-stores/abc'
-        _generate_store_activate(store_dir, bin_dir, target)
-        content = (store_dir / 'activate').read_text()
-        assert f'mkdir -p "{target}"' in content
-
-
 class TestDetectSubcommandStore:
     def test_store_detected(self):
         assert _detect_subcommand(['store', 'init']) == ('store', 0)
@@ -126,8 +56,6 @@ class TestStoreInit:
         store_dir = tmp_path / 'test-store'
         main(['store', 'init', '--store-dir', str(store_dir)])
         assert (store_dir / 'graphroot').is_dir()
-        assert (store_dir / 'bin').is_dir()
-        assert (store_dir / 'activate').exists()
 
     def test_runroot_is_symlink(self, tmp_path, monkeypatch):
         store_dir = tmp_path / 'test-store'
@@ -136,30 +64,6 @@ class TestStoreInit:
         assert runroot.is_symlink()
         target = os.readlink(str(runroot))
         assert target.startswith(podrun_mod._PODRUN_STORES_DIR)
-
-    def test_bin_podman_has_flags(self, tmp_path, monkeypatch):
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        content = (store_dir / 'bin' / 'podman').read_text()
-        assert '--root' in content
-        assert '--runroot' in content
-        assert '--storage-driver' in content
-
-    def test_bin_podrun_has_flags(self, tmp_path, monkeypatch):
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        content = (store_dir / 'bin' / 'podrun').read_text()
-        assert '--root' in content
-        assert '--runroot' in content
-        assert '--storage-driver' in content
-        assert 'podrun.py' in content
-
-    def test_bin_python3_is_symlink(self, tmp_path, monkeypatch):
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        python_link = store_dir / 'bin' / 'python3'
-        assert python_link.is_symlink()
-        assert os.readlink(str(python_link)) == sys.executable
 
     def test_with_registry(self, tmp_path, monkeypatch):
         store_dir = tmp_path / 'test-store'
@@ -194,7 +98,6 @@ class TestStoreInit:
         out = capsys.readouterr().out
         assert 'initialized' in out.lower() or 'Podrun store' in out
         assert 'graphroot' in out
-        assert 'activate' in out.lower()
 
 
 class TestStoreDestroy:
@@ -382,7 +285,6 @@ class TestStoreInfo:
         assert 'Podrun store' in out
         assert 'graphroot' in out
         assert 'runroot' in out
-        assert 'Activate with:' in out or 'Activated.' in out
 
     def test_nonexistent_store(self, tmp_path, capsys):
         store_dir = tmp_path / 'nonexistent'
@@ -392,27 +294,6 @@ class TestStoreInfo:
         err = capsys.readouterr().err
         assert 'No store found' in err
         assert 'podrun store init' in err
-
-    def test_shows_activate_hint_when_inactive(self, tmp_path, monkeypatch, capsys):
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        capsys.readouterr()
-        main(['store', 'info', '--store-dir', str(store_dir)])
-        out = capsys.readouterr().out
-        assert 'Activate with:' in out
-        assert 'Activated.' not in out
-
-    def test_shows_active_when_bin_in_path(self, tmp_path, monkeypatch, capsys):
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        capsys.readouterr()
-        # Simulate activation by putting bin/ in PATH
-        bin_dir = str(store_dir / 'bin')
-        monkeypatch.setenv('PATH', bin_dir + os.pathsep + os.environ.get('PATH', ''))
-        main(['store', 'info', '--store-dir', str(store_dir)])
-        out = capsys.readouterr().out
-        assert 'Activated.' in out
-        assert 'Activate with:' not in out
 
     def test_shows_registry_when_present(self, tmp_path, monkeypatch, capsys):
         store_dir = tmp_path / 'test-store'
@@ -449,135 +330,6 @@ class TestSubcommandSets:
         """Podrun-specific subcommands must not overlap with podman subcommands."""
         overlap = PODMAN_SUBCOMMANDS & _PODRUN_SUBCOMMANDS
         assert overlap == set(), f'Overlap: {overlap}'
-
-
-class TestWrapperScriptQuoting:
-    def test_paths_with_spaces_are_quoted(self, tmp_path, monkeypatch):
-        """Wrapper scripts quote all paths so spaces don't break them."""
-        store_dir = tmp_path / 'my store dir'
-        store_dir.mkdir()
-        monkeypatch.setattr(
-            podrun_mod.shutil,
-            'which',
-            lambda x: '/usr/bin/my podman',
-        )
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        podman_content = (store_dir / 'bin' / 'podman').read_text()
-        podrun_content = (store_dir / 'bin' / 'podrun').read_text()
-        graphroot = str(store_dir / 'graphroot')
-        # Verify paths are quoted in both wrappers
-        assert f'--root "{graphroot}"' in podman_content
-        assert f'--root "{graphroot}"' in podrun_content
-        assert '"/usr/bin/my podman"' in podman_content
-
-
-class TestActivateScriptFunctional:
-    """Run the activate script in a real shell and verify behavior."""
-
-    def _init_store(self, tmp_path, monkeypatch):
-        """Helper to create a store and return its path."""
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir)])
-        return store_dir
-
-    def test_activate_prepends_bin_to_path(self, tmp_path, monkeypatch):
-        store_dir = self._init_store(tmp_path, monkeypatch)
-        result = subprocess.run(
-            ['bash', '-c', f'source "{store_dir}/activate" && echo "$PATH"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert str(store_dir / 'bin') in result.stdout.split(':')[0]
-
-    def test_activate_sets_ps1(self, tmp_path, monkeypatch):
-        store_dir = self._init_store(tmp_path, monkeypatch)
-        result = subprocess.run(
-            ['bash', '-c', f'PS1="$ " && source "{store_dir}/activate" && echo "$PS1"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert '(podrun-store)' in result.stdout
-
-    def test_deactivate_restores_path(self, tmp_path, monkeypatch):
-        store_dir = self._init_store(tmp_path, monkeypatch)
-        result = subprocess.run(
-            [
-                'bash',
-                '-c',
-                f'OLD_PATH="$PATH" && '
-                f'source "{store_dir}/activate" && '
-                f'deactivate_podrun_store && '
-                f'[ "$PATH" = "$OLD_PATH" ] && echo "PATH_RESTORED"',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert 'PATH_RESTORED' in result.stdout
-
-    def test_deactivate_restores_ps1(self, tmp_path, monkeypatch):
-        store_dir = self._init_store(tmp_path, monkeypatch)
-        result = subprocess.run(
-            [
-                'bash',
-                '-c',
-                f'PS1="original$ " && '
-                f'source "{store_dir}/activate" && '
-                f'deactivate_podrun_store && '
-                f'printf "%s\\n" "$PS1"',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert result.stdout.strip() == 'original$'
-
-    def test_activate_creates_runroot_dir(self, tmp_path, monkeypatch):
-        """Activate recreates the /tmp runroot dir (post-reboot scenario)."""
-        store_dir = self._init_store(tmp_path, monkeypatch)
-        runroot_target = os.readlink(str(store_dir / 'runroot'))
-        # Simulate reboot: delete the /tmp runroot dir
-        if os.path.exists(runroot_target):
-            os.rmdir(runroot_target)
-        assert not os.path.exists(runroot_target)
-        result = subprocess.run(
-            ['bash', '-c', f'source "{store_dir}/activate" && echo "ok"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        assert os.path.exists(runroot_target)
-
-    def test_registries_conf_set_and_restored(self, tmp_path, monkeypatch):
-        """Activate sets CONTAINERS_REGISTRIES_CONF; deactivate restores it."""
-        store_dir = tmp_path / 'test-store'
-        main(['store', 'init', '--store-dir', str(store_dir), '--registry', 'mirror.example.com'])
-        reg_path = str(store_dir / 'registries.conf')
-        result = subprocess.run(
-            [
-                'bash',
-                '-c',
-                f'unset CONTAINERS_REGISTRIES_CONF && '
-                f'source "{store_dir}/activate" && '
-                f'echo "$CONTAINERS_REGISTRIES_CONF" && '
-                f'deactivate_podrun_store && '
-                f'echo "${{CONTAINERS_REGISTRIES_CONF:-unset}}"',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, f'stderr: {result.stderr}'
-        lines = result.stdout.strip().splitlines()
-        assert lines[0] == reg_path
-        assert lines[1] == 'unset'
 
 
 class TestWarnMissingSubids:
@@ -650,3 +402,519 @@ class TestWarnMissingSubids:
         _warn_missing_subids()
         out = capsys.readouterr().out
         assert out == ''
+
+
+class TestResolveStoreFlags:
+    """Tests for _resolve_store_flags() and --store integration in main()."""
+
+    def test_resolves_to_root_runroot_driver(self, tmp_path, monkeypatch):
+        """--store resolves to --root/--runroot/--storage-driver in output."""
+        store_dir = tmp_path / 'test-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        flags, env = _resolve_store_flags(str(store_dir))
+        assert flags[0] == '--root'
+        assert flags[1] == str(store_dir / 'graphroot')
+        assert flags[2] == '--runroot'
+        assert flags[4] == '--storage-driver'
+        assert flags[5] == 'overlay'
+
+    def test_nonexistent_store_errors_without_auto_init(self, tmp_path, capsys):
+        """--store with nonexistent dir errors without --auto-init-store."""
+        store_dir = tmp_path / 'no-such-store'
+        with pytest.raises(SystemExit) as exc_info:
+            _resolve_store_flags(str(store_dir))
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert 'does not contain a graphroot' in err
+        assert '--auto-init-store' in err
+
+    def test_auto_init_creates_store(self, tmp_path, monkeypatch):
+        """--auto-init-store creates store on first use."""
+        store_dir = tmp_path / 'auto-store'
+        flags, env = _resolve_store_flags(str(store_dir), auto_init=True)
+        assert (store_dir / 'graphroot').is_dir()
+        assert flags[0] == '--root'
+        assert flags[1] == str(store_dir / 'graphroot')
+
+    def test_auto_init_idempotent(self, tmp_path, monkeypatch):
+        """--auto-init-store on existing store works without error."""
+        store_dir = tmp_path / 'idem-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        flags1, _ = _resolve_store_flags(str(store_dir), auto_init=True)
+        flags2, _ = _resolve_store_flags(str(store_dir), auto_init=True)
+        assert flags1 == flags2
+
+    def test_sets_registries_conf_env(self, tmp_path, monkeypatch):
+        """--store sets CONTAINERS_REGISTRIES_CONF when registries.conf present."""
+        store_dir = tmp_path / 'reg-store'
+        main(['store', 'init', '--store-dir', str(store_dir), '--registry', 'mirror.example.com'])
+        flags, env = _resolve_store_flags(str(store_dir))
+        assert 'CONTAINERS_REGISTRIES_CONF' in env
+        assert env['CONTAINERS_REGISTRIES_CONF'] == str(store_dir / 'registries.conf')
+
+    def test_no_registries_conf_no_env(self, tmp_path, monkeypatch):
+        """--store without registries.conf sets no env."""
+        store_dir = tmp_path / 'no-reg-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        flags, env = _resolve_store_flags(str(store_dir))
+        assert 'CONTAINERS_REGISTRIES_CONF' not in env
+
+    def test_recreates_runroot_if_missing(self, tmp_path, monkeypatch):
+        """--store recreates runroot if missing (post-reboot scenario)."""
+        store_dir = tmp_path / 'reboot-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        # Simulate reboot: remove the runroot target
+        graphroot_str = str(store_dir / 'graphroot')
+        runroot = _runroot_path(graphroot_str)
+        if os.path.isdir(runroot):
+            os.rmdir(runroot)
+        assert not os.path.isdir(runroot)
+        flags, env = _resolve_store_flags(str(store_dir))
+        assert os.path.isdir(runroot)
+
+    def test_store_registry_wires_through(self, tmp_path, monkeypatch):
+        """--store-registry wires through to registries.conf during auto-init."""
+        store_dir = tmp_path / 'mirror-store'
+        flags, env = _resolve_store_flags(
+            str(store_dir), auto_init=True, registry='my-mirror.local'
+        )
+        reg_conf = store_dir / 'registries.conf'
+        assert reg_conf.exists()
+        assert 'my-mirror.local' in reg_conf.read_text()
+        assert 'CONTAINERS_REGISTRIES_CONF' in env
+
+
+class TestStoreMainIntegration:
+    """Tests for --store flag integration in main()."""
+
+    def test_print_cmd_contains_store_flags(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """--store resolves to --root/--runroot/--storage-driver in --print-cmd output."""
+        store_dir = tmp_path / 'cmd-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--store', str(store_dir), '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert '--root' in out
+        assert str(store_dir / 'graphroot') in out
+        assert '--runroot' in out
+        assert '--storage-driver' in out
+
+    def test_store_conflicts_with_global_root(self, tmp_path, monkeypatch, capsys):
+        """--store with --root in global flags errors."""
+        store_dir = tmp_path / 'conflict-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    '--root',
+                    '/some/path',
+                    'run',
+                    '--store',
+                    str(store_dir),
+                    '--no-devconfig',
+                    '--print-cmd',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--store conflicts with --root' in err
+
+    def test_store_conflicts_with_global_runroot(self, tmp_path, monkeypatch, capsys):
+        """--store with --runroot in global flags errors."""
+        store_dir = tmp_path / 'conflict-store2'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    '--runroot',
+                    '/some/path',
+                    'run',
+                    '--store',
+                    str(store_dir),
+                    '--no-devconfig',
+                    '--print-cmd',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--store conflicts with --runroot' in err
+
+    def test_store_conflicts_with_global_storage_driver(self, tmp_path, monkeypatch, capsys):
+        """--store with --storage-driver in global flags errors."""
+        store_dir = tmp_path / 'conflict-store3'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    '--storage-driver',
+                    'vfs',
+                    'run',
+                    '--store',
+                    str(store_dir),
+                    '--no-devconfig',
+                    '--print-cmd',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--store conflicts with --storage-driver' in err
+
+    def test_auto_init_store_without_store_errors(
+        self, tmp_path, monkeypatch, capsys, mock_run_os_cmd
+    ):
+        """--auto-init-store without --store errors."""
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--auto-init-store', '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--auto-init-store requires --store' in err
+
+    def test_store_registry_without_auto_init_errors(
+        self, tmp_path, monkeypatch, capsys, mock_run_os_cmd
+    ):
+        """--store-registry without --auto-init-store errors."""
+        store_dir = tmp_path / 'reg-err-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--store',
+                    str(store_dir),
+                    '--store-registry',
+                    'mirror.local',
+                    '--no-devconfig',
+                    '--print-cmd',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--store-registry requires --auto-init-store' in err
+
+    def test_store_sets_env_registries_conf(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """--store sets CONTAINERS_REGISTRIES_CONF in os.environ when present."""
+        store_dir = tmp_path / 'env-store'
+        main(['store', 'init', '--store-dir', str(store_dir), '--registry', 'mirror.example.com'])
+        capsys.readouterr()
+        # Remove any pre-existing value
+        monkeypatch.delenv('CONTAINERS_REGISTRIES_CONF', raising=False)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--store', str(store_dir), '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        assert os.environ.get('CONTAINERS_REGISTRIES_CONF') == str(store_dir / 'registries.conf')
+
+    def test_auto_init_creates_store_via_main(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """--store + --auto-init-store creates store on first use via main()."""
+        store_dir = tmp_path / 'automain-store'
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--store',
+                    str(store_dir),
+                    '--auto-init-store',
+                    '--no-devconfig',
+                    '--print-cmd',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        assert (store_dir / 'graphroot').is_dir()
+        out = capsys.readouterr().out
+        assert '--root' in out
+        assert str(store_dir / 'graphroot') in out
+
+
+class TestStoreDevconfig:
+    """Tests for store/autoInitStore/storeRegistry in devcontainer.json."""
+
+    def _write_devconfig(self, tmp_path, podrun_cfg, image='alpine'):
+        """Write a devcontainer.json and chdir into tmp_path."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc = {'image': image, 'customizations': {'podrun': podrun_cfg}}
+        (dc_dir / 'devcontainer.json').write_text(json.dumps(dc))
+
+    def test_store_from_devconfig(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """store in devcontainer.json resolves to --root/--runroot/--storage-driver."""
+        store_dir = tmp_path / 'dc-store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        self._write_devconfig(tmp_path, {'store': str(store_dir)})
+        monkeypatch.chdir(tmp_path)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--print-cmd'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert '--root' in out
+        assert str(store_dir / 'graphroot') in out
+
+    def test_auto_init_store_from_devconfig(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """autoInitStore in devcontainer.json creates store on first use."""
+        store_dir = tmp_path / 'dc-auto-store'
+        self._write_devconfig(tmp_path, {'store': str(store_dir), 'autoInitStore': True})
+        monkeypatch.chdir(tmp_path)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--print-cmd'])
+        assert exc_info.value.code == 0
+        assert (store_dir / 'graphroot').is_dir()
+        out = capsys.readouterr().out
+        assert '--root' in out
+
+    def test_store_registry_from_devconfig(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """storeRegistry in devcontainer.json wires through to registries.conf."""
+        store_dir = tmp_path / 'dc-reg-store'
+        self._write_devconfig(
+            tmp_path,
+            {'store': str(store_dir), 'autoInitStore': True, 'storeRegistry': 'mirror.local'},
+        )
+        monkeypatch.chdir(tmp_path)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--print-cmd'])
+        assert exc_info.value.code == 0
+        reg_conf = store_dir / 'registries.conf'
+        assert reg_conf.exists()
+        assert 'mirror.local' in reg_conf.read_text()
+
+    def test_cli_store_overrides_devconfig(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """CLI --store overrides store from devcontainer.json."""
+        dc_store = tmp_path / 'dc-store'
+        cli_store = tmp_path / 'cli-store'
+        main(['store', 'init', '--store-dir', str(dc_store)])
+        main(['store', 'init', '--store-dir', str(cli_store)])
+        capsys.readouterr()
+        self._write_devconfig(tmp_path, {'store': str(dc_store)})
+        monkeypatch.chdir(tmp_path)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--store', str(cli_store), '--print-cmd'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert str(cli_store / 'graphroot') in out
+        assert str(dc_store / 'graphroot') not in out
+
+    def test_auto_init_store_without_store_in_devconfig_errors(
+        self, tmp_path, monkeypatch, capsys, mock_run_os_cmd
+    ):
+        """autoInitStore without store in devcontainer.json errors."""
+        self._write_devconfig(tmp_path, {'autoInitStore': True})
+        monkeypatch.chdir(tmp_path)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--print-cmd'])
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--auto-init-store requires --store' in err
+
+    def test_store_registry_without_auto_init_in_devconfig_errors(
+        self, tmp_path, monkeypatch, capsys, mock_run_os_cmd
+    ):
+        """storeRegistry without autoInitStore in devcontainer.json errors."""
+        store_dir = tmp_path / 'dc-reg-err'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        self._write_devconfig(tmp_path, {'store': str(store_dir), 'storeRegistry': 'mirror.local'})
+        monkeypatch.chdir(tmp_path)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--print-cmd'])
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--store-registry requires --auto-init-store' in err
+
+
+class TestDiscoverStore:
+    """Tests for _find_project_context() store discovery."""
+
+    def test_finds_initialized_store(self, tmp_path):
+        """Discovers store at .devcontainer/.podrun/store/graphroot/."""
+        store = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        (store / 'graphroot').mkdir(parents=True)
+        ctx = _find_project_context(start_dir=str(tmp_path))
+        assert ctx.store_dir == str(store)
+
+    def test_ignores_uninitialized(self, tmp_path):
+        """No graphroot/ means no store discovered."""
+        store = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        store.mkdir(parents=True)
+        ctx = _find_project_context(start_dir=str(tmp_path))
+        assert ctx.store_dir is None
+
+    def test_walks_upward(self, tmp_path):
+        """Finds store in parent directory."""
+        store = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        (store / 'graphroot').mkdir(parents=True)
+        child = tmp_path / 'sub' / 'dir'
+        child.mkdir(parents=True)
+        ctx = _find_project_context(start_dir=str(child))
+        assert ctx.store_dir == str(store)
+
+    def test_returns_none_when_absent(self, tmp_path):
+        """No .devcontainer/.podrun/store anywhere → None."""
+        child = tmp_path / 'empty'
+        child.mkdir()
+        ctx = _find_project_context(start_dir=str(child))
+        assert ctx.store_dir is None
+
+    def test_custom_start_dir(self, tmp_path):
+        """Explicit start_dir is respected."""
+        store = tmp_path / 'project' / '.devcontainer' / '.podrun' / 'store'
+        (store / 'graphroot').mkdir(parents=True)
+        ctx = _find_project_context(start_dir=str(tmp_path / 'project'))
+        assert ctx.store_dir == str(store)
+
+
+class TestHasStoreConflict:
+    """Tests for _has_store_conflict()."""
+
+    def test_no_conflict(self):
+        assert not _has_store_conflict(['--log-level', 'debug'])
+
+    def test_root_conflict(self):
+        assert _has_store_conflict(['--root=/x'])
+
+    def test_root_conflict_space(self):
+        assert _has_store_conflict(['--root', '/x'])
+
+    def test_runroot_conflict(self):
+        assert _has_store_conflict(['--runroot=/x'])
+
+    def test_storage_driver_conflict(self):
+        assert _has_store_conflict(['--storage-driver', 'vfs'])
+
+    def test_empty(self):
+        assert not _has_store_conflict([])
+
+
+class TestAutoDiscoveryIntegration:
+    """Tests for auto-discovery integration in main()."""
+
+    def _init_project_store(self, tmp_path, monkeypatch):
+        """Create an initialized store at .devcontainer/.podrun/store and chdir."""
+        store_dir = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        monkeypatch.chdir(tmp_path)
+        # Restore real _find_project_context (autouse fixture patches it out).
+        monkeypatch.setattr(podrun_mod, '_find_project_context', _find_project_context)
+        return store_dir
+
+    def test_run_auto_discovers_store(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """Auto-discovery injects store flags for run (via --print-cmd)."""
+        store_dir = self._init_project_store(tmp_path, monkeypatch)
+        capsys.readouterr()
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert '--root' in out
+        assert str(store_dir / 'graphroot') in out
+
+    def test_exec_auto_discovers_store(self, tmp_path, monkeypatch):
+        """Auto-discovery injects store flags for exec."""
+        store_dir = self._init_project_store(tmp_path, monkeypatch)
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['exec', 'mycontainer', 'ls'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        assert '--root' in cmd
+        assert str(store_dir / 'graphroot') in cmd
+
+    def test_passthrough_auto_discovers_store(self, tmp_path, monkeypatch):
+        """Auto-discovery injects store flags for passthrough (e.g. ps)."""
+        store_dir = self._init_project_store(tmp_path, monkeypatch)
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['ps', '-a'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        assert '--root' in cmd
+        assert str(store_dir / 'graphroot') in cmd
+
+    def test_cli_store_overrides_discovery(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """CLI --store overrides auto-discovered store."""
+        self._init_project_store(tmp_path, monkeypatch)
+        cli_store = tmp_path / 'cli-store'
+        main(['store', 'init', '--store-dir', str(cli_store)])
+        capsys.readouterr()
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--store', str(cli_store), '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert str(cli_store / 'graphroot') in out
+
+    def test_devconfig_store_overrides_discovery(
+        self, tmp_path, monkeypatch, capsys, mock_run_os_cmd
+    ):
+        """devcontainer.json store overrides auto-discovered store."""
+        self._init_project_store(tmp_path, monkeypatch)
+        dc_store = tmp_path / 'dc-store'
+        main(['store', 'init', '--store-dir', str(dc_store)])
+        capsys.readouterr()
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir(exist_ok=True)
+        (dc_dir / 'devcontainer.json').write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'store': str(dc_store)}},
+                }
+            )
+        )
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--print-cmd'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert str(dc_store / 'graphroot') in out
+
+    def test_explicit_root_silently_skips_exec(self, tmp_path, monkeypatch):
+        """Explicit --root in global flags silently skips discovery for exec."""
+        self._init_project_store(tmp_path, monkeypatch)
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['--root=/custom', 'exec', 'mycontainer', 'ls'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        assert '--root=/custom' in cmd
+        # Should NOT contain the discovered store's graphroot
+        graphroot = str(tmp_path / '.devcontainer' / '.podrun' / 'store' / 'graphroot')
+        assert graphroot not in cmd

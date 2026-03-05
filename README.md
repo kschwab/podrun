@@ -211,6 +211,9 @@ directory (searching upward). Supported fields:
         "podrun": {
             "name": "mydev",
             "podmanPath": "/opt/podman/bin/podman",
+            "store": ".devcontainer/.podrun/store",
+            "autoInitStore": true,
+            "storeRegistry": "mirror.example.com",
             "userOverlay": true,
             "hostOverlay": true,
             "interactiveOverlay": true,
@@ -372,38 +375,89 @@ wrapper scripts that inject `--root`/`--runroot`/`--storage-driver` CLI flags.
 This keeps all images, layers, and runtime state local to the project without
 affecting your system podman.
 
+#### Auto-Discovery
+
+Podrun automatically discovers project-local stores by walking upward from the
+current directory looking for `.devcontainer/.podrun/store/graphroot/`. When
+found, store flags (`--root`/`--runroot`/`--storage-driver`) are injected
+automatically for all subcommands — `run`, `exec`, and passthrough (`ps`,
+`images`, etc.):
+
 ```bash
-podrun store init
-source .podrun-store/activate
+podrun store init                    # creates .devcontainer/.podrun/store/
+cd sub/dir                           # works from any subdirectory
+podrun ps                            # auto-discovers and uses project store
+podrun --adhoc ubuntu:24.04          # auto-discovers for run too
+podrun exec mycontainer ls           # auto-discovers for exec too
 ```
 
-After activation, `podman`, `podrun`, and `python3` in your `PATH` all resolve
-to the wrapper scripts under `.podrun-store/bin/`. The prompt shows
-`(podrun-store)` to indicate the active store.
+Auto-discovery has the lowest priority. Explicit `--store` and devcontainer.json
+`store` key take precedence. If `--root`/`--runroot`/`--storage-driver` are
+already present in global flags, discovery is silently skipped.
+
+Use `--no-store` to bypass auto-discovery:
 
 ```bash
-which podman    # .podrun-store/bin/podman
-podman images   # shows images in project-local store
-podrun --adhoc ubuntu:24.04  # uses project-local storage
+podrun --no-store ps                 # uses system podman storage
 ```
 
-To deactivate:
+`--no-store` only suppresses auto-discovery; explicit `--store` and devconfig
+`store` still work when `--no-store` is set.
+
+#### Inline Usage (`--store`)
+
+The `--store` flag resolves a store directory into podman global flags inline,
+skipping the activation step entirely:
+
 ```bash
-deactivate_podrun_store
+podrun store init                              # one-time setup
+podrun --store .devcontainer/.podrun/store --adhoc ubuntu:24.04  # use store directly
 ```
 
-Options:
+Use `--auto-init-store` to create the store on first use (no separate init
+step):
+
 ```bash
-podrun store init --store-dir .podrun-store  # custom directory (default: .podrun-store)
+podrun --store .devcontainer/.podrun/store --auto-init-store --adhoc ubuntu:24.04
+```
+
+Use `--store-registry` to configure a registry mirror during auto-init:
+
+```bash
+podrun --store .devcontainer/.podrun/store --auto-init-store --store-registry mirror.example.com --adhoc ubuntu:24.04
+```
+
+These flags can also be set in devcontainer.json (see
+[devcontainer.json](#devcontainerjson)):
+
+```jsonc
+{
+  "customizations": {
+    "podrun": {
+      "store": ".devcontainer/.podrun/store",
+      "autoInitStore": true,
+      "storeRegistry": "mirror.example.com"
+    }
+  }
+}
+```
+
+`--store` conflicts with explicit `--root`/`--runroot`/`--storage-driver` in
+global flags.
+
+#### Store Options
+
+```bash
+podrun store init --store-dir .devcontainer/.podrun/store  # custom directory (default: .devcontainer/.podrun/store)
 podrun store init --registry mirror.example.com  # configure registry mirror
-podrun store info     # show store paths, activation status, and registry config
+podrun store info     # show store paths and registry config
 podrun store destroy  # remove store and its /tmp runroot
 ```
 
 The runroot (runtime state) lives under `/tmp/podrun-stores/` to avoid NFS
-issues and the 108-byte `sun_path` limit. A symlink at `.podrun-store/runroot`
-makes the relationship visible. After a reboot, the activate script recreates
-the `/tmp` directory automatically.
+issues and the 108-byte `sun_path` limit. A symlink at
+`.devcontainer/.podrun/store/runroot` makes the relationship visible. After a
+reboot, `--store` recreates the `/tmp` directory automatically.
 
 ### Shell Completion
 
@@ -428,9 +482,6 @@ podrun --completion fish | source
 
 After reloading your shell, `podrun <TAB>` will complete subcommands, images,
 container names, flags, and all other values that podman's completion supports.
-Note that `source .podrun-store/activate` also provides completion since
-`podrun` in `bin/` is the real podrun, and shell completion is configured
-separately in your shell rc file.
 
 ## Testing
 
@@ -468,7 +519,7 @@ python3 -m pytest tests/ -m live -v                              # live tests on
 ```
 
 Live and devcontainer tests automatically manage a
-[podrun store](#podman-local-storage-podrun-store) under `.podrun-store/` so
+[podrun store](#podman-local-storage-podrun-store) under `.devcontainer/.podrun/store/` so
 they do not interfere with your system podman. Use `--registry` with any test
 command to pull through a registry mirror (e.g. behind a corporate proxy):
 ```bash
@@ -531,6 +582,10 @@ frequent with parallel execution (`-n3`) due to shared podman infrastructure
 | `--config PATH` | Explicit path to devcontainer.json |
 | `--no-devconfig` | Skip devcontainer.json discovery |
 | `--config-script PATH` | Run script and inline its stdout as args |
+| `--store DIR` | Use project-local store directory (see [Podrun Store](#podman-local-storage-podrun-store)) |
+| `--no-store` | Suppress auto-discovery of project-local store |
+| `--auto-init-store` | Auto-create store if missing (requires `--store`) |
+| `--store-registry HOST` | Registry mirror for auto-init (requires `--store` + `--auto-init-store`) |
 | `--fuse-overlayfs` | Use fuse-overlayfs for overlay mounts (see [Fuse-Overlayfs](#fuse-overlayfs)) |
 | `--check-flags` | Diff static podman flags against installed podman |
 | `--completion SHELL` | Generate shell completion script (`bash`, `zsh`, `fish`) and exit |

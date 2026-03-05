@@ -175,6 +175,17 @@ def _patch_module_constants(request, monkeypatch, tmp_path):
         'which',
         lambda x: 'podman' if x == 'podman' else _real_which(x),
     )
+    # Prevent auto-discovery from finding the real project store in unit tests.
+    # We wrap the real function but always nullify store_dir so that unit tests
+    # don't accidentally inject store flags from the project's real store.
+    _real_find_project_context = podrun_mod._find_project_context
+
+    def _patched_find_project_context(**kwargs):
+        ctx = _real_find_project_context(**kwargs)
+        ctx.store_dir = None
+        return ctx
+
+    monkeypatch.setattr(podrun_mod, '_find_project_context', _patched_find_project_context)
 
 
 @pytest.fixture
@@ -212,6 +223,9 @@ def make_cli_args():
             export=None,
             fuse_overlayfs=None,
             had_config_script=False,
+            store=None,
+            auto_init_store=False,
+            store_registry=None,
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)

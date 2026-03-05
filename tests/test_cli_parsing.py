@@ -73,9 +73,10 @@ class TestParseCliArgs:
         args = parse_cli_args(['alpine', '--', 'bash', '-c', 'echo hi'])
         assert args.explicit_command == ['bash', '-c', 'echo hi']
 
-    def test_version_exits(self, mock_run_os_cmd):
-        with pytest.raises(SystemExit):
-            parse_cli_args(['--version'])
+    def test_version_is_unknown_flag(self, mock_run_os_cmd):
+        """--version is handled by main(), not argparse; parse_cli_args treats it as unknown."""
+        args = parse_cli_args(['--version', 'alpine'])
+        assert '--version' in args.passthrough_args
 
     def test_value_flag_consumption(self, mock_run_os_cmd):
         args = parse_cli_args(['-v', '/src:/dest', 'alpine'])
@@ -336,7 +337,7 @@ class TestPodrunParser:
         assert '--workspace' in flags
         assert '--adhoc' in flags
         assert '--name' in flags
-        assert '--version' in flags
+        # --version is handled in main(), not registered as an argparse flag
 
     def test_registry_tracks_value_flags(self, mock_run_os_cmd):
         self._ensure_run_parser(mock_run_os_cmd)

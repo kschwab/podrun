@@ -4,7 +4,71 @@ import subprocess
 import pytest
 
 import podrun.podrun as podrun_mod
-from podrun.podrun import _detect_subcommand, main
+from podrun.podrun import __version__, _detect_subcommand, _find_project_context, main
+
+
+class TestVersion:
+    """Test that -v / --version print both podman and podrun versions."""
+
+    def test_dash_v(self, mock_run_os_cmd, capsys):
+        """podrun -v → prints podman version + podrun version."""
+        mock_run_os_cmd.set_return(stdout='podman version 5.0.0\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['-v'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'podman version 5.0.0' in out
+        assert f'podrun {__version__}' in out
+
+    def test_double_dash_version(self, mock_run_os_cmd, capsys):
+        """podrun --version → prints podman version + podrun version."""
+        mock_run_os_cmd.set_return(stdout='podman version 5.0.0\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--version'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'podman version 5.0.0' in out
+        assert f'podrun {__version__}' in out
+
+    def test_run_double_dash_version(self, mock_run_os_cmd, capsys):
+        """podrun run --version → prints podman version + podrun version."""
+        mock_run_os_cmd.set_return(stdout='podman version 5.0.0\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--version'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'podman version 5.0.0' in out
+        assert f'podrun {__version__}' in out
+
+    def test_exec_double_dash_version(self, mock_run_os_cmd, capsys):
+        """podrun exec --version → prints podman version + podrun version."""
+        mock_run_os_cmd.set_return(stdout='podman version 5.0.0\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['exec', '--version'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'podman version 5.0.0' in out
+        assert f'podrun {__version__}' in out
+
+    def test_store_double_dash_version(self, mock_run_os_cmd, capsys):
+        """podrun store --version → prints podman version + podrun version."""
+        mock_run_os_cmd.set_return(stdout='podman version 5.0.0\n')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['store', '--version'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'podman version 5.0.0' in out
+        assert f'podrun {__version__}' in out
+
+    def test_version_podman_fails(self, mock_run_os_cmd, capsys):
+        """podrun --version with podman failure → still prints podrun version."""
+        mock_run_os_cmd.set_return(returncode=1, stdout='')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--version'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert f'podrun {__version__}' in out
+        assert 'podman' not in out
 
 
 class TestMain:
@@ -985,3 +1049,54 @@ class TestDetectSubcommand:
     )
     def test_detect(self, argv, expected):
         assert _detect_subcommand(argv) == expected
+
+
+class TestNoStoreFlag:
+    """Tests for --no-store flag."""
+
+    def test_no_store_stripped_from_passthrough(self, monkeypatch):
+        """--no-store is stripped from passthrough args."""
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['--no-store', 'ps', '-a'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        assert '--no-store' not in cmd
+        assert cmd == ['podman', 'ps', '-a']
+
+    def test_no_store_after_separator_preserved(self, monkeypatch):
+        """--no-store after -- is preserved (not stripped)."""
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['ps', '--', '--no-store'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        assert '--no-store' in cmd
+
+    def test_no_store_suppresses_discovery(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
+        """--no-store suppresses auto-discovery for run."""
+        store_dir = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+        monkeypatch.chdir(tmp_path)
+        # Restore real _find_project_context (autouse fixture patches it out).
+        monkeypatch.setattr(podrun_mod, '_find_project_context', _find_project_context)
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--no-store', 'run', '--no-devconfig', '--print-cmd', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        # Should NOT have store flags
+        assert str(store_dir / 'graphroot') not in out

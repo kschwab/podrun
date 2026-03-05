@@ -6,8 +6,7 @@ Run this to generate podman storage and registry configuration::
     pytest tests/test_setup.py --registry=my-mirror.example.com -v
 
 The generated configs live under ``.podrun-store/`` and are used
-automatically by all live and devcontainer tests.  For manual use,
-``source .podrun-store/activate``.
+automatically by all live and devcontainer tests.
 """
 
 import os
@@ -25,28 +24,6 @@ def test_store_directories(podman_store):
     assert runroot_link.is_symlink(), f'{runroot_link} is not a symlink'
     runroot_target = pathlib.Path(os.readlink(str(runroot_link)))
     assert runroot_target.exists(), f'runroot target {runroot_target} not found'
-
-
-def test_activate_script(podman_store):
-    """Verify activate script exists and uses CLI flags (not XDG_CONFIG_HOME)."""
-    activate = PODRUN_STORE / 'activate'
-    assert activate.exists(), f'{activate} not found'
-    content = activate.read_text()
-    assert 'PATH=' in content
-    assert 'deactivate_podrun_store' in content
-    assert 'XDG_CONFIG_HOME' not in content
-
-
-def test_bin_wrappers(podman_store):
-    """Verify bin/ wrapper scripts exist and contain store flags."""
-    bin_dir = PODRUN_STORE / 'bin'
-    for name in ('podman', 'podrun'):
-        wrapper = bin_dir / name
-        assert wrapper.exists(), f'{wrapper} not found'
-        content = wrapper.read_text()
-        assert '--root' in content
-        assert '--runroot' in content
-        assert '--storage-driver' in content
 
 
 def test_registry_config(podman_store, request):

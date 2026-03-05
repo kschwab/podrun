@@ -69,7 +69,7 @@ class TestBuildPodmanArgs:
         assert '-v=/etc/localtime:/etc/localtime:ro' in args
 
     def test_env(self, make_config):
-        config = make_config(container_env={'FOO': 'bar'}, remote_env={'BAZ': 'qux'})
+        config = make_config(remote_env={'FOO': 'bar', 'BAZ': 'qux'})
         args = build_podman_args(config)
         assert '--env=FOO=bar' in args
         assert '--env=BAZ=qux' in args

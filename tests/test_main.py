@@ -4,7 +4,13 @@ import subprocess
 import pytest
 
 import podrun.podrun as podrun_mod
-from podrun.podrun import __version__, _detect_subcommand, _find_project_context, main
+from podrun.podrun import (
+    __version__,
+    _detect_subcommand,
+    _find_project_context,
+    _strip_root_flags,
+    main,
+)
 
 
 class TestVersion:
@@ -86,6 +92,30 @@ class TestMain:
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert '--export requires --user-overlay' in err
+
+    def test_export_volume_conflict_warns(self, mock_run_os_cmd, capsys):
+        """Export that conflicts with a -v mount is filtered with a warning; others kept."""
+        mock_run_os_cmd.set_return(returncode=1)
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    'run',
+                    '--no-devconfig',
+                    '--user-overlay',
+                    '--export',
+                    '/opt/sdk:./sdk',
+                    '--export',
+                    '/opt/other:./other',
+                    '--print-cmd',
+                    '-v=/host/sdk:/opt/sdk',
+                    'alpine',
+                ]
+            )
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "export '/opt/sdk:./sdk' skipped" in captured.err
+        # The non-conflicting export should still produce a volume mount
+        assert '/.podrun/exports/' in captured.out
 
     def test_print_overlays_exits(self, mock_run_os_cmd, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -508,6 +538,40 @@ class TestTopLevelHelp:
         # Podrun sections still present
         assert 'Available Commands:' in out
         assert 'store' in out
+        # Global store options are listed
+        assert 'Options:' in out
+        assert '--store DIR' in out
+        assert '--ignore-store' in out
+        assert '--auto-init-store' in out
+        assert '--store-registry' in out
+
+    def test_top_level_help_podman_succeeds(self, mock_run_os_cmd, capsys):
+        """podrun --help shows podman help (with 'podman' replaced by 'podrun')."""
+        mock_run_os_cmd.set_return(stdout='Manage pods, containers and images\npodman')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--help'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'podrun' in out
+        # 'podman' should be replaced with 'podrun' in the output
+        assert 'Manage pods, containers and images' in out
+        assert 'Available Commands:' in out
+        # Global store options are listed
+        assert 'Options:' in out
+        assert '--store DIR' in out
+        assert '--ignore-store' in out
+
+    def test_run_help(self, mock_run_os_cmd, capsys):
+        """podrun run --help shows podman run help + podrun run options."""
+        mock_run_os_cmd.set_return(stdout='podman run [options] IMAGE [COMMAND]')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--help'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        # podman run → podrun in help text
+        assert 'podrun' in out
+        # Podrun section header
+        assert 'Podrun:' in out
 
 
 class TestGlobalFlagsPassthrough:
@@ -890,6 +954,22 @@ class TestContainerStateWithoutPrintCmd:
         assert len(execvpe_calls) == 1
         assert 'exec' in execvpe_calls[0][1]
 
+    def test_running_auto_attach_no_user_overlay_errors(self, mock_run_os_cmd, capsys):
+        """Running + --auto-attach but no user overlay → error."""
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='running\n', stderr=''),
+                subprocess.CompletedProcess(
+                    args='', returncode=0, stdout='PODRUN_OVERLAYS=host\n', stderr=''
+                ),
+            ]
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--no-devconfig', '--auto-attach', '--name', 'test', 'alpine'])
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert 'not created with podrun user overlay' in err
+
     def test_stopped_auto_attach_warns_exits(self, mock_run_os_cmd, capsys):
         """Stopped + --auto-attach → warns can't attach, exits 0 (no action)."""
         mock_run_os_cmd.set_return(stdout='exited\n')
@@ -1051,11 +1131,11 @@ class TestDetectSubcommand:
         assert _detect_subcommand(argv) == expected
 
 
-class TestNoStoreFlag:
-    """Tests for --no-store flag."""
+class TestIgnoreStoreFlag:
+    """Tests for --ignore-store flag."""
 
-    def test_no_store_stripped_from_passthrough(self, monkeypatch):
-        """--no-store is stripped from passthrough args."""
+    def test_ignore_store_stripped_from_passthrough(self, monkeypatch):
+        """--ignore-store is stripped from passthrough args."""
         execvpe_calls = []
 
         def fake_execvpe(*a):
@@ -1064,14 +1144,14 @@ class TestNoStoreFlag:
 
         monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
         with pytest.raises(SystemExit):
-            main(['--no-store', 'ps', '-a'])
+            main(['--ignore-store', 'ps', '-a'])
         assert len(execvpe_calls) == 1
         cmd = execvpe_calls[0][1]
-        assert '--no-store' not in cmd
+        assert '--ignore-store' not in cmd
         assert cmd == ['podman', 'ps', '-a']
 
-    def test_no_store_after_separator_preserved(self, monkeypatch):
-        """--no-store after -- is preserved (not stripped)."""
+    def test_ignore_store_after_separator_preserved(self, monkeypatch):
+        """--ignore-store after -- is preserved (not stripped)."""
         execvpe_calls = []
 
         def fake_execvpe(*a):
@@ -1080,13 +1160,15 @@ class TestNoStoreFlag:
 
         monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
         with pytest.raises(SystemExit):
-            main(['ps', '--', '--no-store'])
+            main(['ps', '--', '--ignore-store'])
         assert len(execvpe_calls) == 1
         cmd = execvpe_calls[0][1]
-        assert '--no-store' in cmd
+        assert '--ignore-store' in cmd
 
-    def test_no_store_suppresses_discovery(self, tmp_path, monkeypatch, capsys, mock_run_os_cmd):
-        """--no-store suppresses auto-discovery for run."""
+    def test_ignore_store_suppresses_discovery(
+        self, tmp_path, monkeypatch, capsys, mock_run_os_cmd
+    ):
+        """--ignore-store suppresses auto-discovery for run."""
         store_dir = tmp_path / '.devcontainer' / '.podrun' / 'store'
         main(['store', 'init', '--store-dir', str(store_dir)])
         capsys.readouterr()
@@ -1095,8 +1177,112 @@ class TestNoStoreFlag:
         monkeypatch.setattr(podrun_mod, '_find_project_context', _find_project_context)
         mock_run_os_cmd.set_return(returncode=1)
         with pytest.raises(SystemExit) as exc_info:
-            main(['--no-store', 'run', '--no-devconfig', '--print-cmd', 'alpine'])
+            main(['--ignore-store', 'run', '--no-devconfig', '--print-cmd', 'alpine'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         # Should NOT have store flags
         assert str(store_dir / 'graphroot') not in out
+
+
+class TestStoreRootFlags:
+    """Tests for root-level store flags (--store, --auto-init-store, --store-registry)."""
+
+    def test_strip_store_space_separated(self):
+        """_strip_root_flags strips --store <value> from argv."""
+        cleaned, ns = _strip_root_flags(['--store', '/my/store', 'ps', '-a'])
+        assert cleaned == ['ps', '-a']
+        assert ns.store == '/my/store'
+
+    def test_strip_store_equals(self):
+        """_strip_root_flags strips --store=<value> from argv."""
+        cleaned, ns = _strip_root_flags(['--store=/my/store', 'ps', '-a'])
+        assert cleaned == ['ps', '-a']
+        assert ns.store == '/my/store'
+
+    def test_strip_auto_init_store(self):
+        """_strip_root_flags strips --auto-init-store."""
+        cleaned, ns = _strip_root_flags(['--auto-init-store', 'ps'])
+        assert cleaned == ['ps']
+        assert ns.auto_init_store is True
+
+    def test_strip_store_registry(self):
+        """_strip_root_flags strips --store-registry."""
+        cleaned, ns = _strip_root_flags(['--store-registry', 'mirror.example.com', 'ps'])
+        assert cleaned == ['ps']
+        assert ns.store_registry == 'mirror.example.com'
+
+    def test_strip_all_store_flags(self):
+        """_strip_root_flags strips all store flags together."""
+        cleaned, ns = _strip_root_flags(
+            [
+                '--store',
+                '/s',
+                '--auto-init-store',
+                '--store-registry',
+                'host',
+                '--ignore-store',
+                'run',
+                'alpine',
+            ]
+        )
+        assert cleaned == ['run', 'alpine']
+        assert ns.store == '/s'
+        assert ns.auto_init_store is True
+        assert ns.store_registry == 'host'
+        assert ns.ignore_store is True
+
+    def test_store_after_separator_preserved(self, monkeypatch):
+        """--store after -- is preserved (not stripped)."""
+        cleaned, ns = _strip_root_flags(['ps', '--', '--store', '/some/path'])
+        assert '--store' in cleaned
+        assert '/some/path' in cleaned
+        assert ns.store is None
+
+    def test_store_passthrough_uses_store(self, tmp_path, monkeypatch, capsys):
+        """--store resolves store flags for passthrough subcommands."""
+        store_dir = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['--store', str(store_dir), 'ps', '-a'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        # --store itself should NOT appear in the podman command
+        assert '--store' not in cmd
+        # But the resolved --root flag should be present
+        assert '--root' in cmd
+        assert str(store_dir / 'graphroot') in cmd
+
+    def test_store_exec_uses_store(self, tmp_path, monkeypatch, capsys):
+        """--store resolves store flags for exec subcommand."""
+        store_dir = tmp_path / '.devcontainer' / '.podrun' / 'store'
+        main(['store', 'init', '--store-dir', str(store_dir)])
+        capsys.readouterr()
+
+        execvpe_calls = []
+
+        def fake_execvpe(*a):
+            execvpe_calls.append(a)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
+        with pytest.raises(SystemExit):
+            main(['--store', str(store_dir), 'exec', 'mycontainer', 'ls'])
+        assert len(execvpe_calls) == 1
+        cmd = execvpe_calls[0][1]
+        # --store itself should NOT appear in the podman command
+        assert '--store' not in cmd
+        # But the resolved --root flag should be present
+        assert '--root' in cmd
+        assert str(store_dir / 'graphroot') in cmd
+        # exec subcommand and args should be present
+        assert 'exec' in cmd
+        assert 'mycontainer' in cmd

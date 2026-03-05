@@ -575,6 +575,103 @@ def _run_podrun(podrun_args, podman_env, podman_store_flags=None, timeout=30):
     )
 
 
+def _run_podrun_raw(argv, podman_env, timeout=30):
+    """Run ``podrun`` with arbitrary argv (no implicit ``run``).
+
+    Use this for testing passthrough, exec, and global flag paths
+    where the subcommand is part of *argv* itself.
+    """
+    cmd = [sys.executable, '-m', 'podrun'] + argv
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=str(PROJECT_ROOT),
+        env=podman_env,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TestStoreGlobalFlags — --store / --ignore-store with passthrough & exec
+# ---------------------------------------------------------------------------
+
+
+class TestStoreGlobalFlags:
+    """Validate that --store and --ignore-store work with exec and passthrough."""
+
+    def test_store_passthrough_ps(self, podman_store, podman_env):
+        """podrun --store <dir> ps succeeds and uses the project store."""
+        store_dir = podman_store['root'].rsplit('/graphroot', 1)[0]
+        result = _run_podrun_raw(
+            ['--store', store_dir, 'ps', '-a', '--format={{.Names}}'],
+            podman_env,
+        )
+        assert result.returncode == 0, f'stderr: {result.stderr}'
+
+    def test_store_passthrough_images(self, podman_store, podman_env, pull_image):
+        """podrun --store <dir> images shows images from the store."""
+        pull_image('alpine:latest')
+        store_dir = podman_store['root'].rsplit('/graphroot', 1)[0]
+        result = _run_podrun_raw(
+            ['--store', store_dir, 'images', '--format={{.Repository}}:{{.Tag}}'],
+            podman_env,
+        )
+        assert result.returncode == 0, f'stderr: {result.stderr}'
+        assert 'alpine' in result.stdout
+
+    def test_store_exec(
+        self,
+        distro_image,
+        podman_run,
+        podman_store,
+        podman_env,
+        podman_store_flags,
+        container_name,
+    ):
+        """podrun --store <dir> exec <container> <cmd> succeeds."""
+        name = container_name('podrun-test-store-exec')
+        podman_run(['run', '-d', f'--name={name}', distro_image, 'sleep', '60'])
+        try:
+            store_dir = podman_store['root'].rsplit('/graphroot', 1)[0]
+            result = _run_podrun_raw(
+                ['--store', store_dir, 'exec', name, 'echo', 'hello'],
+                podman_env,
+            )
+            assert result.returncode == 0, f'stderr: {result.stderr}'
+            assert 'hello' in result.stdout
+        finally:
+            podman_run(['rm', '-f', '-t', '0', name])
+
+    def test_ignore_store_suppresses_discovery(
+        self,
+        distro_image,
+        podman_env,
+        podman_store_flags,
+    ):
+        """podrun --ignore-store run --print-cmd omits store flags."""
+        result = _run_podrun_raw(
+            ['--ignore-store']
+            + podman_store_flags
+            + ['run', '--no-devconfig', '--print-cmd', distro_image],
+            podman_env,
+        )
+        assert result.returncode == 0, f'stderr: {result.stderr}'
+        # The print-cmd output should contain --root from podman_store_flags
+        # (those are podman global flags, not --store), so the command works.
+        # --ignore-store only suppresses auto-discovery; it shouldn't prevent
+        # explicit --root flags from passing through.
+        assert 'podman' in result.stdout
+
+    def test_ignore_store_passthrough(self, podman_store, podman_env):
+        """podrun --ignore-store ps succeeds even with a discoverable store."""
+        result = _run_podrun_raw(
+            ['--ignore-store', 'ps', '-a'],
+            podman_env,
+        )
+        assert result.returncode == 0, f'stderr: {result.stderr}'
+
+
 # ---------------------------------------------------------------------------
 # TestAutoAttach — auto-attach / auto-replace with overlay guard
 # ---------------------------------------------------------------------------

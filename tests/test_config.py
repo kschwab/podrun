@@ -129,12 +129,6 @@ class TestImageSource:
 
 
 class TestEnvAndArgs:
-    def test_container_env(self, make_cli_args):
-        cli = make_cli_args()
-        dc = {'image': 'alpine', 'containerEnv': {'FOO': 'bar'}}
-        config = merge_config(cli, {}, dc)
-        assert config.container_env == {'FOO': 'bar'}
-
     def test_remote_env(self, make_cli_args):
         cli = make_cli_args()
         dc = {'image': 'alpine', 'remoteEnv': {'BAZ': 'qux'}}
@@ -185,6 +179,20 @@ class TestConfigScript:
         captured = capsys.readouterr()
         assert 'Warning' in captured.err
         assert '/bad/script' in captured.err
+
+
+class TestConfigScriptArgparseExit:
+    """Test config script handling when argparse raises SystemExit."""
+
+    def test_config_script_argparse_exit_treats_as_raw(self, make_cli_args, mock_run_os_cmd):
+        """When script output causes argparse SystemExit, treat tokens as raw podman args."""
+        mock_run_os_cmd.set_return(stdout='--export')
+        cli = make_cli_args(had_config_script=False)
+        podrun_cfg = {'configScript': '/path/to/script', 'podmanArgs': ['--init']}
+        config = merge_config(cli, podrun_cfg, {'image': 'alpine'})
+        # --export (with no value) should be treated as a raw podman arg
+        assert '--export' in config.podman_args
+        assert '--init' in config.podman_args
 
 
 class TestConfigScriptFlagExtraction:
@@ -337,6 +345,12 @@ class TestExportTildeExpansion:
         config = merge_config(cli, {}, {'image': 'alpine'})
         assert config.exports == ['/opt/sdk:./sdk']
 
+    def test_single_part_export_tilde(self, make_cli_args):
+        """Single-part export (no host path) expands container ~ correctly."""
+        cli = make_cli_args(export=['~/data'])
+        config = merge_config(cli, {}, {'image': 'alpine'})
+        assert config.exports == ['/home/testuser/data']
+
     def test_tilde_in_config_script_exports(self, make_cli_args, mock_run_os_cmd):
         mock_run_os_cmd.set_return(stdout='--export ~/.claude:~/.claude')
         cli = make_cli_args(had_config_script=False)
@@ -485,7 +499,7 @@ class TestDevcontainerRunArgs:
         assert cap_idx < mem_idx
 
     def test_unrelated_fields_ignored(self):
-        dc = {'image': 'ubuntu', 'workspaceFolder': '/app', 'containerEnv': {'A': 'B'}}
+        dc = {'image': 'ubuntu', 'workspaceFolder': '/app', 'remoteEnv': {'A': 'B'}}
         args = _devcontainer_run_args(dc)
         assert args == []
 

@@ -253,7 +253,6 @@ class Config:
     auto_replace: bool = False
     print_cmd: bool = False
     command: List[str] = dataclasses.field(default_factory=list)
-    container_env: Dict[str, str] = dataclasses.field(default_factory=dict)
     remote_env: Dict[str, str] = dataclasses.field(default_factory=dict)
     podman_args: List[str] = dataclasses.field(default_factory=list)
     bootstrap_caps: List[str] = dataclasses.field(default_factory=list)
@@ -693,6 +692,12 @@ def _print_help(subcmd, argv, parser, podman_path):
             p = _PodrunParser.get_parser(name)
             desc = p.parser.description or '' if p else ''
             print(f'    {name:<10}{desc}')
+        print()
+        print('Options:')
+        print('  --store DIR           Use project-local store directory')
+        print('  --ignore-store       Suppress auto-discovery of project-local store')
+        print('  --auto-init-store     Auto-create store if missing (requires --store)')
+        print('  --store-registry HOST Registry mirror for auto-init')
         print()
         print('Run Options:')
         print("  Podrun extends 'podrun run' with overlay flags for host identity mapping,")
@@ -1713,6 +1718,12 @@ def _build_parser():
         default=None,
         help='Registry mirror for auto-init (requires --store + --auto-init-store)',
     )
+    parser.add_argument(
+        '--ignore-store',
+        action='store_true',
+        default=False,
+        help='Suppress auto-discovery of project-local store',
+    )
 
     # Store subcommand tree (standalone parser — not an argparse subparser
     # of the root, because parse_known_args rejects positional args that
@@ -2064,7 +2075,6 @@ def merge_config(  # noqa: C901 — three-way merge across CLI, configScript, an
         ),
         print_cmd=cli_args.print_cmd,
         command=command,
-        container_env=devcontainer.get('containerEnv', {}),
         remote_env=devcontainer.get('remoteEnv', {}),
         podman_args=podman_args,
         bootstrap_caps=bootstrap_caps,
@@ -2689,8 +2699,6 @@ def _dood_args(config):
 def _env_args(config):
     """Build args for container environment variables and PODRUN_* env vars."""
     args = []
-    for key, val in config.container_env.items():
-        args.append(f'--env={key}={val}')
     for key, val in config.remote_env.items():
         args.append(f'--env={key}={val}')
 
@@ -3068,22 +3076,51 @@ def _apply_store_args(store, auto_init_store, store_registry, global_flags):
     return global_flags
 
 
-def _strip_no_store(raw):
-    """Strip ``--no-store`` from *raw* argv, returning ``(cleaned, found)``."""
-    stripped = []
-    found = False
+_ROOT_BOOL_FLAGS = frozenset({'--auto-init-store', '--ignore-store'})
+_ROOT_VALUE_FLAGS = frozenset({'--store', '--store-registry'})
+
+
+def _strip_root_flags(raw):
+    """Strip podrun root-level flags from *raw* argv.
+
+    Returns ``(cleaned, namespace)`` where *namespace* is an
+    `argparse.Namespace` with extracted values (dashes → underscores).
+    Respects ``--`` separator: flags after it are never stripped.
+    """
+    cleaned = []
+    vals = {f.lstrip('-').replace('-', '_'): None for f in _ROOT_VALUE_FLAGS}
+    vals.update({f.lstrip('-').replace('-', '_'): False for f in _ROOT_BOOL_FLAGS})
     past_sep = False
-    for arg in raw:
+    skip_next = False
+    for i, arg in enumerate(raw):
+        if skip_next:
+            skip_next = False
+            continue
         if arg == '--':
             past_sep = True
-        if arg == '--no-store' and not past_sep:
-            found = True
-        else:
-            stripped.append(arg)
-    return stripped, found
+            cleaned.append(arg)
+            continue
+        if past_sep:
+            cleaned.append(arg)
+            continue
+        if arg in _ROOT_BOOL_FLAGS:
+            vals[arg.lstrip('-').replace('-', '_')] = True
+            continue
+        # Value flags: --flag value or --flag=value
+        bare = arg.split('=', 1)[0]
+        if bare in _ROOT_VALUE_FLAGS:
+            key = bare.lstrip('-').replace('-', '_')
+            if '=' in arg:
+                vals[key] = arg.split('=', 1)[1]
+            elif i + 1 < len(raw):
+                vals[key] = raw[i + 1]
+                skip_next = True
+            continue
+        cleaned.append(arg)
+    return cleaned, argparse.Namespace(**vals)
 
 
-def _resolve_run_config(subcmd_argv, global_flags, project_ctx, no_store, config, parser):
+def _resolve_run_config(subcmd_argv, global_flags, project_ctx, root_ns, config, parser):
     """Parse CLI args, resolve devcontainer/store config, and dispatch ``run``.
 
     This handles the full config-resolution pipeline for the ``run``
@@ -3105,11 +3142,11 @@ def _resolve_run_config(subcmd_argv, global_flags, project_ctx, no_store, config
     podrun_cfg = extract_podrun_config(devcontainer)
 
     # --store / --auto-init-store / --store-registry: CLI wins over devconfig
-    store = cli_args.store or podrun_cfg.get('store')
-    if not store and not no_store:
+    store = root_ns.store or podrun_cfg.get('store')
+    if not store and not root_ns.ignore_store:
         store = project_ctx.store_dir  # auto-discovered (lowest priority)
-    auto_init_store = cli_args.auto_init_store or podrun_cfg.get('autoInitStore', False)
-    store_registry = cli_args.store_registry or podrun_cfg.get('storeRegistry')
+    auto_init_store = root_ns.auto_init_store or podrun_cfg.get('autoInitStore', False)
+    store_registry = root_ns.store_registry or podrun_cfg.get('storeRegistry')
     global_flags = _apply_store_args(store, auto_init_store, store_registry, global_flags)
 
     podman_path = _resolve_podman_path(podrun_cfg, config.podman_path)
@@ -3117,19 +3154,6 @@ def _resolve_run_config(subcmd_argv, global_flags, project_ctx, no_store, config
         cli_args, podrun_cfg, devcontainer, podman_path=podman_path, parser=parser
     )
     _main_run(config, global_flags=global_flags)
-
-
-def _inject_discovered_store(no_store, global_flags, project_ctx):
-    """Inject auto-discovered store flags when applicable.
-
-    Returns ``(global_flags, raw_prefix)`` where *raw_prefix* is the
-    list of flags to prepend to the raw argv for passthrough commands.
-    """
-    if not no_store and not _has_store_conflict(global_flags) and project_ctx.store_dir:
-        store_flags, store_env = _resolve_store_flags(project_ctx.store_dir)
-        os.environ.update(store_env)
-        return store_flags + global_flags, store_flags
-    return global_flags, []
 
 
 def main(argv=None):
@@ -3147,7 +3171,7 @@ def main(argv=None):
       podrun [global] <other> …    → os.execvpe('podman', ...) (passthrough)
     """
     raw = argv if argv is not None else sys.argv[1:]
-    raw, no_store = _strip_no_store(raw)
+    raw, root_ns = _strip_root_flags(raw)
     parser = _build_parser()
 
     # Guard: refuse to run inside a podrun container
@@ -3186,9 +3210,14 @@ def main(argv=None):
     _print_help(subcmd, subcmd_argv, parser, config.podman_path)
 
     if subcmd == 'run':
-        _resolve_run_config(subcmd_argv, global_flags, project_ctx, no_store, config, parser)
+        _resolve_run_config(subcmd_argv, global_flags, project_ctx, root_ns, config, parser)
     elif subcmd == 'exec':
-        global_flags, _ = _inject_discovered_store(no_store, global_flags, project_ctx)
+        store = root_ns.store
+        if not store and not root_ns.ignore_store and not _has_store_conflict(global_flags):
+            store = project_ctx.store_dir
+        global_flags = _apply_store_args(
+            store, root_ns.auto_init_store, root_ns.store_registry, global_flags
+        )
         _main_exec(subcmd_argv, global_flags=global_flags, podman_path=config.podman_path)
     elif subcmd == 'store':
         _main_store(
@@ -3198,8 +3227,11 @@ def main(argv=None):
         )
     else:
         # Other podman subcommand or no subcommand — passthrough
-        _, store_prefix = _inject_discovered_store(no_store, global_flags, project_ctx)
-        raw = store_prefix + raw
+        store = root_ns.store
+        if not store and not root_ns.ignore_store and not _has_store_conflict(global_flags):
+            store = project_ctx.store_dir
+        store_flags = _apply_store_args(store, root_ns.auto_init_store, root_ns.store_registry, [])
+        raw = store_flags + raw
         os.execvpe(config.podman_path, [config.podman_path] + raw, os.environ.copy())
 
 

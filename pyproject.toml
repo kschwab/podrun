@@ -43,6 +43,9 @@ Homepage = "https://github.com/kschwab/podrun"
 [project.scripts]
 podrun = "podrun:main"
 
+[tool.setuptools.packages.find]
+include = ["podrun*"]
+
 [tool.setuptools.dynamic]
 version = {attr = "podrun.__version__"}
 

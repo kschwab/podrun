@@ -8,6 +8,10 @@ from podrun.podrun import (
     PODRUN_EXEC_ENTRY_PATH,
     _parse_export,
     _parse_image_ref,
+    _socket_is_alive,
+    _stop_store_service,
+    _store_pid_path,
+    _store_socket_path,
     _validate_overlay_args,
     build_podman_args,
     build_podman_exec_args,
@@ -156,11 +160,20 @@ class TestBuildPodmanArgs:
             args = build_podman_args(config)
         assert '--env=DISPLAY' not in args
 
-    def test_dood_with_socket(self, make_config):
-        """Cover dood branch when socket exists (lines 1030-1032)."""
+    def test_podman_remote_with_store_socket(self, make_config, tmp_path):
+        """Cover podman_remote branch when a per-store socket is available."""
+        sock = tmp_path / 'podman.sock'
+        sock.touch()
+        config = make_config(podman_remote=True, store_socket=str(sock))
+        args = build_podman_args(config)
+        assert f'-v={sock}:/run/podman/podman.sock' in args
+        assert '--env=CONTAINER_HOST=unix:///run/podman/podman.sock' in args
+
+    def test_podman_remote_with_socket(self, make_config):
+        """Cover podman_remote fallback when systemd socket exists."""
         import pathlib as _pathlib
 
-        config = make_config(dood=True)
+        config = make_config(podman_remote=True)
         orig_exists = _pathlib.Path.exists
         with patch.object(
             _pathlib.Path,
@@ -168,14 +181,14 @@ class TestBuildPodmanArgs:
             lambda self: True if 'podman.sock' in str(self) else orig_exists(self),
         ):
             args = build_podman_args(config)
-        vol_args = [a for a in args if 'podman.sock' in a]
-        assert len(vol_args) == 1
+        assert any('-v=' in a and 'podman.sock' in a for a in args)
+        assert '--env=CONTAINER_HOST=unix:///run/podman/podman.sock' in args
 
-    def test_dood_no_socket(self, make_config):
-        """Cover dood branch when socket doesn't exist (line 1031 false)."""
+    def test_podman_remote_no_socket(self, make_config, capsys):
+        """Cover podman_remote branch when no socket exists."""
         import pathlib as _pathlib
 
-        config = make_config(dood=True)
+        config = make_config(podman_remote=True)
         orig_exists = _pathlib.Path.exists
         with patch.object(
             _pathlib.Path,
@@ -185,6 +198,28 @@ class TestBuildPodmanArgs:
             args = build_podman_args(config)
         vol_args = [a for a in args if 'podman.sock' in a]
         assert len(vol_args) == 0
+        captured = capsys.readouterr()
+        assert '--podman-remote was requested' in captured.out
+        assert 'systemctl --user enable --now podman.socket' in captured.out
+
+    def test_podman_remote_store_socket_missing_falls_back(self, make_config):
+        """When store_socket is set but file doesn't exist, fall back to systemd socket."""
+        import pathlib as _pathlib
+
+        config = make_config(podman_remote=True, store_socket='/nonexistent/podman.sock')
+        orig_exists = _pathlib.Path.exists
+        with patch.object(
+            _pathlib.Path,
+            'exists',
+            lambda self: (
+                True if str(self) == f'/run/user/{os.getuid()}/podman/podman.sock'
+                else orig_exists(self)
+            ),
+        ):
+            args = build_podman_args(config)
+        # Should use the systemd socket, not the missing store socket
+        assert any('podman.sock' in a and '-v=' in a for a in args)
+        assert '--env=CONTAINER_HOST=unix:///run/podman/podman.sock' in args
 
 
 class TestBuildPodmanExecArgs:
@@ -793,3 +828,95 @@ class TestOverlayConflictGuards:
         _validate_overlay_args(config)
         captured = capsys.readouterr()
         assert 'Warning' not in captured.err
+
+
+class TestStoreSocketHelpers:
+    """Test per-store podman socket helper functions."""
+
+    def test_store_socket_path_deterministic(self):
+        """Same graphroot always produces the same socket path."""
+        p1 = _store_socket_path('/some/graphroot')
+        p2 = _store_socket_path('/some/graphroot')
+        assert p1 == p2
+        assert p1.endswith('/podman.sock')
+
+    def test_store_socket_path_differs_by_graphroot(self):
+        """Different graphroots produce different socket paths."""
+        p1 = _store_socket_path('/store-a/graphroot')
+        p2 = _store_socket_path('/store-b/graphroot')
+        assert p1 != p2
+
+    def test_store_pid_path_deterministic(self):
+        """Same graphroot always produces the same PID path."""
+        p1 = _store_pid_path('/some/graphroot')
+        p2 = _store_pid_path('/some/graphroot')
+        assert p1 == p2
+        assert p1.endswith('/podman.pid')
+
+    def test_store_pid_path_shares_dir_with_socket(self):
+        """PID file and socket live in the same directory."""
+        sock = _store_socket_path('/some/graphroot')
+        pid = _store_pid_path('/some/graphroot')
+        assert os.path.dirname(sock) == os.path.dirname(pid)
+
+    def test_socket_is_alive_no_pid_file(self, tmp_path):
+        """Returns False when PID file doesn't exist."""
+        assert not _socket_is_alive(str(tmp_path / 'sock'), str(tmp_path / 'pid'))
+
+    def test_socket_is_alive_stale_pid(self, tmp_path):
+        """Returns False when PID file references a dead process."""
+        pid_file = tmp_path / 'podman.pid'
+        pid_file.write_text('999999999')  # unlikely to be a real PID
+        sock = tmp_path / 'podman.sock'
+        sock.touch()
+        assert not _socket_is_alive(str(sock), str(pid_file))
+
+    def test_socket_is_alive_invalid_pid(self, tmp_path):
+        """Returns False when PID file contains non-numeric content."""
+        pid_file = tmp_path / 'podman.pid'
+        pid_file.write_text('not-a-number')
+        sock = tmp_path / 'podman.sock'
+        sock.touch()
+        assert not _socket_is_alive(str(sock), str(pid_file))
+
+    def test_socket_is_alive_running_process(self, tmp_path):
+        """Returns True when PID is our own process and socket exists."""
+        pid_file = tmp_path / 'podman.pid'
+        pid_file.write_text(str(os.getpid()))
+        sock = tmp_path / 'podman.sock'
+        sock.touch()
+        assert _socket_is_alive(str(sock), str(pid_file))
+
+    def test_socket_is_alive_no_socket_file(self, tmp_path):
+        """Returns False when PID is alive but socket file is missing."""
+        pid_file = tmp_path / 'podman.pid'
+        pid_file.write_text(str(os.getpid()))
+        assert not _socket_is_alive(str(tmp_path / 'podman.sock'), str(pid_file))
+
+
+class TestStopStoreService:
+    """Test _stop_store_service cleanup."""
+
+    def test_stop_noop_when_no_pid_file(self, tmp_path, monkeypatch):
+        """No error when PID file doesn't exist."""
+        import podrun.podrun as _mod
+
+        monkeypatch.setattr(_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        _stop_store_service('/nonexistent/graphroot')  # should not raise
+
+    def test_stop_cleans_up_files(self, tmp_path, monkeypatch):
+        """PID file and socket are removed."""
+        import podrun.podrun as _mod
+
+        monkeypatch.setattr(_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        graphroot = '/test/graphroot'
+        pid_path = _store_pid_path(graphroot)
+        sock_path = _store_socket_path(graphroot)
+        os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+        with open(pid_path, 'w') as f:
+            f.write('999999999')  # dead PID
+        with open(sock_path, 'w') as f:
+            f.write('')
+        _stop_store_service(graphroot)
+        assert not os.path.exists(pid_path)
+        assert not os.path.exists(sock_path)

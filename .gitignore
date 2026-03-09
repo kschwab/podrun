@@ -9,3 +9,4 @@ build/
 .coverage*
 .podrun-store/
 .devcontainer/.podrun/store/
+.claude/config/

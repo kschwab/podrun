@@ -29,7 +29,7 @@ appear before the subcommand:
 | `--shell SHELL` | Shell to use inside container (e.g. `bash`, `zsh`) |
 | `--login` / `--no-login` | Run shell as login shell (sources `/etc/profile`). `--no-login` explicitly disables. |
 | `--x11` | Enable X11 forwarding |
-| `--dood` | Docker-outside-of-Docker (Podman socket passthrough) |
+| `--podman-remote` | Podman socket passthrough. When a store is active, auto-starts a per-store `podman system service`; otherwise falls back to the systemd-managed socket. |
 | `--prompt-banner TEXT` | Custom prompt banner text |
 | `--auto-attach` | Auto attach to named container if already running |
 | `--auto-replace` | Auto replace named container if already exists |

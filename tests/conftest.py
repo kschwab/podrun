@@ -22,6 +22,20 @@ FAKE_USER_HOME = '/home/testuser'
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PODRUN_STORE = PROJECT_ROOT / '.podrun-store'
 
+# Detect podman-remote mode: inside a podrun container with a host socket.
+# When true, storage is on the host — no local --root/--runroot/--storage-driver.
+PODMAN_REMOTE = bool(
+    os.environ.get('CONTAINER_HOST')
+    and any(k.startswith('PODRUN_') for k in os.environ)
+)
+
+# Resolve the podman binary once: prefer podman-remote inside podrun containers
+# (where only the host socket is available), fall back to podman.
+PODMAN_BIN = (
+    shutil.which('podman-remote') if PODMAN_REMOTE
+    else (shutil.which('podman') or 'podman')
+)
+
 # All base images used by the live test suite.  Eagerly pulled into the
 # shared store so per-worker copies already contain them.
 TEST_IMAGES = ['alpine:latest', 'ubuntu:24.04', 'fedora:latest']
@@ -173,7 +187,7 @@ def _patch_module_constants(request, monkeypatch, tmp_path):
     monkeypatch.setattr(
         podrun_mod.shutil,
         'which',
-        lambda x: 'podman' if x == 'podman' else _real_which(x),
+        lambda x: PODMAN_BIN if x in ('podman', 'podman-remote') else _real_which(x),
     )
     # Prevent auto-discovery from finding the real project store in unit tests.
     # We wrap the real function but always nullify store_dir so that unit tests
@@ -207,7 +221,7 @@ def make_cli_args():
             workspace=None,
             adhoc=None,
             x11=None,
-            dood=None,
+            podman_remote=None,
             shell=None,
             login=None,
             prompt_banner=None,
@@ -311,6 +325,11 @@ def mock_run_os_cmd(monkeypatch):
 def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequential store bootstrap; splitting would obscure the phase 1→2 flow
     """Per-worker podman store, bootstrapped from a shared base.
 
+    In **podman-remote mode** (``PODMAN_REMOTE``), storage lives on the host
+    and is accessed through the socket — no local ``--root``/``--runroot``
+    flags.  The fixture just ensures images are pulled on the host and
+    yields an empty store dict.
+
     Phase 1 — shared store init + image pull (serialized via filelock):
         Runs ``podrun store init`` and eagerly pulls every image in
         ``TEST_IMAGES`` into the shared ``.podrun-store/graphroot``.
@@ -327,6 +346,39 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
     In serial mode (``-n0``, worker_id == 'master') the shared store is
     used directly — no copy needed.
     """
+    images = sorted(_allowed_images(request.config))
+
+    # --- Podman-remote: storage is on the host, just ensure images exist ---
+    if PODMAN_REMOTE:
+        registry = request.config.getoption('--registry', default=None) or os.environ.get(
+            'PODRUN_TEST_REGISTRY', ''
+        )
+        lock = tmp_path_factory.getbasetemp().parent / 'podrun-store.lock'
+        with filelock.FileLock(str(lock)):
+            for image in images:
+                check = subprocess.run(
+                    [PODMAN_BIN, 'image', 'exists', image],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if check.returncode != 0:
+                    pull_img = f'{registry}/{image}' if registry else image
+                    subprocess.run(
+                        [PODMAN_BIN, 'pull', pull_img],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                        check=True,
+                    )
+                    if registry:
+                        subprocess.run(
+                            [PODMAN_BIN, 'tag', pull_img, image],
+                            capture_output=True,
+                            check=True,
+                        )
+        yield {'root': '', 'runroot': '', 'storage_driver': ''}
+        return
+
     init_args = ['store', 'init', '--store-dir', str(PODRUN_STORE)]
     registry = request.config.getoption('--registry', default=None) or os.environ.get(
         'PODRUN_TEST_REGISTRY', ''
@@ -354,9 +406,6 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
         'overlay',
     ]
 
-    # Only pull/copy images that will actually be tested.
-    images = sorted(_allowed_images(request.config))
-
     with filelock.FileLock(str(lock)):
         if not shared_graphroot.exists():
             podrun_main(init_args)
@@ -372,7 +421,7 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
         if to_pull:
             for image in to_pull:
                 subprocess.run(
-                    ['podman'] + shared_flags + ['pull', image],
+                    [PODMAN_BIN] + shared_flags + ['pull', image],
                     capture_output=True,
                     text=True,
                     timeout=300,
@@ -404,13 +453,13 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
             try:
                 for image in images:
                     save = subprocess.Popen(
-                        ['podman'] + shared_flags + ['image', 'save', image],
+                        [PODMAN_BIN] + shared_flags + ['image', 'save', image],
                         stdout=subprocess.PIPE,
                         env=shared_env,
                     )
                     try:
                         subprocess.run(
-                            ['podman'] + worker_flags + ['image', 'load'],
+                            [PODMAN_BIN] + worker_flags + ['image', 'load'],
                             stdin=save.stdout,
                             capture_output=True,
                             timeout=300,
@@ -422,7 +471,7 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
                     save.wait(timeout=60)
             except Exception:
                 subprocess.run(
-                    ['podman', 'unshare', 'rm', '-rf', str(worker_graphroot)],
+                    [PODMAN_BIN, 'unshare', 'rm', '-rf', str(worker_graphroot)],
                     capture_output=True,
                     timeout=60,
                 )
@@ -442,7 +491,7 @@ def podman_store(request, tmp_path_factory, worker_id):  # noqa: C901 — sequen
         return
     try:
         subprocess.run(
-            ['podman', 'unshare', 'rm', '-rf', graphroot],
+            [PODMAN_BIN, 'unshare', 'rm', '-rf', graphroot],
             capture_output=True,
             timeout=60,
         )
@@ -460,8 +509,11 @@ def podman_store_flags(podman_store):
     """Return podman global flags for project-local storage.
 
     These flags bypass all config resolution and work correctly for
-    rootless podman.
+    rootless podman.  Returns an empty list in podman-remote mode
+    (storage is on the host).
     """
+    if PODMAN_REMOTE:
+        return []
     return [
         '--root',
         podman_store['root'],
@@ -497,7 +549,7 @@ def podman_run(podman_store_flags, podman_env):
     """
 
     def _run(args, **kwargs):
-        cmd = ['podman'] + podman_store_flags + args
+        cmd = [PODMAN_BIN] + podman_store_flags + args
         kwargs.setdefault('capture_output', True)
         kwargs.setdefault('text', True)
         kwargs.setdefault('timeout', 120)
@@ -531,7 +583,7 @@ def _podman_cleanup(request, podman_store_flags, podman_env):
         return
     try:
         result = subprocess.run(
-            ['podman'] + podman_store_flags + ['ps', '-a', '--format={{.Names}}'],
+            [PODMAN_BIN] + podman_store_flags + ['ps', '-a', '--format={{.Names}}'],
             capture_output=True,
             text=True,
             timeout=30,
@@ -542,7 +594,7 @@ def _podman_cleanup(request, podman_store_flags, podman_env):
             if not name:
                 continue
             subprocess.run(
-                ['podman'] + podman_store_flags + ['rm', '-f', '-t', '0', name],
+                [PODMAN_BIN] + podman_store_flags + ['rm', '-f', '-t', '0', name],
                 capture_output=True,
                 timeout=30,
                 env=podman_env,
@@ -582,7 +634,7 @@ def pull_image(podman_store_flags, podman_env):
         if image in _verified:
             return image
         check = subprocess.run(
-            ['podman'] + podman_store_flags + ['image', 'exists', image],
+            [PODMAN_BIN] + podman_store_flags + ['image', 'exists', image],
             capture_output=True,
             timeout=10,
             env=podman_env,
@@ -592,7 +644,7 @@ def pull_image(podman_store_flags, podman_env):
             return image
         # Image not pre-populated; pull from registry.
         subprocess.run(
-            ['podman'] + podman_store_flags + ['pull', image],
+            [PODMAN_BIN] + podman_store_flags + ['pull', image],
             capture_output=True,
             text=True,
             timeout=300,

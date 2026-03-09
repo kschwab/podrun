@@ -49,6 +49,7 @@ import platform
 import pwd
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -233,6 +234,17 @@ _OVERLAY_FIELDS = [
 ]
 
 
+def _default_podman_path():
+    """Resolve the default podman binary, preferring podman-remote inside containers."""
+    if os.environ.get('CONTAINER_HOST') and any(
+        k.startswith('PODRUN_') for k in os.environ
+    ):
+        remote = shutil.which('podman-remote')
+        if remote:
+            return remote
+    return shutil.which('podman')
+
+
 @dataclasses.dataclass
 class Config:
     image: Optional[str] = None
@@ -245,7 +257,7 @@ class Config:
     workspace_folder: str = '/app'
     workspace_mount_src: str = ''
     x11: bool = False
-    dood: bool = False
+    podman_remote: bool = False
     shell: Optional[str] = None
     login: Optional[bool] = None
     prompt_banner: Optional[str] = None
@@ -258,8 +270,10 @@ class Config:
     bootstrap_caps: List[str] = dataclasses.field(default_factory=list)
     passthrough_args: List[str] = dataclasses.field(default_factory=list)
     exports: List[str] = dataclasses.field(default_factory=list)
-    podman_path: Optional[str] = dataclasses.field(default_factory=lambda: shutil.which('podman'))
+    podman_path: Optional[str] = dataclasses.field(default_factory=lambda: _default_podman_path())
     fuse_overlayfs: bool = False
+    store_dir: Optional[str] = None
+    store_socket: Optional[str] = None
 
     def resolve(self):
         """Sort set-like lists so downstream output is deterministic.
@@ -1291,6 +1305,114 @@ def _runroot_path(graphroot: str) -> str:
     return f'{_PODRUN_STORES_DIR}/{h}'
 
 
+def _store_socket_path(graphroot: str) -> str:
+    """Return the podman service socket path for a store."""
+    h = hashlib.sha256(graphroot.encode()).hexdigest()[:12]
+    return f'{_PODRUN_STORES_DIR}/{h}/podman.sock'
+
+
+def _store_pid_path(graphroot: str) -> str:
+    """Return the PID file path for a store's podman service."""
+    h = hashlib.sha256(graphroot.encode()).hexdigest()[:12]
+    return f'{_PODRUN_STORES_DIR}/{h}/podman.pid'
+
+
+def _socket_is_alive(sock, pid_file):
+    """Return True if the podman service is still running."""
+    if not os.path.exists(pid_file):
+        return False
+    try:
+        pid = int(pathlib.Path(pid_file).read_text().strip())
+        os.kill(pid, 0)  # Check if process exists
+        return os.path.exists(sock)
+    except (ValueError, OSError):
+        return False
+
+
+def _wait_for_socket(sock, timeout=10):
+    """Block until the socket file appears or timeout."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(sock):
+            return
+        time.sleep(0.1)
+    print(f'Warning: timed out waiting for {sock}', file=sys.stderr)
+
+
+def _ensure_store_service(graphroot, runroot, store_dir=None):
+    """Ensure a podman system service is running for the given store.
+
+    Starts ``podman system service`` bound to the store's graphroot/runroot
+    with no idle timeout, writing its PID to a file for cleanup.
+    Returns the socket path.
+    """
+    sock = _store_socket_path(graphroot)
+    pid_file = _store_pid_path(graphroot)
+
+    # Already running?
+    if _socket_is_alive(sock, pid_file):
+        return sock
+
+    # Clean up stale socket
+    if os.path.exists(sock):
+        os.unlink(sock)
+
+    # Build env with registries.conf if present
+    env = os.environ.copy()
+    if store_dir:
+        reg = pathlib.Path(store_dir) / 'registries.conf'
+        if reg.exists():
+            env['CONTAINERS_REGISTRIES_CONF'] = str(reg)
+
+    # Resolve podman binary (use local podman, not podman-remote)
+    podman = shutil.which('podman')
+    if not podman:
+        print('Error: podman not found — cannot start store service.', file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [
+        podman,
+        '--root', graphroot,
+        '--runroot', runroot,
+        '--storage-driver', 'overlay',
+        'system', 'service',
+        '--time', '0',
+        f'unix://{sock}',
+    ]
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Write PID
+    pathlib.Path(pid_file).write_text(str(proc.pid))
+
+    # Wait for socket to appear
+    _wait_for_socket(sock)
+
+    return sock
+
+
+def _stop_store_service(graphroot):
+    """Stop the podman system service for a store, if running."""
+    pid_file = _store_pid_path(graphroot)
+    if not os.path.exists(pid_file):
+        return
+    try:
+        pid = int(pathlib.Path(pid_file).read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (ValueError, OSError):
+        pass
+    try:
+        os.unlink(pid_file)
+    except OSError:
+        pass
+    sock = _store_socket_path(graphroot)
+    try:
+        os.unlink(sock)
+    except OSError:
+        pass
+
+
 def _warn_missing_subids():
     """Print a note if the current user lacks subuid/subgid ranges."""
     try:
@@ -1446,6 +1568,8 @@ def _store_destroy(args, podman_path):  # noqa: C901 — sequential teardown ste
     for gr in sorted(store_dir.glob('graphroot*')):
         if not gr.is_dir():
             continue
+        # Stop any running podman service for this store
+        _stop_store_service(str(gr))
         gr_runroot = _runroot_path(str(gr))
         runroot_targets.add(gr_runroot)
         try:
@@ -1608,10 +1732,10 @@ def _build_parser():
     )
     parser.add_argument('--x11', action='store_true', default=None, help='Enable X11 forwarding')
     parser.add_argument(
-        '--dood',
+        '--podman-remote',
         action='store_true',
         default=None,
-        help='Enable Docker-outside-of-Docker (Podman socket)',
+        help='Podman socket passthrough (rootless Podman socket into container)',
     )
     parser.add_argument(
         '--shell',
@@ -1872,16 +1996,18 @@ def _expand_export_tilde(exports: list) -> list:
 
 
 def _resolve_image_and_command(trailing, explicit_command, devcontainer):
-    """Deduplicate image from trailing positional args and devcontainer.json."""
+    """Resolve image and command from trailing positional args and devcontainer.json.
+
+    CLI always wins: if a trailing positional arg is present, it is the image
+    (regardless of what devcontainer.json says).  Falls back to the
+    devcontainer.json image only when no trailing args are provided.
+    """
     image = devcontainer.get('image')
-    if image is None and trailing:
-        image = trailing[0]
-        command = trailing[1:] + explicit_command
-    elif image is not None and trailing and trailing[0] == image:
-        # Caller (e.g. devcontainer CLI) passed the same image from json — dedup
+    if trailing:
+        image = trailing[0]  # CLI wins over devcontainer.json
         command = trailing[1:] + explicit_command
     else:
-        command = trailing + explicit_command
+        command = explicit_command
     return image, command
 
 
@@ -2051,8 +2177,8 @@ def merge_config(  # noqa: C901 — three-way merge across CLI, configScript, an
         workspace_mount_src=workspace_mount_src,
         shell=_first(cli_args.shell, _script_val(script_attrs, 'shell'), podrun_cfg.get('shell')),
         x11=_first(cli_args.x11, _script_val(script_attrs, 'x11'), podrun_cfg.get('x11'), False),
-        dood=_first(
-            cli_args.dood, _script_val(script_attrs, 'dood'), podrun_cfg.get('dood'), False
+        podman_remote=_first(
+            cli_args.podman_remote, _script_val(script_attrs, 'podman_remote'), podrun_cfg.get('podmanRemote'), False
         ),
         login=_first(cli_args.login, _script_val(script_attrs, 'login'), podrun_cfg.get('login')),
         prompt_banner=_first(
@@ -2312,6 +2438,14 @@ def generate_run_entrypoint(config: Config) -> str:
 {export_blocks}        # Signal that setup is complete so exec-entrypoint.sh can proceed.
         touch {PODRUN_READY_PATH}
 
+        # If an alternate entrypoint was requested (e.g. by the devcontainer
+        # CLI via --entrypoint), prepend it to the args so it is exec'd after
+        # our setup completes.  The podrun entrypoint always runs first to
+        # ensure user identity and home directory are ready.
+        if [ -n "$PODRUN_ALT_ENTRYPOINT" ]; then
+          set -- "$PODRUN_ALT_ENTRYPOINT" "$@"
+        fi
+
         # Drop bootstrap capabilities before exec.
         # Probe short names first (BusyBox), fall back to cap_ prefix (util-linux).
         # Drop from both inheritable and ambient sets so effective caps
@@ -2398,6 +2532,8 @@ def generate_rc_sh(config: Config) -> str:
           *)
             PS1="$_i$_prompt_banner$_n\n$_g\u@\h$_n $_b\w$_n\n\$ " ;;
         esac
+        # Skip banner for non-interactive shells.
+        case "$-" in *i*) ;; *) return 0 2>/dev/null || : ;; esac
         _uptime="$(awk '{{ printf "%d", $1 }}' /proc/uptime)"
         _minutes=$((_uptime / 60))
         _hours=$((_minutes / 60))
@@ -2605,6 +2741,57 @@ def _passthrough_has_short_flag(pt, char):
     return False
 
 
+def _extract_label_value(pt, label_key):
+    """Extract a label value from passthrough args.
+
+    Searches for ``-l <key>=<value>`` or ``-l=<key>=<value>`` or
+    ``--label <key>=<value>`` or ``--label=<key>=<value>`` in passthrough
+    args and returns the value, or ``None`` if not found.
+    """
+    prefix = f'{label_key}='
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        # --label=key=value or -l=key=value
+        if arg.startswith(('--label=', '-l=')):
+            val = arg.split('=', 1)[1]
+            if val.startswith(prefix):
+                return val[len(prefix):]
+        # --label key=value or -l key=value
+        elif arg in ('-l', '--label') and i + 1 < len(pt):
+            val = pt[i + 1]
+            if val.startswith(prefix):
+                return val[len(prefix):]
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _extract_passthrough_entrypoint(pt):
+    """Extract and remove ``--entrypoint`` from passthrough args.
+
+    Returns ``(entrypoint_value, filtered_pt)`` where *entrypoint_value* is
+    the last ``--entrypoint`` value found (or ``None``), and *filtered_pt* is
+    the passthrough list with all ``--entrypoint`` occurrences removed.
+    """
+    alt_entrypoint = None
+    filtered = []
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        if arg.startswith('--entrypoint='):
+            alt_entrypoint = arg.split('=', 1)[1]
+        elif arg == '--entrypoint' and i + 1 < len(pt):
+            alt_entrypoint = pt[i + 1]
+            i += 2
+            continue
+        else:
+            filtered.append(arg)
+        i += 1
+    return alt_entrypoint, filtered
+
+
 def _volume_mount_destinations(*arg_lists) -> set:
     """Extract container destination paths from -v/--volume args across all arg lists."""
     dests = set()
@@ -2687,12 +2874,22 @@ def _x11_args(config):
     return args
 
 
-def _dood_args(config):
-    """Build args for DooD (Docker-outside-of-Docker via rootless Podman socket)."""
+def _podman_remote_args(config):
+    """Build args for podman-remote (rootless Podman socket passthrough)."""
     args = []
-    podman_socket = f'/run/user/{UID}/podman/podman.sock'
-    if pathlib.Path(podman_socket).exists():
-        args.append(f'-v={podman_socket}:/run/podman/podman.sock')
+    if config.store_socket and pathlib.Path(config.store_socket).exists():
+        # Per-store socket (started by _ensure_store_service)
+        args.append(f'-v={config.store_socket}:/run/podman/podman.sock')
+        args.append('--env=CONTAINER_HOST=unix:///run/podman/podman.sock')
+    else:
+        # Fallback: systemd-managed socket
+        podman_socket = f'/run/user/{UID}/podman/podman.sock'
+        if pathlib.Path(podman_socket).exists():
+            args.append(f'-v={podman_socket}:/run/podman/podman.sock')
+            args.append('--env=CONTAINER_HOST=unix:///run/podman/podman.sock')
+        else:
+            print('Warning: podman remote was requested but podman.socket not found.', file=sys.stderr)
+            print('systemctl --user enable --now podman.socket', file=sys.stderr)
     return args
 
 
@@ -2768,19 +2965,31 @@ def build_podman_args(  # noqa: C901 — linear overlay dispatch; each branch is
     args = ['run']
     pt = config.passthrough_args
 
+    # When user-overlay is active, the podrun entrypoint must run first to set
+    # up user identity, home directory, exports, etc.  If the caller (e.g. the
+    # devcontainer CLI) passed --entrypoint, extract it from the passthrough
+    # args so it doesn't override the podrun entrypoint.  The value is passed
+    # as PODRUN_ALT_ENTRYPOINT and the entrypoint script invokes it after setup.
+    alt_entrypoint = None
+    if config.user_overlay:
+        alt_entrypoint, pt = _extract_passthrough_entrypoint(pt)
+        config = dataclasses.replace(config, passthrough_args=pt)
+
     if config.name:
         args.append(f'--name={config.name}')
 
     if config.user_overlay:
         args.extend(_user_overlay_args(config, pt, entrypoint_path, rc_path, exec_entry_path))
+        if alt_entrypoint:
+            args.append(f'--env=PODRUN_ALT_ENTRYPOINT={alt_entrypoint}')
     if config.interactive_overlay:
         args.extend(_interactive_overlay_args(config, pt))
     if config.host_overlay:
         args.extend(_host_overlay_args(config, pt))
     if config.x11:
         args.extend(_x11_args(config))
-    if config.dood:
-        args.extend(_dood_args(config))
+    if config.podman_remote:
+        args.extend(_podman_remote_args(config))
 
     if config.adhoc:
         if not _passthrough_has_exact(pt, '--rm') and '--rm' not in config.podman_args:
@@ -3120,6 +3329,50 @@ def _strip_root_flags(raw):
     return cleaned, argparse.Namespace(**vals)
 
 
+def _resolve_global_store(project_ctx, root_ns, parser):
+    """Resolve store flags from devcontainer.json + configScript.
+
+    Called at root level before subcommand dispatch so ALL subcommands
+    (ps, inspect, exec, etc.) get correct --root/--runroot flags.
+    """
+    store = root_ns.store
+    auto_init = root_ns.auto_init_store
+    registry = root_ns.store_registry
+
+    if store or root_ns.ignore_store:
+        return _apply_store_args(store, auto_init, registry, [])
+
+    # Load devcontainer.json
+    devcontainer = parse_devcontainer_json(project_ctx.devcontainer_json)
+    podrun_cfg = extract_podrun_config(devcontainer)
+
+    store = podrun_cfg.get('store')
+    auto_init = auto_init or podrun_cfg.get('autoInitStore', False)
+    registry = registry or podrun_cfg.get('storeRegistry')
+
+    # Run configScript if present and store not yet resolved
+    if not store:
+        config_script = podrun_cfg.get('configScript')
+        if config_script:
+            out = run_os_cmd(shlex.quote(config_script))
+            if out.returncode == 0:
+                tokens = shlex.split(out.stdout)
+                try:
+                    script_attrs, _ = parser.parse_known_args(tokens)
+                    store = store or getattr(script_attrs, 'store', None)
+                    auto_init = auto_init or getattr(script_attrs, 'auto_init_store', False)
+                    registry = registry or getattr(script_attrs, 'store_registry', None)
+                except SystemExit:
+                    pass
+
+    # Fallback to filesystem auto-discovery
+    if not store:
+        store = project_ctx.store_dir
+
+    project_ctx.store_dir = store
+    return _apply_store_args(store, auto_init, registry, [])
+
+
 def _resolve_run_config(subcmd_argv, global_flags, project_ctx, root_ns, config, parser):
     """Parse CLI args, resolve devcontainer/store config, and dispatch ``run``.
 
@@ -3137,22 +3390,43 @@ def _resolve_run_config(subcmd_argv, global_flags, project_ctx, root_ns, config,
     elif cli_args.config:
         devcontainer = parse_devcontainer_json(pathlib.Path(cli_args.config))
     else:
-        devcontainer = parse_devcontainer_json(project_ctx.devcontainer_json)
+        # The devcontainer CLI passes the config file path as a label:
+        #   -l devcontainer.config_file=<path>
+        # Use it to resolve the correct devcontainer.json when multiple
+        # named configs exist (auto-discovery picks alphabetically first).
+        pt = getattr(cli_args, 'passthrough_args', [])
+        label_config = _extract_label_value(pt, 'devcontainer.config_file')
+        if label_config:
+            devcontainer = parse_devcontainer_json(pathlib.Path(label_config))
+        else:
+            devcontainer = parse_devcontainer_json(project_ctx.devcontainer_json)
 
     podrun_cfg = extract_podrun_config(devcontainer)
 
-    # --store / --auto-init-store / --store-registry: CLI wins over devconfig
-    store = root_ns.store or podrun_cfg.get('store')
-    if not store and not root_ns.ignore_store:
-        store = project_ctx.store_dir  # auto-discovered (lowest priority)
-    auto_init_store = root_ns.auto_init_store or podrun_cfg.get('autoInitStore', False)
-    store_registry = root_ns.store_registry or podrun_cfg.get('storeRegistry')
-    global_flags = _apply_store_args(store, auto_init_store, store_registry, global_flags)
+    # --store / --auto-init-store / --store-registry: CLI wins over devconfig.
+    # Skip if root-level _resolve_global_store() already injected store flags.
+    if not _has_store_conflict(global_flags):
+        store = root_ns.store or podrun_cfg.get('store')
+        if not store and not root_ns.ignore_store:
+            store = project_ctx.store_dir  # auto-discovered (lowest priority)
+        auto_init_store = root_ns.auto_init_store or podrun_cfg.get('autoInitStore', False)
+        store_registry = root_ns.store_registry or podrun_cfg.get('storeRegistry')
+        global_flags = _apply_store_args(store, auto_init_store, store_registry, global_flags)
 
     podman_path = _resolve_podman_path(podrun_cfg, config.podman_path)
     config = merge_config(
         cli_args, podrun_cfg, devcontainer, podman_path=podman_path, parser=parser
     )
+    config = dataclasses.replace(config, store_dir=project_ctx.store_dir)
+
+    # Start a per-store podman service when --podman-remote is used with a store.
+    if config.podman_remote and config.store_dir:
+        store_path = pathlib.Path(config.store_dir).resolve()
+        graphroot = str(store_path / 'graphroot')
+        runroot = _runroot_path(graphroot)
+        sock = _ensure_store_service(graphroot, runroot, store_dir=str(store_path))
+        config = dataclasses.replace(config, store_socket=sock)
+
     _main_run(config, global_flags=global_flags)
 
 
@@ -3209,15 +3483,14 @@ def main(argv=None):
     # Consolidated help — handles top-level and run, respects '--'
     _print_help(subcmd, subcmd_argv, parser, config.podman_path)
 
+    # Resolve store from devcontainer.json + configScript for ALL subcommands
+    if not _has_store_conflict(global_flags):
+        store_flags = _resolve_global_store(project_ctx, root_ns, parser)
+        global_flags = store_flags + global_flags
+
     if subcmd == 'run':
         _resolve_run_config(subcmd_argv, global_flags, project_ctx, root_ns, config, parser)
     elif subcmd == 'exec':
-        store = root_ns.store
-        if not store and not root_ns.ignore_store and not _has_store_conflict(global_flags):
-            store = project_ctx.store_dir
-        global_flags = _apply_store_args(
-            store, root_ns.auto_init_store, root_ns.store_registry, global_flags
-        )
         _main_exec(subcmd_argv, global_flags=global_flags, podman_path=config.podman_path)
     elif subcmd == 'store':
         _main_store(
@@ -3227,12 +3500,8 @@ def main(argv=None):
         )
     else:
         # Other podman subcommand or no subcommand — passthrough
-        store = root_ns.store
-        if not store and not root_ns.ignore_store and not _has_store_conflict(global_flags):
-            store = project_ctx.store_dir
-        store_flags = _apply_store_args(store, root_ns.auto_init_store, root_ns.store_registry, [])
-        raw = store_flags + raw
-        os.execvpe(config.podman_path, [config.podman_path] + raw, os.environ.copy())
+        cmd_parts = global_flags + ([subcmd] if subcmd else []) + subcmd_argv
+        os.execvpe(config.podman_path, [config.podman_path] + cmd_parts, os.environ.copy())
 
 
 if __name__ == '__main__':

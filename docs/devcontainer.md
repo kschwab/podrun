@@ -36,7 +36,7 @@ directory (searching upward). Supported fields:
             "shell": "zsh",
             "login": false,
             "x11": false,
-            "dood": false,
+            "podmanRemote": false,
             "promptBanner": "my-project",
             "autoAttach": true,
             "autoReplace": false,

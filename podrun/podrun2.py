@@ -27,6 +27,11 @@ Phase 2.3: Overlay arg builders — user, host, interactive, dot-files, x11,
            podman-remote, env, validation. Cap-drop filtering for user
            --cap-add/--privileged. New --dot-files-overlay (mount-mode).
            print_overlays() implementation.
+Phase 2.4: Command assembly + container state — detect_container_state(),
+           handle_container_state(), query_container_info(),
+           build_podman_exec_args(), build_overlay_run_command().
+           Wire entrypoint generation and overlay builders into command
+           assembly. Alt-entrypoint extraction for user-overlay.
 """
 
 __version__ = '1.0.0'
@@ -528,21 +533,42 @@ def _expand_volume_tilde(args: list) -> list:
 
     Source (host) ``~`` expands to USER_HOME.
     Destination (container) ``~`` expands to ``/home/{UNAME}``.
+
+    Handles both equals form (``-v=~/src:/dst``) and space-separated
+    form (``-v``, ``~/src:/dst``) as produced by ``_PassthroughAction``.
     """
     result = []
-    for arg in args:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        # Equals form: -v=~/src:/dst or --volume=~/src:/dst
         m = re.match(r'^(-v|--volume)=(.*)', arg)
-        if not m:
-            result.append(arg)
+        if m:
+            flag = m.group(1)
+            parts = m.group(2).split(':')
+            if len(parts) >= 2:
+                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+                parts[1] = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+            elif len(parts) == 1:
+                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+            result.append(f'{flag}={":".join(parts)}')
+            i += 1
             continue
-        flag = m.group(1)
-        parts = m.group(2).split(':')
-        if len(parts) >= 2:
-            parts[0] = re.sub(r'^~', USER_HOME, parts[0])
-            parts[1] = re.sub(r'^~', f'/home/{UNAME}', parts[1])
-        elif len(parts) == 1:
-            parts[0] = re.sub(r'^~', USER_HOME, parts[0])
-        result.append(f'{flag}={":".join(parts)}')
+        # Space form: -v ~/src:/dst or --volume ~/src:/dst
+        if arg in ('-v', '--volume') and i + 1 < len(args):
+            val = args[i + 1]
+            parts = val.split(':')
+            if len(parts) >= 2:
+                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+                parts[1] = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+            elif len(parts) == 1:
+                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+            result.append(arg)
+            result.append(':'.join(parts))
+            i += 2
+            continue
+        result.append(arg)
+        i += 1
     return result
 
 
@@ -2105,6 +2131,141 @@ def parse_args(argv: List[str], flags=None) -> ParseResult:
 
 
 # ---------------------------------------------------------------------------
+# Container state
+# ---------------------------------------------------------------------------
+
+
+def detect_container_state(
+    name: str, global_flags=None, podman_path: str = 'podman',
+):
+    """Returns ``"running"``, ``"stopped"``, or ``None``."""
+    if not name:
+        return None
+    gf = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
+    fmt = shlex.quote('{{.State.Status}}')
+    result = run_os_cmd(
+        f'{shlex.quote(podman_path)} {gf}inspect --format={fmt} {shlex.quote(name)}'
+    )
+    if result.returncode != 0:
+        return None
+    status = result.stdout.strip()
+    if status == 'running':
+        return 'running'
+    if status in ('created', 'exited', 'stopped', 'dead', 'paused'):
+        return 'stopped'
+    return None
+
+
+def handle_container_state(ns, global_flags=None, podman_path: str = 'podman'):
+    """Returns ``"run"``, ``"attach"``, ``"replace"``, or ``None`` (exit).
+
+    Reads from *ns*: ``run.name``, ``run.auto_attach``, ``run.auto_replace``.
+    """
+    name = ns.get('run.name')
+    if not name:
+        return 'run'
+
+    state = detect_container_state(name, global_flags=global_flags, podman_path=podman_path)
+    if state is None:
+        return 'run'
+
+    is_interactive = sys.stdin.isatty()
+    auto_attach = ns.get('run.auto_attach')
+    auto_replace = ns.get('run.auto_replace')
+
+    if state == 'running':
+        if auto_attach:
+            return 'attach'
+        if auto_replace:
+            return 'replace'
+        if auto_attach is False and auto_replace is False:
+            return None
+        if yes_no_prompt('Attach to already running instance?', True, is_interactive):
+            return 'attach'
+        if yes_no_prompt('Replace already running instance?', False, is_interactive):
+            return 'replace'
+        return None
+
+    # Stopped — cannot attach to a non-running container.
+    if auto_attach:
+        print(
+            f'Warning: Cannot auto-attach to container {name!r} in non-running state',
+            file=sys.stderr,
+        )
+    if auto_replace:
+        return 'replace'
+    if auto_attach is False and auto_replace is False and not is_interactive:
+        return None
+    if yes_no_prompt('Replace stopped instance?', False, is_interactive):
+        return 'replace'
+    return None
+
+
+def query_container_info(
+    name: str, global_flags=None, podman_path: str = 'podman',
+) -> Tuple[str, str]:
+    """Read PODRUN_WORKDIR and PODRUN_OVERLAYS from container env via inspect.
+
+    Returns ``(workdir, overlays)`` where each is ``''`` if not found.
+    """
+    gf = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
+    fmt = shlex.quote('{{range .Config.Env}}{{println .}}{{end}}')
+    result = run_os_cmd(
+        f'{shlex.quote(podman_path)} {gf}inspect --format={fmt} {shlex.quote(name)}'
+    )
+    workdir = ''
+    overlays = ''
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith('PODRUN_WORKDIR='):
+                workdir = line.split('=', 1)[1]
+            elif line.startswith('PODRUN_OVERLAYS='):
+                overlays = line.split('=', 1)[1]
+    return workdir, overlays
+
+
+def build_podman_exec_args(
+    ns, name: str, container_workdir: str = '',
+    trailing_args=None, explicit_command=None,
+) -> List[str]:
+    """Build ``podman exec`` args for attaching to a running container.
+
+    Shell/login handling is delegated to exec-entrypoint.sh inside the
+    container.  CLI overrides are passed as ``-e=PODRUN_*`` env vars.
+    """
+    args = ['exec']
+    args.append('-it')
+    args.append('--detach-keys=ctrl-q,ctrl-q')
+
+    if container_workdir:
+        args.append(f'-w={container_workdir}')
+
+    try:
+        cols, rows = shutil.get_terminal_size()
+        args.append(f'-e=PODRUN_STTY_INIT=rows {rows} cols {cols}')
+    except (ValueError, OSError):
+        pass
+
+    args.append(f'-e=ENV={PODRUN_RC_PATH}')
+
+    if ns.get('run.shell'):
+        args.append(f'-e=PODRUN_SHELL={ns["run.shell"]}')
+    if ns.get('run.login') is not None:
+        args.append(f'-e=PODRUN_LOGIN={"1" if ns["run.login"] else "0"}')
+
+    args.append(name)
+
+    # Determine command: explicit_command ('--' args) > trailing_args after image > interactive
+    command = explicit_command or (trailing_args[1:] if trailing_args and len(trailing_args) > 1 else [])
+    if command:
+        args.extend(command)
+    else:
+        args.append(PODRUN_EXEC_ENTRY_PATH)
+
+    return args
+
+
+# ---------------------------------------------------------------------------
 # Command builders
 # ---------------------------------------------------------------------------
 
@@ -2134,6 +2295,67 @@ def build_run_command(result: ParseResult, podman_path: str = 'podman') -> List[
         cmd.extend(result.explicit_command)
 
     return cmd
+
+
+def build_overlay_run_command(result: ParseResult, podman_path: str = 'podman') -> Tuple[List[str], List[str]]:
+    """Generate entrypoints, build overlay args, and return the full run command.
+
+    Returns ``(cmd, caps_to_drop)`` where *cmd* is the complete
+    ``podman run ...`` arg list and *caps_to_drop* is the list of
+    capabilities the entrypoint should drop after bootstrap.
+
+    Overlay args are injected into ``ns['run.passthrough_args']`` before
+    delegating to :func:`build_run_command`.
+    """
+    ns = result.ns
+    pt = ns.get('run.passthrough_args') or []
+    overlay_args = []
+    caps_to_drop = []
+
+    # Validate overlay combinations
+    _validate_overlay_args(ns)
+
+    # Alt-entrypoint extraction — when user-overlay is active, extract any
+    # --entrypoint from passthrough so it doesn't override the podrun entrypoint.
+    alt_entrypoint = None
+    if ns.get('run.user_overlay'):
+        alt_entrypoint, pt = _extract_passthrough_entrypoint(pt)
+
+    # Generate entrypoints and build user overlay args
+    if ns.get('run.user_overlay'):
+        entrypoint_path = generate_run_entrypoint(ns, caps_to_drop=compute_caps_to_drop(pt))
+        rc_path = generate_rc_sh(ns)
+        exec_entry_path = generate_exec_entrypoint()
+        user_args, caps_to_drop = _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path)
+        overlay_args.extend(user_args)
+        if alt_entrypoint:
+            overlay_args.append(f'--env=PODRUN_ALT_ENTRYPOINT={alt_entrypoint}')
+
+    if ns.get('run.interactive_overlay'):
+        overlay_args.extend(_interactive_overlay_args(ns, pt))
+    if ns.get('run.host_overlay'):
+        overlay_args.extend(_host_overlay_args(ns, pt))
+    if ns.get('run.dot_files_overlay'):
+        overlay_args.extend(_dot_files_overlay_args(ns, pt))
+    if ns.get('run.x11'):
+        overlay_args.extend(_x11_args(ns))
+    if ns.get('run.podman_remote'):
+        overlay_args.extend(_podman_remote_args(ns))
+    if ns.get('run.adhoc'):
+        if not _passthrough_has_exact(pt, '--rm'):
+            overlay_args.append('--rm')
+
+    overlay_args.extend(_env_args(ns))
+
+    # Apply tilde expansion to passthrough and overlay args when user overlay active
+    if ns.get('run.user_overlay'):
+        pt = _expand_volume_tilde(pt)
+        overlay_args = _expand_volume_tilde(overlay_args)
+
+    # Inject overlay args into passthrough
+    ns['run.passthrough_args'] = overlay_args + pt
+
+    return build_run_command(result, podman_path), caps_to_drop
 
 
 def build_passthrough_command(result: ParseResult, podman_path: str = 'podman') -> List[str]:

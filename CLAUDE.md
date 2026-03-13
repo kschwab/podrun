@@ -51,11 +51,31 @@ Each sub-phase should:
 
 | Phase | Test file |
 |---|---|
+| 1.x | `tests2/test_podrun2_cli.py` |
 | 2.1 | `tests2/test_podrun2_utils.py` |
 | 2.2 | `tests2/test_podrun2_entrypoint.py` |
 | 2.3 | `tests2/test_podrun2_overlays.py` |
 | 2.4 | `tests2/test_podrun2_state.py` |
 | 2.5 | `tests2/test_podrun2_main.py` |
+
+### CLI flag form coverage
+
+`tests2/test_podrun2_cli.py` includes `TestEqualsFormRootFlags`,
+`TestEqualsFormRunFlags`, and `TestEqualsFormPassthroughFlags` — 44 tests
+ensuring every value flag parses correctly in both `--flag=value` and
+`--flag value` forms. Coverage includes:
+
+- **Root/global:** `--config=`, `--config-script=`, `--completion=`,
+  `--log-level=`, `--storage-opt=`
+- **Run (podrun):** `--name=`, `--shell=`, `--prompt-banner=`, `--export=`,
+  `--label=`, `-l=`
+- **Passthrough (podman run):** `-e=`/`--env`, `-v=`/`--volume=`,
+  `-m=`/`--memory`/`--memory=`, `-u=`/`--user`/`--user=`,
+  `-w`/`-w=`/`--workdir`/`--workdir=`, `-p=`/`--publish`/`--publish=`,
+  `-h=`/`--hostname`/`--hostname=`, `--network=`, `--mount=`, `--cpus=`,
+  `--cap-add`/`--cap-add=`, `--entrypoint`/`--entrypoint=`,
+  `--userns`/`--userns=`, `--annotation=`,
+  `--security-opt`/`--security-opt=`
 
 **Guiding principle for every sub-phase:** look for opportunities to simplify
 the ported code by leveraging podrun2's `ns` dict, `ParseResult`, argparse
@@ -127,19 +147,24 @@ Key decisions:
 - `--dot-files-overlay`/`--dotfiles` CLI flag added; implies `user_overlay` via `resolve_config()`
 - `_DOTFILES_MOUNT = ['.emacs', '.emacs.d', '.vimrc']` — mount-mode only; copy-mode deferred to Phase 2.8
 
-#### Phase 2.4: Command Assembly + Container State
+#### Phase 2.4: Command Assembly + Container State ✓
 
 Wire overlay args into the existing command-building backbone.
+**Status: Complete — 65 tests in `tests2/test_podrun2_state.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
-| `detect_container_state()` | Lines 2224-2242 | `podman inspect` state query |
-| `handle_container_state()` | Lines 2245-2290 | Action decision: run/attach/replace |
-| `query_container_info()` | Lines 3021-3043 | Inspect running container workdir/overlays |
-| `build_podman_exec_args()` | Lines 3044-3089 | Exec command for attach sessions |
-| Extend `build_run_command()` | Lines 2957-3020 | Inject overlay args into passthrough before calling existing builder |
+| `detect_container_state()` | Lines 2224-2242 | `podman inspect` state query; returns "running"/"stopped"/None |
+| `handle_container_state()` | Lines 2245-2290 | Action decision: run/attach/replace/None; reads `run.name`, `run.auto_attach`, `run.auto_replace` |
+| `query_container_info()` | Lines 3021-3043 | Inspect running container env for PODRUN_WORKDIR/PODRUN_OVERLAYS |
+| `build_podman_exec_args()` | Lines 3044-3089 | Exec command for attach sessions; passes shell/login overrides as env vars |
+| `build_overlay_run_command()` | Lines 2957-3020 | Generates entrypoints, calls overlay builders, injects into passthrough, delegates to `build_run_command()` |
 
-Depends on 2.1-2.3.
+Key decisions:
+- `build_overlay_run_command(result)` returns `(cmd, caps_to_drop)` tuple
+- Alt-entrypoint extraction: when user-overlay active, `--entrypoint` from passthrough is extracted and passed as `PODRUN_ALT_ENTRYPOINT` env
+- `_expand_volume_tilde()` enhanced to handle space-separated form (`-v ~/src`) from `_PassthroughAction`, not just equals form (`-v=~/src`)
+- `build_podman_exec_args()` takes ns dict + name + container_workdir + trailing_args + explicit_command; command from explicit_command takes priority over trailing_args
 
 #### Phase 2.5: Main Orchestration + Execution
 
@@ -181,3 +206,9 @@ dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
 `.gitconfig`) need to be writable in the container, so they require a
 host->container copy mechanism (similar to exports but reversed direction).
 Options: entrypoint copy block from staging mount, or a new staging pattern.
+
+### Phase 3 — Live Testing + Bug Fixes
+
+Live container integration tests and bug fixes discovered during end-to-end
+testing. Unit tests cover parsing, generation, and assembly logic; Phase 3
+validates the full podrun2 lifecycle against real podman.

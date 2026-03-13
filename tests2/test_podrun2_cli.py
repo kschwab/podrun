@@ -519,6 +519,276 @@ class TestPassthroughAction:
         assert ns.get('podman_global_args') or [] == ['--remote']
 
 
+# ---------------------------------------------------------------------------
+# TestEqualsFormParsing — ensure both --flag=value and --flag value forms work
+# ---------------------------------------------------------------------------
+
+
+class TestEqualsFormRootFlags:
+    """Verify equals-form parsing for root-level value flags."""
+
+    def _parse(self, args):
+        parser = build_root_parser()
+        ns, unknowns = parser.parse_known_args(args)
+        return vars(ns), unknowns
+
+    def test_config_equals(self):
+        ns, _ = self._parse(['--config=/path/to/config.json'])
+        assert ns['root.config'] == '/path/to/config.json'
+
+    def test_config_script_equals(self):
+        ns, _ = self._parse(['--config-script=/path/to/script'])
+        assert ns['root.config_script'] == ['/path/to/script']
+
+    def test_completion_equals(self):
+        ns, _ = self._parse(['--completion=bash'])
+        assert ns['root.completion'] == 'bash'
+
+    def test_log_level_equals(self):
+        ns, _ = self._parse(['--log-level=debug'])
+        args = ns.get('podman_global_args') or []
+        assert '--log-level' in args
+        assert 'debug' in args
+
+    def test_storage_opt_equals(self):
+        ns, _ = self._parse(['--storage-opt=ignore_chown_errors=true'])
+        args = ns.get('podman_global_args') or []
+        assert '--storage-opt' in args
+        assert 'ignore_chown_errors=true' in args
+
+
+class TestEqualsFormRunFlags:
+    """Verify equals-form parsing for run-level podrun value flags."""
+
+    def _parse_run(self, args):
+        parser = build_root_parser()
+        ns, unknowns = parser.parse_known_args(['run'] + args)
+        return vars(ns), unknowns
+
+    def test_name_equals(self):
+        ns, _ = self._parse_run(['--name=mycontainer'])
+        assert ns['run.name'] == 'mycontainer'
+
+    def test_shell_equals(self):
+        ns, _ = self._parse_run(['--shell=/bin/zsh'])
+        assert ns['run.shell'] == '/bin/zsh'
+
+    def test_prompt_banner_equals(self):
+        ns, _ = self._parse_run(['--prompt-banner=DEV'])
+        assert ns['run.prompt_banner'] == 'DEV'
+
+    def test_export_equals(self):
+        ns, _ = self._parse_run(['--export=/a:/b'])
+        assert ns['run.export'] == ['/a:/b']
+
+    def test_export_equals_multiple(self):
+        ns, _ = self._parse_run(['--export=/a:/b', '--export=/c:/d:0'])
+        assert ns['run.export'] == ['/a:/b', '/c:/d:0']
+
+    def test_label_equals(self):
+        ns, _ = self._parse_run(['--label=app=test'])
+        assert ns['run.label'] == ['app=test']
+
+    def test_label_short_equals(self):
+        ns, _ = self._parse_run(['-l=app=test'])
+        assert ns['run.label'] == ['app=test']
+
+
+class TestEqualsFormPassthroughFlags:
+    """Verify equals-form parsing for podman run passthrough value flags."""
+
+    def test_env_short_equals(self):
+        r = parse_args(['run', '-e=FOO=bar', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-e' in pt
+        assert 'FOO=bar' in pt
+
+    def test_env_long_space(self):
+        r = parse_args(['run', '--env', 'FOO=bar', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--env' in pt
+        assert 'FOO=bar' in pt
+
+    def test_volume_short_equals(self):
+        r = parse_args(['run', '-v=/a:/b', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-v' in pt
+        assert '/a:/b' in pt
+
+    def test_volume_long_equals(self):
+        r = parse_args(['run', '--volume=/a:/b', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--volume' in pt
+        assert '/a:/b' in pt
+
+    def test_memory_short_equals(self):
+        r = parse_args(['run', '-m=512m', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-m' in pt
+        assert '512m' in pt
+
+    def test_memory_long_space(self):
+        r = parse_args(['run', '--memory', '512m', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--memory' in pt
+        assert '512m' in pt
+
+    def test_memory_long_equals(self):
+        r = parse_args(['run', '--memory=512m', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--memory' in pt
+        assert '512m' in pt
+
+    def test_user_short_equals(self):
+        r = parse_args(['run', '-u=1000:1000', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-u' in pt
+        assert '1000:1000' in pt
+
+    def test_user_long_space(self):
+        r = parse_args(['run', '--user', '1000:1000', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--user' in pt
+        assert '1000:1000' in pt
+
+    def test_user_long_equals(self):
+        r = parse_args(['run', '--user=1000:1000', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--user' in pt
+        assert '1000:1000' in pt
+
+    def test_workdir_short_space(self):
+        r = parse_args(['run', '-w', '/app', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-w' in pt
+        assert '/app' in pt
+
+    def test_workdir_short_equals(self):
+        r = parse_args(['run', '-w=/app', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-w' in pt
+        assert '/app' in pt
+
+    def test_workdir_long_space(self):
+        r = parse_args(['run', '--workdir', '/app', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--workdir' in pt
+        assert '/app' in pt
+
+    def test_workdir_long_equals(self):
+        r = parse_args(['run', '--workdir=/app', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--workdir' in pt
+        assert '/app' in pt
+
+    def test_publish_short_equals(self):
+        r = parse_args(['run', '-p=8080:80', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-p' in pt
+        assert '8080:80' in pt
+
+    def test_publish_long_space(self):
+        r = parse_args(['run', '--publish', '8080:80', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--publish' in pt
+        assert '8080:80' in pt
+
+    def test_publish_long_equals(self):
+        r = parse_args(['run', '--publish=8080:80', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--publish' in pt
+        assert '8080:80' in pt
+
+    def test_hostname_short_equals(self):
+        r = parse_args(['run', '-h=devbox', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '-h' in pt
+        assert 'devbox' in pt
+
+    def test_hostname_long_space(self):
+        r = parse_args(['run', '--hostname', 'devbox', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--hostname' in pt
+        assert 'devbox' in pt
+
+    def test_hostname_long_equals(self):
+        r = parse_args(['run', '--hostname=devbox', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--hostname' in pt
+        assert 'devbox' in pt
+
+    def test_network_equals(self):
+        r = parse_args(['run', '--network=host', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--network' in pt
+        assert 'host' in pt
+
+    def test_mount_equals(self):
+        r = parse_args(['run', '--mount=type=bind,src=/a,dst=/b', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--mount' in pt
+        assert 'type=bind,src=/a,dst=/b' in pt
+
+    def test_cpus_equals(self):
+        r = parse_args(['run', '--cpus=2', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--cpus' in pt
+        assert '2' in pt
+
+    def test_cap_add_space(self):
+        r = parse_args(['run', '--cap-add', 'CAP_CHOWN', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--cap-add' in pt
+        assert 'CAP_CHOWN' in pt
+
+    def test_cap_add_equals(self):
+        r = parse_args(['run', '--cap-add=CAP_CHOWN', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--cap-add' in pt
+        assert 'CAP_CHOWN' in pt
+
+    def test_entrypoint_space(self):
+        r = parse_args(['run', '--entrypoint', '/bin/sh', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--entrypoint' in pt
+        assert '/bin/sh' in pt
+
+    def test_entrypoint_equals(self):
+        r = parse_args(['run', '--entrypoint=/bin/sh', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--entrypoint' in pt
+        assert '/bin/sh' in pt
+
+    def test_userns_space(self):
+        r = parse_args(['run', '--userns', 'keep-id', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--userns' in pt
+        assert 'keep-id' in pt
+
+    def test_userns_equals(self):
+        r = parse_args(['run', '--userns=keep-id', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--userns' in pt
+        assert 'keep-id' in pt
+
+    def test_annotation_equals(self):
+        r = parse_args(['run', '--annotation=note=hello', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--annotation' in pt
+        assert 'note=hello' in pt
+
+    def test_security_opt_space(self):
+        r = parse_args(['run', '--security-opt', 'seccomp=unconfined', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--security-opt' in pt
+        assert 'seccomp=unconfined' in pt
+
+    def test_security_opt_equals(self):
+        r = parse_args(['run', '--security-opt=seccomp=unconfined', 'alpine'])
+        pt = r.ns.get('run.passthrough_args') or []
+        assert '--security-opt' in pt
+        assert 'seccomp=unconfined' in pt
+
 
 # ---------------------------------------------------------------------------
 # TestParseArgs (end-to-end)

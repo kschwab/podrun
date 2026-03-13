@@ -15,6 +15,10 @@ Phase 1.2: Configuration integration — config-script execution,
 Phase 1.3: Local store management — local store resolution, initialization,
            --root/--runroot/--storage-driver injection, and podman
            remote detection.
+Phase 2.1: Constants, utilities, and parsing helpers — UID/GID/UNAME identity
+           constants, PODRUN_TMP paths, export/image-ref parsing, passthrough
+           flag introspection, tilde expansion, SHA-named file writer,
+           yes/no prompt.
 """
 
 __version__ = '1.0.0'
@@ -39,12 +43,42 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 from typing import List, Tuple
+
+# ---------------------------------------------------------------------------
+# Identity and path constants
+# ---------------------------------------------------------------------------
+
+UID = os.getuid()
+GID = os.getgid()
+UNAME = pwd.getpwuid(UID).pw_name
+USER_HOME = pwd.getpwuid(UID).pw_dir
+
+PODRUN_TMP = os.path.join(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/podrun-{UID}'), 'podrun')
+PODRUN_RC_PATH = '/.podrun/rc.sh'
+PODRUN_ENTRYPOINT_PATH = '/.podrun/run-entrypoint.sh'
+PODRUN_EXEC_ENTRY_PATH = '/.podrun/exec-entrypoint.sh'
+PODRUN_READY_PATH = '/.podrun/READY'
+BOOTSTRAP_CAPS = ['CAP_DAC_OVERRIDE', 'CAP_CHOWN', 'CAP_FOWNER', 'CAP_SETPCAP']
+
+# ns-key → PODRUN_OVERLAYS token mapping for _env_args().
+_OVERLAY_FIELDS = [
+    ('run.user_overlay', 'user'),
+    ('run.host_overlay', 'host'),
+    ('run.interactive_overlay', 'interactive'),
+    ('run.workspace', 'workspace'),
+    ('run.adhoc', 'adhoc'),
+]
+
+# ---------------------------------------------------------------------------
+# CLI flag constants
+# ---------------------------------------------------------------------------
 
 # Podrun root flags that overlap with podman global flags and are handled
 # by the root parser directly (skip registering as passthrough).
@@ -302,6 +336,211 @@ def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]
     podman_passthrough = podman_passthrough + run_passthrough
 
     return config_ns, podman_passthrough
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.1 — Parsing helpers and utilities
+# ---------------------------------------------------------------------------
+
+
+def yes_no_prompt(prompt_msg: str, answer_default: bool, is_interactive: bool) -> bool:
+    """Prompt the user for a yes/no answer on stderr."""
+    prompt_default = 'Y/n' if answer_default else 'N/y'
+    answer_default_str = 'yes' if answer_default else 'no'
+    prompt_str = f'{prompt_msg} [{prompt_default}]: '
+    if is_interactive:
+        sys.stderr.write(prompt_str)
+        sys.stderr.flush()
+        answer = input().lower() or answer_default_str
+    else:
+        answer = answer_default_str
+        print(f'{prompt_str}{answer}', file=sys.stderr)
+    while answer[:1] not in ['y', 'n']:
+        print('Please answer yes or no...', file=sys.stderr)
+        sys.stderr.write(prompt_str)
+        sys.stderr.flush()
+        answer = input().lower() or answer_default_str
+    return answer[:1] == 'y'
+
+
+def _parse_export(entry: str):
+    """Parse an export entry into ``(container_path, host_path, copy_only)``.
+
+    Accepted forms::
+
+        container_path:host_path        — strict (rm + symlink)
+        container_path:host_path:0      — copy-only (populate host dir, skip rm/symlink)
+    """
+    parts = entry.split(':')
+    if len(parts) == 3 and parts[2] == '0':
+        return parts[0], parts[1], True
+    if len(parts) == 2:
+        return parts[0], parts[1], False
+    raise ValueError(f'Invalid export spec {entry!r}: expected SRC:DST or SRC:DST:0')
+
+
+def _parse_image_ref(image: str) -> Tuple[str, str, str]:
+    """Break an image reference into ``(registry, name, tag)``.
+
+    Registry defaults to ``docker.io`` and tag defaults to ``latest``
+    when not explicitly present.
+    """
+    _IMAGE_RE = re.compile(
+        r'^((?P<registry>([^/]*[\.:]|localhost)[^/]*)/)?'
+        r'/?(?P<name>[a-z0-9][^:]*):?(?P<tag>.*)'
+    )
+    m = _IMAGE_RE.match(image)
+    if m is None:
+        raise ValueError(f'Invalid image name: "{image}"')
+    parts = m.groupdict()
+    return (
+        parts['registry'] if parts['registry'] else 'docker.io',
+        parts['name'],
+        parts['tag'] if parts['tag'] else 'latest',
+    )
+
+
+def _write_sha_file(content: str, prefix: str, suffix: str) -> str:
+    """Write content to a SHA-named file in PODRUN_TMP.  Idempotent."""
+    content_hash = hashlib.sha256(content.encode()).hexdigest()[:12]
+    filename = f'{prefix}{content_hash}{suffix}'
+    path = os.path.join(PODRUN_TMP, filename)
+    if not os.path.exists(path):
+        pathlib.Path(PODRUN_TMP).mkdir(parents=True, exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(content)
+        os.chmod(path, 0o755)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Passthrough flag introspection
+# ---------------------------------------------------------------------------
+
+
+def _passthrough_has_flag(pt, prefix):
+    """Return True if any arg in *pt* starts with *prefix* (e.g. ``--userns``)."""
+    return any(a == prefix or a.startswith(prefix + '=') for a in pt)
+
+
+def _passthrough_has_exact(pt, value):
+    """Return True if the exact *value* string is in *pt*."""
+    return value in pt
+
+
+def _passthrough_has_short_flag(pt, char):
+    """Check if short flag *char* is present (handles combined flags like ``-it``)."""
+    for a in pt:
+        if a.startswith('-') and not a.startswith('--'):
+            if char in a[1:]:
+                return True
+    return False
+
+
+def _extract_label_value(pt, label_key):
+    """Extract a label value from passthrough args.
+
+    Searches for ``-l key=value``, ``--label=key=value``, etc.
+    Returns the value, or ``None`` if not found.
+    """
+    prefix = f'{label_key}='
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        if arg.startswith(('--label=', '-l=')):
+            val = arg.split('=', 1)[1]
+            if val.startswith(prefix):
+                return val[len(prefix):]
+        elif arg in ('-l', '--label') and i + 1 < len(pt):
+            val = pt[i + 1]
+            if val.startswith(prefix):
+                return val[len(prefix):]
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _extract_passthrough_entrypoint(pt):
+    """Extract and remove ``--entrypoint`` from passthrough args.
+
+    Returns ``(entrypoint_value, filtered_pt)``.
+    """
+    alt_entrypoint = None
+    filtered = []
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        if arg.startswith('--entrypoint='):
+            alt_entrypoint = arg.split('=', 1)[1]
+        elif arg == '--entrypoint' and i + 1 < len(pt):
+            alt_entrypoint = pt[i + 1]
+            i += 2
+            continue
+        else:
+            filtered.append(arg)
+        i += 1
+    return alt_entrypoint, filtered
+
+
+def _volume_mount_destinations(*arg_lists) -> set:
+    """Extract container destination paths from -v/--volume args across all arg lists."""
+    dests = set()
+    for args in arg_lists:
+        for arg in args:
+            m = re.match(r'^(-v|--volume)=(.*)', arg)
+            if not m:
+                continue
+            parts = m.group(2).split(':')
+            if len(parts) >= 2:
+                dest = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+                dests.add(dest)
+    return dests
+
+
+# ---------------------------------------------------------------------------
+# Tilde expansion
+# ---------------------------------------------------------------------------
+
+
+def _expand_volume_tilde(args: list) -> list:
+    """Expand ``~`` in ``-v``/``--volume`` arguments.
+
+    Source (host) ``~`` expands to USER_HOME.
+    Destination (container) ``~`` expands to ``/home/{UNAME}``.
+    """
+    result = []
+    for arg in args:
+        m = re.match(r'^(-v|--volume)=(.*)', arg)
+        if not m:
+            result.append(arg)
+            continue
+        flag = m.group(1)
+        parts = m.group(2).split(':')
+        if len(parts) >= 2:
+            parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+            parts[1] = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+        elif len(parts) == 1:
+            parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+        result.append(f'{flag}={":".join(parts)}')
+    return result
+
+
+def _expand_export_tilde(exports: list) -> list:
+    """Expand ``~`` in export entries (``container_path:host_path[:0]``).
+
+    Host ``~`` expands to USER_HOME, container ``~`` expands to ``/home/{UNAME}``.
+    """
+    result = []
+    for entry in exports:
+        parts = entry.split(':')
+        if len(parts) >= 2:
+            parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
+            parts[1] = re.sub(r'^~', USER_HOME, parts[1])
+        elif len(parts) == 1:
+            parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
+        result.append(':'.join(parts))
+    return result
 
 
 # ---------------------------------------------------------------------------

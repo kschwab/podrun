@@ -330,8 +330,8 @@ class TestPodmanRemoteArgs:
         sock.touch()
         ns = {'run.store_socket': str(sock)}
         args = _podman_remote_args(ns)
-        assert f'-v={sock}:/run/podman/podman.sock' in args
-        assert '--env=CONTAINER_HOST=unix:///run/podman/podman.sock' in args
+        assert f'-v={sock}:{podrun2_mod.PODRUN_SOCKET_PATH}' in args
+        assert f'--env=CONTAINER_HOST={podrun2_mod.PODRUN_CONTAINER_HOST}' in args
 
     def test_fallback_systemd_socket(self, tmp_path, monkeypatch):
         sock = tmp_path / 'podman.sock'

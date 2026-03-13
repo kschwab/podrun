@@ -36,6 +36,11 @@ Phase 2.5: Main orchestration + execution — _default_podman_path(),
            _warn_missing_subids(), _fuse_overlayfs_fixup(),
            _handle_run(), and full main() wiring. Nested podrun guard,
            export/mount conflict filtering, stale file cleanup.
+Phase 2.6: Store service lifecycle — _store_hash(), _store_socket_path(),
+           _store_pid_path(), _socket_is_alive(), _wait_for_socket(),
+           _ensure_store_service(), _stop_store_service(). Hardened
+           _is_nested() with PODRUN_SOCKET_PATH fallback. Socket mount
+           path moved to podrun-specific /.podrun/podman/podman.sock.
 """
 
 __version__ = '1.0.0'
@@ -65,6 +70,7 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -84,6 +90,8 @@ PODRUN_RC_PATH = '/.podrun/rc.sh'
 PODRUN_ENTRYPOINT_PATH = '/.podrun/run-entrypoint.sh'
 PODRUN_EXEC_ENTRY_PATH = '/.podrun/exec-entrypoint.sh'
 PODRUN_READY_PATH = '/.podrun/READY'
+PODRUN_SOCKET_PATH = '/.podrun/podman/podman.sock'
+PODRUN_CONTAINER_HOST = f'unix://{PODRUN_SOCKET_PATH}'
 BOOTSTRAP_CAPS = ['CAP_DAC_OVERRIDE', 'CAP_CHOWN', 'CAP_FOWNER', 'CAP_SETPCAP']
 
 # ns-key → PODRUN_OVERLAYS token mapping for _env_args().
@@ -273,11 +281,25 @@ def run_os_cmd(cmd: str) -> subprocess.CompletedProcess:
 
 
 def _default_podman_path():
-    """Resolve the default podman binary, preferring podman-remote inside containers.
+    """Resolve the default podman binary.
 
-    Uses :func:`_is_nested` together with ``CONTAINER_HOST`` to decide
-    whether podman-remote should be preferred.
+    Resolution order:
+
+    1. ``PODRUN_PODMAN_PATH`` env var — highest priority, checked before any
+       parsing or flag scraping.  Follows the standard ``CC``/``EDITOR``
+       convention for tool-path overrides.
+    2. ``podman-remote`` when running inside a podrun container (detected via
+       :func:`_is_nested`) **and** ``CONTAINER_HOST`` is set.
+    3. ``podman`` (default).
     """
+    env_path = os.environ.get('PODRUN_PODMAN_PATH')
+    if env_path:
+        resolved = shutil.which(env_path)
+        if not resolved:
+            print(f"Error: PODRUN_PODMAN_PATH='{env_path}' not found.",
+                  file=sys.stderr)
+            sys.exit(1)
+        return resolved
     if os.environ.get('CONTAINER_HOST') and _is_nested():
         remote = shutil.which('podman-remote')
         if remote:
@@ -293,8 +315,17 @@ def _is_nested() -> bool:
     (via ``_env_args``).  All guards — nested-run refusal, podman-remote
     preference, store-flag suppression, flag-scrape refusal — should use
     this rather than probing the podman binary at runtime.
+
+    Fallback: if the env var has been unset, also detect nesting when
+    ``CONTAINER_HOST`` matches the podrun socket mount and the socket
+    file exists.  ``/.podrun/podman/podman.sock`` only exists inside a
+    podrun container (never on a bare host), making this tamper-resistant.
     """
-    return bool(os.environ.get('PODRUN_CONTAINER'))
+    if os.environ.get('PODRUN_CONTAINER'):
+        return True
+    if os.environ.get('CONTAINER_HOST') == PODRUN_CONTAINER_HOST and os.path.exists(PODRUN_SOCKET_PATH):
+        return True
+    return False
 
 
 def _warn_missing_subids():
@@ -1110,13 +1141,13 @@ def _podman_remote_args(ns):
     args = []
     store_socket = ns.get('run.store_socket')
     if store_socket and pathlib.Path(store_socket).exists():
-        args.append(f'-v={store_socket}:/run/podman/podman.sock')
-        args.append('--env=CONTAINER_HOST=unix:///run/podman/podman.sock')
+        args.append(f'-v={store_socket}:{PODRUN_SOCKET_PATH}')
+        args.append(f'--env=CONTAINER_HOST={PODRUN_CONTAINER_HOST}')
     else:
         podman_socket = f'/run/user/{UID}/podman/podman.sock'
         if pathlib.Path(podman_socket).exists():
-            args.append(f'-v={podman_socket}:/run/podman/podman.sock')
-            args.append('--env=CONTAINER_HOST=unix:///run/podman/podman.sock')
+            args.append(f'-v={podman_socket}:{PODRUN_SOCKET_PATH}')
+            args.append(f'--env=CONTAINER_HOST={PODRUN_CONTAINER_HOST}')
         else:
             print('Warning: podman remote was requested but podman.socket not found.', file=sys.stderr)
             print('systemctl --user enable --now podman.socket', file=sys.stderr)
@@ -1358,14 +1389,106 @@ def devcontainer_run_args(devcontainer: dict) -> list:
 _PODRUN_STORES_DIR = '/tmp/podrun-stores'
 
 
-def _runroot_path(graphroot: str) -> str:
-    """Return a deterministic runroot path under ``/tmp`` for *graphroot*.
+def _store_hash(graphroot: str) -> str:
+    """Return a truncated SHA-256 hash for *graphroot*.
 
-    Uses a short SHA-256 prefix to stay well within
-    the 108-byte ``sun_path`` limit and is unique per graphroot.
+    Used by ``_runroot_path``, ``_store_socket_path``, and
+    ``_store_pid_path`` to derive a deterministic, short directory
+    name that stays well within the 108-byte ``sun_path`` limit.
     """
-    h = hashlib.sha256(graphroot.encode()).hexdigest()[:12]
-    return f'{_PODRUN_STORES_DIR}/{h}'
+    return hashlib.sha256(graphroot.encode()).hexdigest()[:12]
+
+
+def _runroot_path(graphroot: str) -> str:
+    """Return a deterministic runroot path under ``/tmp`` for *graphroot*."""
+    return f'{_PODRUN_STORES_DIR}/{_store_hash(graphroot)}'
+
+
+def _store_socket_path(graphroot: str) -> str:
+    """Return the podman service socket path for a store."""
+    return f'{_PODRUN_STORES_DIR}/{_store_hash(graphroot)}/podman.sock'
+
+
+def _store_pid_path(graphroot: str) -> str:
+    """Return the PID file path for a store's podman service."""
+    return f'{_PODRUN_STORES_DIR}/{_store_hash(graphroot)}/podman.pid'
+
+
+def _socket_is_alive(sock, pid_file):
+    """Return True if the podman service is still running."""
+    if not os.path.exists(pid_file):
+        return False
+    try:
+        pid = int(pathlib.Path(pid_file).read_text().strip())
+        os.kill(pid, 0)  # Check if process exists
+        return os.path.exists(sock)
+    except (ValueError, OSError):
+        return False
+
+
+def _wait_for_socket(sock, timeout=10):
+    """Block until the socket file appears or timeout."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(sock):
+            return
+        time.sleep(0.1)
+    print(f'Warning: timed out waiting for {sock}', file=sys.stderr)
+
+
+def _ensure_store_service(graphroot, runroot, store_dir=None, podman_path='podman'):
+    """Ensure a podman system service is running for the given store.
+
+    Starts ``podman system service`` bound to the store's graphroot/runroot
+    with no idle timeout, writing its PID to a file for cleanup.
+    Returns the socket path.
+    """
+    if _is_nested():
+        print(
+            'Error: cannot start store service inside a podrun container.\n'
+            'The store lives on the host — use podman-remote to access it.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sock = _store_socket_path(graphroot)
+    pid_file = _store_pid_path(graphroot)
+
+    # Already running?
+    if _socket_is_alive(sock, pid_file):
+        return sock
+
+    # Clean up stale socket
+    if os.path.exists(sock):
+        os.unlink(sock)
+
+    # Build env with registries.conf if present
+    env = os.environ.copy()
+    if store_dir:
+        reg = pathlib.Path(store_dir) / 'registries.conf'
+        if reg.exists():
+            env['CONTAINERS_REGISTRIES_CONF'] = str(reg)
+
+    cmd = [
+        podman_path,
+        '--root', graphroot,
+        '--runroot', runroot,
+        '--storage-driver', 'overlay',
+        'system', 'service',
+        '--time', '0',
+        f'unix://{sock}',
+    ]
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Write PID
+    pathlib.Path(pid_file).write_text(str(proc.pid))
+
+    # Wait for socket to appear
+    _wait_for_socket(sock)
+
+    return sock
 
 
 def _default_store_dir():
@@ -1422,10 +1545,24 @@ def _store_print_info(store_dir: str) -> None:
 
 
 def _stop_store_service(graphroot: str) -> None:
-    """Stop the podman system service for a store, if running.
-
-    TODO: phase 2 — full service management.
-    """
+    """Stop the podman system service for a store, if running."""
+    pid_file = _store_pid_path(graphroot)
+    if not os.path.exists(pid_file):
+        return
+    try:
+        pid = int(pathlib.Path(pid_file).read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (ValueError, OSError):
+        pass
+    try:
+        os.unlink(pid_file)
+    except OSError:
+        pass
+    sock = _store_socket_path(graphroot)
+    try:
+        os.unlink(sock)
+    except OSError:
+        pass
 
 
 def _store_destroy(store_dir: str, podman_path: str) -> None:
@@ -2718,6 +2855,14 @@ def _handle_run(result, podman_path):
     # Warn about missing subuid/subgid ranges
     if ns.get('run.user_overlay'):
         _warn_missing_subids()
+
+    # Ensure store service is running when using podman-remote with a local store
+    if ns.get('run.podman_remote') and ns.get('root.local_store'):
+        store_path = pathlib.Path(ns['root.local_store']).resolve()
+        graphroot = str(store_path / 'graphroot')
+        runroot = _runroot_path(graphroot)
+        sock = _ensure_store_service(graphroot, runroot, store_dir=str(store_path), podman_path=podman_path)
+        ns['run.store_socket'] = sock
 
     # Build the full run command with overlay injection
     cmd, _caps_to_drop = build_overlay_run_command(result, podman_path)

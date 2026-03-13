@@ -27,6 +27,7 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
     # Clear nested podrun guard env var (we're running inside a podrun container)
     monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
+    monkeypatch.delenv('PODRUN_PODMAN_PATH', raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,46 @@ class TestDefaultPodmanPath:
         path = _default_podman_path()
         # Without CONTAINER_HOST, should use regular podman
         assert path is None or 'podman-remote' not in path
+
+    def test_podman_path_env_returns_resolved(self, monkeypatch):
+        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'podman')
+        path = _default_podman_path()
+        # shutil.which('podman') should resolve to a real path
+        assert path is not None
+        assert 'podman' in path
+
+    def test_podman_path_env_invalid_exits(self, monkeypatch):
+        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'no-such-binary-xyz')
+        with pytest.raises(SystemExit) as exc_info:
+            _default_podman_path()
+        assert exc_info.value.code == 1
+
+    def test_podman_path_env_invalid_message(self, monkeypatch, capsys):
+        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'no-such-binary-xyz')
+        with pytest.raises(SystemExit):
+            _default_podman_path()
+        err = capsys.readouterr().err
+        assert 'PODRUN_PODMAN_PATH' in err
+        assert 'no-such-binary-xyz' in err
+
+    def test_podman_path_env_overrides_nested_remote(self, monkeypatch):
+        """PODRUN_PODMAN_PATH takes priority over nested podman-remote preference."""
+        monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
+        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        # Point to regular podman — should be used even when nested
+        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'podman')
+        path = _default_podman_path()
+        assert path is not None
+        assert 'podman-remote' not in path
+
+    def test_podman_path_env_absolute(self, monkeypatch, tmp_path):
+        """PODRUN_PODMAN_PATH works with absolute paths."""
+        fake_bin = tmp_path / 'my-podman'
+        fake_bin.write_text('#!/bin/sh\n')
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv('PODRUN_PODMAN_PATH', str(fake_bin))
+        path = _default_podman_path()
+        assert path == str(fake_bin)
 
 
 # ---------------------------------------------------------------------------

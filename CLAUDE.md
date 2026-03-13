@@ -57,6 +57,7 @@ Each sub-phase should:
 | 2.3 | `tests2/test_podrun2_overlays.py` |
 | 2.4 | `tests2/test_podrun2_state.py` |
 | 2.5 | `tests2/test_podrun2_main.py` |
+| 2.6 | `tests2/test_podrun2_store_service.py` |
 
 ### CLI flag form coverage
 
@@ -168,12 +169,12 @@ Key decisions:
 
 #### Phase 2.5: Main Orchestration + Execution ✓
 
-Final integration into `main()`. Tests: `tests2/test_podrun2_main.py` (35 tests).
+Final integration into `main()`. Tests: `tests2/test_podrun2_main.py` (40 tests).
 
 | Item | Source (podrun.py) | Status |
 |---|---|---|
 | `_is_nested()` | replaces `is_podman_remote()` | ✓ Single source of truth for nested-execution detection via `PODRUN_CONTAINER` env var |
-| `_default_podman_path()` | Lines 237-245 | ✓ Uses `_is_nested()` + `CONTAINER_HOST` to prefer podman-remote |
+| `_default_podman_path()` | Lines 237-245 | ✓ `PODRUN_PODMAN_PATH` env var → nested podman-remote → podman fallback |
 | `_warn_missing_subids()` | Lines 1416-1439 | ✓ subuid/subgid check |
 | `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files, storage-opt injection (TODO: space-form fix in Phase 2.8) |
 | `_handle_run()` | Lines 3103-3226 | ✓ state → entrypoints → overlays → exec |
@@ -181,6 +182,7 @@ Final integration into `main()`. Tests: `tests2/test_podrun2_main.py` (35 tests)
 | `_volume_mount_destinations()` | — | ✓ Fixed space-form volume parsing (`-v /host:/ctr`) |
 
 Key decisions:
+- **`PODRUN_PODMAN_PATH`** env var support in `_default_podman_path()` — highest-priority override for the podman binary path, checked before any parsing or flag scraping. Follows the standard `CC`/`EDITOR` convention. Resolved via `shutil.which()` (handles bare names and absolute paths); exits with error if not found. Avoids chicken-and-egg problem of CLI/devcontainer `podmanPath` (binary needed before parsing, but config not available until after).
 - **`PODRUN_CONTAINER=1`** is set by `_env_args()` in every child container. It is the single source of truth for "am I inside a podrun container?" — used by `_is_nested()`, which replaced the old `is_podman_remote()` function (which spawned `podman info`). All guards (nested-run refusal, podman-remote preference, store-flag suppression, flag-scrape refusal) go through `_is_nested()`.
 - `_handle_run()` orchestrates: image extraction → container state → export conflict filtering → subid warning → overlay build → fuse-overlayfs fixup → stale cleanup → exec
 - `_volume_mount_destinations()` handles both equals form (`-v=/host:/ctr`) and space form (`-v /host:/ctr`) from `_PassthroughAction`
@@ -189,24 +191,29 @@ Key decisions:
 
 Depends on 2.1-2.4.
 
-#### Phase 2.6: Store Service Lifecycle (orthogonal)
+#### Phase 2.6: Store Service Lifecycle ✓
+
+Store service lifecycle for `podman system service` management.
+**Status: Complete — 35 tests in `tests2/test_podrun2_store_service.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
+| `_store_hash()` | New | Extracted from `_runroot_path`; shared by socket/pid/runroot path helpers |
 | `_store_socket_path()` | Line 1308 | Socket path from graphroot |
 | `_store_pid_path()` | Line 1314 | PID file path |
-| `_socket_is_alive()` | Lines 1320-1330 | Health check |
-| `_wait_for_socket()` | Lines 1332-1342 | Block until ready |
-| `_ensure_store_service()` | Lines 1344-1394 | Start `podman system service` |
-| `_stop_store_service()` | Lines 1395-1415 | Stop service (currently stub) |
+| `_socket_is_alive()` | Lines 1320-1330 | Health check (PID alive + socket exists) |
+| `_wait_for_socket()` | Lines 1332-1342 | Block until ready, warns on timeout |
+| `_ensure_store_service()` | Lines 1344-1394 | Idempotent start of `podman system service`; writes PID, waits for socket |
+| `_stop_store_service()` | Lines 1395-1415 | SIGTERM → clean PID file → clean socket (was empty stub) |
+| `_is_nested()` hardened | — | Fallback: `CONTAINER_HOST` + `PODRUN_SOCKET_PATH` existence |
+| `PODRUN_SOCKET_PATH` | New | `/.podrun/podman/podman.sock` — podrun-specific mount point |
+| `PODRUN_CONTAINER_HOST` | New | `unix://` + `PODRUN_SOCKET_PATH` |
 
-**TODO: Harden `_is_nested()` detection.** Currently uses `PODRUN_CONTAINER=1`
-env var (can be `unset` by user). Nested podrun requires podman-remote which
-requires a socket — podrun mounts the host socket to `/run/podman/podman.sock`
-inside the container and sets `CONTAINER_HOST`. Checking socket existence +
-`CONTAINER_HOST` would be a tamper-resistant complement to the env var. This is
-the natural place to implement it since the socket paths and lifecycle are
-defined here.
+Key decisions:
+- **Socket mount moved to `/.podrun/podman/podman.sock`** — replaces `/run/podman/podman.sock`. This path only exists inside a podrun container, making it an unambiguous signal for `_is_nested()` fallback detection
+- **`_is_nested()` hardened**: primary check via `PODRUN_CONTAINER` env var (fast path); fallback checks `CONTAINER_HOST == PODRUN_CONTAINER_HOST` AND socket file exists at `PODRUN_SOCKET_PATH` (tamper-resistant — survives `unset PODRUN_CONTAINER`)
+- **`_store_hash()` extracted** from `_runroot_path()` to eliminate triple `hashlib.sha256` duplication across `_runroot_path`, `_store_socket_path`, `_store_pid_path`
+- **`_handle_run()` integration**: when `run.podman_remote` and `root.local_store` are both set, calls `_ensure_store_service()` and sets `ns['run.store_socket']` before overlay command assembly
 
 #### Phase 2.7: Shell Completion (orthogonal, low priority)
 

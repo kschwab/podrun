@@ -19,6 +19,10 @@ Phase 2.1: Constants, utilities, and parsing helpers — UID/GID/UNAME identity
            constants, PODRUN_TMP paths, export/image-ref parsing, passthrough
            flag introspection, tilde expansion, SHA-named file writer,
            yes/no prompt.
+Phase 2.2: Entrypoint generation — run-entrypoint.sh (user identity, home dir,
+           shell, sudo, exports, cap-drop), rc.sh (prompt banner), and
+           exec-entrypoint.sh (attach session setup). Functions take ns dict
+           directly instead of Config dataclass.
 """
 
 __version__ = '1.0.0'
@@ -43,12 +47,14 @@ import hashlib
 import json
 import os
 import pathlib
+import platform
 import pwd
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 from typing import List, Tuple
 
 # ---------------------------------------------------------------------------
@@ -541,6 +547,349 @@ def _expand_export_tilde(exports: list) -> list:
             parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
         result.append(':'.join(parts))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.2 — Entrypoint generation
+# ---------------------------------------------------------------------------
+
+
+def generate_run_entrypoint(ns: dict) -> str:
+    """Generate the run-entrypoint script and return its path (SHA-named, idempotent).
+
+    Reads from the *ns* dict: ``run.login``, ``run.shell``, ``run.export``.
+    Bootstrap caps come from the module-level ``BOOTSTRAP_CAPS`` constant.
+    """
+    login_flag = ' -l' if ns.get('run.login') else ''
+    caps_to_drop = sorted(BOOTSTRAP_CAPS)
+    default_shell = ns.get('run.shell')
+    exports = sorted(ns.get('run.export') or [])
+
+    # Build export blocks
+    export_blocks = ''
+    if exports:
+        lines = []
+        for entry in exports:
+            src, _, copy_only = _parse_export(entry)
+            staging = f'/.podrun/exports/{hashlib.sha256(src.encode()).hexdigest()[:12]}'
+            mode = 'copy' if copy_only else 'mount'
+            lines.append(f'        # Export ({mode}): {src}')
+            if copy_only:
+                lines.append(f'        if [ -d "{src}" ] && [ -d "{staging}" ]; then')
+                lines.append(f'            if [ -z "$(ls -A "{staging}" 2>/dev/null)" ]; then')
+                lines.append(f'                cp -a "{src}/." "{staging}/"')
+                lines.append('            fi')
+                lines.append(f'        elif [ -f "{src}" ] && [ -d "{staging}" ]; then')
+                lines.append(f'            _dst="{staging}/$(basename "{src}")"')
+                lines.append('            if [ ! -f "$_dst" ]; then')
+                lines.append(f'                cp -a "{src}" "$_dst"')
+                lines.append('            fi')
+                lines.append('        fi')
+            else:
+                lines.append(f'        if [ -d "{src}" ] && [ -d "{staging}" ]; then')
+                lines.append(f'            if [ -z "$(ls -A "{staging}" 2>/dev/null)" ]; then')
+                lines.append(f'                cp -a "{src}/." "{staging}/"')
+                lines.append('            fi')
+                lines.append(f'            rm -rf "{src}"')
+                lines.append(f'            ln -sfn "{staging}" "{src}"')
+                lines.append(f'        elif [ -f "{src}" ] && [ -d "{staging}" ]; then')
+                lines.append(f'            _dst="{staging}/$(basename "{src}")"')
+                lines.append('            if [ ! -f "$_dst" ]; then')
+                lines.append(f'                cp -a "{src}" "$_dst"')
+                lines.append('            fi')
+                lines.append(f'            rm -f "{src}"')
+                lines.append(f'            ln -sfn "$_dst" "{src}"')
+                lines.append(f'        elif [ -d "{staging}" ]; then')
+                lines.append(f'            mkdir -p "$(dirname "{src}")"')
+                lines.append(f'            ln -sfn "{staging}" "{src}"')
+                lines.append('        fi')
+            lines.append('')
+        export_blocks = '\n'.join(lines)
+
+    # 8-space indent to match textwrap.dedent template below
+    if default_shell:
+        shell_detect = (
+            f'        # Use configured default shell\n'
+            f'        if command -v {default_shell} > /dev/null 2>&1; then\n'
+            f'          SHELL="$(command -v {default_shell})"; export SHELL\n'
+            f'        else\n'
+            f'          echo "podrun: warning: {default_shell} not found, falling back to sh" >&2\n'
+            f'          SHELL="$(command -v sh)"; export SHELL\n'
+            f'        fi'
+        )
+    else:
+        shell_detect = (
+            '        # Detect shell (prefer bash over sh)\n'
+            '        if [ -z "$SHELL" ]; then SHELL="$(command -v sh)"; export SHELL; fi\n'
+            '        if [ "$(basename "$SHELL")" = "sh" ]; then\n'
+            '          if command -v bash > /dev/null 2>&1; then\n'
+            '            SHELL="$(command -v bash)"; export SHELL\n'
+            '          fi\n'
+            '        fi'
+        )
+
+    script = textwrap.dedent(f'''\
+        #!/bin/sh{login_flag}
+        # Generated by podrun {__version__}. Do not modify by hand.
+        set -e
+
+{shell_detect}
+        PODRUN_SHELL="$SHELL"; export PODRUN_SHELL
+
+        # Patch SHELL field in /etc/passwd (--passwd-entry creates the entry
+        # with /bin/sh; update to the resolved shell path).
+        # Also ensure group entry exists (requires CAP_DAC_OVERRIDE).
+        if command -v sed > /dev/null 2>&1; then
+          sed -i "s|^\\({UNAME}:.*:\\)/bin/sh\\$|\\1$SHELL|" /etc/passwd 2>/dev/null || true
+        fi
+        if ! awk -v gid={GID} -F: '{{ if($3==gid){{found=1}} }} END{{exit !found}}' /etc/group 2>/dev/null; then
+          echo "{UNAME}:x:{GID}:" >> /etc/group 2>/dev/null || true
+        fi
+
+        # Create home directory and populate from /etc/skel
+        # (requires CAP_DAC_OVERRIDE for /etc/skel access, CAP_CHOWN for ownership)
+        # Uses -xdev to skip bind-mounted files/dirs (different filesystem).
+        mkdir -p /home/{UNAME}
+        if [ -d /etc/skel ]; then
+          cp -a /etc/skel/. /home/{UNAME}/ 2>/dev/null || true
+        fi
+        find /home/{UNAME} -xdev -exec chown {UID}:{GID} {{}} + 2>/dev/null || true
+
+        # Opportunistic sudo setup (requires CAP_DAC_OVERRIDE to write sudoers)
+        if command -v sudo > /dev/null 2>&1; then
+          echo "{UNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers 2>/dev/null || true
+        fi
+
+        # Convenience symlink to workspace
+        ln -s "$PWD" /home/{UNAME}/workdir > /dev/null 2>&1 || true
+
+        # Wire rc.sh into bashrc
+        _bashrc="/home/{UNAME}/.bashrc"
+        if [ ! -f "$_bashrc" ] || ! grep -q '{PODRUN_RC_PATH}' "$_bashrc" 2>/dev/null; then
+          echo '. {PODRUN_RC_PATH}' >> "$_bashrc"
+        fi
+
+        # Force HOME to the directory we just created — the image may have
+        # HOME baked in (e.g. ENV HOME=/root) which prevents podman from
+        # deriving it from --passwd-entry.
+        HOME=/home/{UNAME}
+        export HOME
+        ENV={PODRUN_RC_PATH}
+        export ENV
+
+{export_blocks}        # Signal that setup is complete so exec-entrypoint.sh can proceed.
+        touch {PODRUN_READY_PATH}
+
+        # If an alternate entrypoint was requested (e.g. by the devcontainer
+        # CLI via --entrypoint), prepend it to the args so it is exec'd after
+        # our setup completes.  The podrun entrypoint always runs first to
+        # ensure user identity and home directory are ready.
+        if [ -n "$PODRUN_ALT_ENTRYPOINT" ]; then
+          set -- "$PODRUN_ALT_ENTRYPOINT" "$@"
+        fi
+
+        # Drop bootstrap capabilities before exec.
+        # Probe short names first (BusyBox), fall back to cap_ prefix (util-linux).
+        # Drop from both inheritable and ambient sets so effective caps
+        # are cleared after exec (ambient caps drive effective in userns).
+        if command -v setpriv > /dev/null 2>&1; then
+          _drop="{','.join('-' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}"
+          if ! setpriv --inh-caps="$_drop" --ambient-caps="$_drop" true 2>/dev/null; then
+            _drop="{','.join('-cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}"
+          fi
+          if [ $# -eq 0 ]; then
+            exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" $SHELL
+          else
+            exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" "$@"
+          fi
+        elif command -v capsh > /dev/null 2>&1; then
+          # capsh uses cap_xxx names; --delamb removes from ambient,
+          # --drop removes from bounding.
+          _capsh_args=""
+          # shellcheck disable=SC2043
+          for _cap in {' '.join('cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}; do
+            _capsh_args="$_capsh_args --delamb=$_cap --drop=$_cap"
+          done
+          # shellcheck disable=SC2086
+          if [ $# -eq 0 ]; then
+            exec capsh $_capsh_args -- -c "exec $SHELL"
+          else
+            _quoted=""
+            for _arg in "$@"; do
+              _quoted="$_quoted '$_arg'"
+            done
+            exec capsh $_capsh_args -- -c "exec $_quoted"
+          fi
+        else
+          if [ $# -eq 0 ]; then
+            exec $SHELL
+          else
+            exec "$@"
+          fi
+        fi
+    ''')
+    return _write_sha_file(script, 'entrypoint_', '.sh')
+
+
+def generate_rc_sh(ns: dict) -> str:
+    """Generate the rc.sh prompt/banner script and return its path (SHA-named, idempotent).
+
+    Reads from the *ns* dict: ``run.prompt_banner``.
+    """
+    prompt_banner = ns.get('run.prompt_banner') or 'podrun'
+    cpu_name = run_os_cmd(
+        "grep -m 1 'model name[[:space:]]*:' /proc/cpuinfo"
+        " | cut -d ' ' -f 3- | sed 's/(R)/\u00ae/g; s/(TM)/\u2122/g;'"
+    ).stdout
+    cpu_vcount = run_os_cmd("grep -o 'processor[[:space:]]*:' /proc/cpuinfo | wc -l").stdout
+    cpu = f'{cpu_name.strip()} ({cpu_vcount.strip()} vCPU)'
+    fl = 52
+    cfl = fl + len(bytearray(cpu, sys.stdout.encoding or 'utf-8')) - len(cpu)
+
+    script = textwrap.dedent(rf"""
+        ##################################################################
+        # Generated by podrun {__version__}. Do not modify by hand.
+
+        # shellcheck disable=SC2148
+        if [ -n "$PODRUN_STTY_INIT" ]; then
+            stty $PODRUN_STTY_INIT > /dev/null 2>&1
+            unset PODRUN_STTY_INIT
+        fi
+        unset PROMPT_COMMAND
+        HOSTNAME="${{HOSTNAME:-{platform.node()}}}"
+        export HOSTNAME
+        _g=$(printf '\033[32m')
+        _b=$(printf '\033[34m')
+        _i=$(printf '\033[7m')
+        _n=$(printf '\033[0m')
+        _prompt_banner="{prompt_banner}"
+        _curr_shell="$(command -v "$0")"
+        if readlink -f "$_curr_shell" > /dev/null 2>&1; then _curr_shell="$(readlink -f "$_curr_shell")"; fi
+        case "$(basename "$_curr_shell")" in
+          dash|ksh)
+            _ps1_user="$(whoami)"
+            PS1=$(printf "$_i$_prompt_banner$_n\n$_g$_ps1_user@$HOSTNAME$_n $_b\$PWD$_n\n\$ ") ;;
+          *)
+            PS1="$_i$_prompt_banner$_n\n$_g\u@\h$_n $_b\w$_n\n\$ " ;;
+        esac
+        # Skip banner for non-interactive shells.
+        case "$-" in *i*) ;; *) return 0 2>/dev/null || : ;; esac
+        _uptime="$(awk '{{ printf "%d", $1 }}' /proc/uptime)"
+        _minutes=$((_uptime / 60))
+        _hours=$((_minutes / 60))
+        _minutes=$((_minutes % 60))
+        _days=$((_hours / 24))
+        _hours=$((_hours % 24))
+        _weeks=$((_days / 7))
+        _days=$((_days % 7))
+        _uptime="up $_weeks weeks, $_days days, $_hours hours, $_minutes minutes"
+        _mem_total=$(grep 'MemTotal:' /proc/meminfo | awk '{{ print $2 }}')
+        _mem_avail=$(grep 'MemAvailable:' /proc/meminfo | awk '{{ print $2 }}')
+        _mem_used=$((_mem_total - _mem_avail))
+        _mem_used=$(awk -v mem_kb="$_mem_used" 'BEGIN{{ printf "%.1fG", mem_kb / 1000000}}')
+        _mem_total=$(awk -v mem_kb="$_mem_total" 'BEGIN{{ printf "%.1fG", mem_kb / 1000000}}')
+        _mem_avail=$(awk -v mem_kb="$_mem_avail" 'BEGIN{{ printf "%.1fG", mem_kb / 1000000}}')
+        _mem="$_mem_used used, $_mem_total total ($_mem_avail avail)"
+        _disk_free=$(df -h / | awk 'FNR == 2 {{ print $4 }}')
+        _disk_used=$(df -h / | awk 'FNR == 2 {{ print $3 }}')
+        cat << 'EOT'
+                         ,,))))))));,
+                      __)))))))))))))),
+           \|/       -\(((((''''((((((((.     .----------------------------.
+           -*-==//////((''  .     `)))))),   /  PODRUN __________________)
+           /|\      ))| o    ;-.    '(((((  /            _______________)   ,(,
+                    ( `|    /  )    ;))))' /         _______________)    ,_))^;(~
+                       |   |   |   ,))((((_/      ________) __          %,;(;(>';'~
+                       o_);   ;    )))(((`    \ \   ~---~  `:: \       %%~~)(v;(`('~
+                             ;    ''''````         `:       `:: |\,__,%%    );`'; ~ %
+                            |   _                )     /      `:|`----'     `-'
+                      ______/\/~    |                 /        /
+                    /~;;.____/;;'  /          ___--,-(   `;;;/
+                   / //  _;______;'------~~~~~    /;;/\    /
+                  //  | |                        / ;   \;;,\
+                 (<_  | ;                      /',/-----'  _>
+                  \_| ||_                     //~;~~~~~~~~~
+        EOT
+        echo "$_g─────────────╴$_n\`\-| $_g─────────────────$_n \(,~~ $_g─────────────────────────────────────"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$_n \~| $_g━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        printf "┃$_n    CPU $_g┃$_n %-{cfl}.{cfl}s $_g┃$_n  DISK SPACE  $_g┃\\n" "{cpu}"
+        printf "┃$_n    RAM $_g┃$_n %-{fl}.{fl}s $_g┃$_n free  %6s $_g┃\\n" "$_mem" "$_disk_free"
+        printf "┃$_n UPTIME $_g┃$_n %-{fl}.{fl}s $_g┃$_n used  %6s $_g┃$_n\\n" "$_uptime" "$_disk_used"
+    """).lstrip('\n')
+
+    return _write_sha_file(script, 'rc_', '.sh')
+
+
+def generate_exec_entrypoint() -> str:
+    """Generate exec-entrypoint.sh and return its path (SHA-named, idempotent).
+
+    The exec-entrypoint is configuration-independent — it reads ``PODRUN_*``
+    env vars at runtime (set by ``podman run -e``).  No *ns* dict needed.
+    """
+    script = textwrap.dedent(f"""\
+        #!/bin/sh
+        # Generated by podrun {__version__}. Do not modify by hand.
+
+        # --- Wait for run-entrypoint.sh setup ---
+        # The run-entrypoint creates the user, home directory, exports, etc.
+        # If exec races the entrypoint, those resources may not exist yet.
+        # Wait for the READY sentinel that run-entrypoint touches after setup.
+        while [ ! -e {PODRUN_READY_PATH} ]; do
+          sleep 0.1
+        done
+
+        # --- HOME resolution ---
+        # The image may bake in ENV HOME=/root which podman exec inherits.
+        # Read HOME from /etc/passwd (set by --passwd-entry) to override it.
+        _home="$(awk -v uid=$(id -u) -F: '$3==uid{{print $6}}' /etc/passwd 2>/dev/null)"
+        if [ -n "$_home" ] && [ -d "$_home" ]; then
+          HOME="$_home"; export HOME
+        fi
+
+        # --- Shell resolution ---
+        # Priority: $1 arg -> $PODRUN_SHELL -> /etc/passwd -> /bin/sh
+        # Then prefer bash over sh (matches run-entrypoint.sh logic).
+        _shell="${{1:-}}"
+        if [ -z "$_shell" ]; then
+          _shell="${{PODRUN_SHELL:-}}"
+        fi
+        if [ -z "$_shell" ]; then
+          _shell="$(awk -v uid=$(id -u) -F: '$3==uid{{print $NF}}' /etc/passwd 2>/dev/null)"
+        fi
+        if [ -z "$_shell" ] || ! command -v "$_shell" > /dev/null 2>&1; then
+          _shell="/bin/sh"
+        fi
+        if [ "$(basename "$_shell")" = "sh" ]; then
+          if command -v bash > /dev/null 2>&1; then
+            _shell="$(command -v bash)"
+          fi
+        fi
+        SHELL="$_shell"; export SHELL
+
+        # --- Login resolution ---
+        # Priority: $2 arg -> $PODRUN_LOGIN -> 0 (no login)
+        _login="${{2:-}}"
+        if [ -z "$_login" ]; then
+          _login="${{PODRUN_LOGIN:-0}}"
+        fi
+
+        # --- stty resize ---
+        if [ -n "$PODRUN_STTY_INIT" ]; then
+          stty $PODRUN_STTY_INIT > /dev/null 2>&1
+          unset PODRUN_STTY_INIT
+        fi
+
+        # --- Exec ---
+        shift 2 2>/dev/null || true
+        if [ $# -gt 0 ]; then
+          exec "$@"
+        elif [ "$_login" = "1" ]; then
+          exec "$SHELL" -l
+        else
+          exec "$SHELL"
+        fi
+    """)
+    return _write_sha_file(script, 'exec_entry_', '.sh')
 
 
 # ---------------------------------------------------------------------------

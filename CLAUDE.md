@@ -1,0 +1,174 @@
+# Podrun Project Notes
+
+## podrun.py to podrun2.py Transition State
+
+### Phase 1 -- Ported / Updated
+
+| Behavior | Status | Notes |
+|---|---|---|
+| CLI flag parsing | Updated | Replaced hand-rolled `_PodrunParser`/`_detect_subcommand` with argparse + live podman flag scraping (cached). Flags no longer hardcoded. |
+| `--help` rendering | Updated | Now scrapes `podman --help` / `podman run --help` live and appends podrun-specific options. Old version used custom formatter. |
+| `--version` | Ported | Same behavior |
+| `--print-cmd` / `--dry-run` | Ported | Same behavior |
+| devcontainer.json discovery | Ported | Same upward-walk logic |
+| JSONC stripping | Ported | Same implementation |
+| devcontainer.json parsing + field mapping | Ported | `mounts`, `capAdd`, `securityOpt`, `privileged`, `init`, `runArgs` |
+| `customizations.podrun` extraction | Ported | Same behavior |
+| Three-way config merge (CLI > script > dc) | Updated | Now uses namespace-dict (`root.*`/`run.*` keys) instead of `Config` dataclass. Merge logic is cleaner but equivalent precedence. |
+| Config-script execution + token parsing | Updated | New `run_config_scripts()` + `parse_config_tokens()` replace `_expand_config_scripts()` + `_resolve_config_script()`. Scripts run through same root+run parsers. |
+| Overlay implication chain (adhoc->workspace->host+interactive->user) | Ported | In `resolve_config()` |
+| Image resolution from dc `image` field | Ported | Falls back to dc image when no CLI trailing args |
+| Export merging (dc + script + cli) | Ported | Append order preserved |
+| Label-based dc config path (`devcontainer.config_file=`) | Ported | Same behavior |
+| `--no-devconfig` | Ported | Same behavior |
+| Local store init / destroy / info | Updated | Simplified signatures (take `store_dir: str` instead of `args` namespace). Same fs layout (graphroot + runroot symlink). |
+| Store auto-discovery (`_default_store_dir`) | Ported | Same upward-walk logic |
+| `--root`/`--runroot`/`--storage-driver` injection | Updated | New `_resolve_store()` + `_apply_store()` handle conflict checks and podman-remote guard. |
+| Podman remote detection | New | `is_podman_remote()` -- used to skip store flags on remote clients. Not in podrun.py's store path (was implicit). |
+| Podman flag scraping + caching | New | Live scrape of `podman --help` / `podman run --help` with disk cache per version. Replaces hardcoded `PODMAN_RUN_VALUE_FLAGS`. |
+| Passthrough subcommands (ps, images, etc.) | Updated | Empty subparsers per scraped subcommand; `build_passthrough_command()` + `os.execvpe()`. |
+
+### Phase 1 -- Deprecated (replaced in podrun2)
+
+| Behavior | Notes |
+|---|---|
+| `Config` dataclass | Replaced by flat `ns` dict with `root.*`/`run.*` keys in `ParseResult` |
+| `_PodrunParser` / `_PodrunMutuallyExclusiveGroup` / `_PodrunSubParsers` | Replaced by standard argparse + `_PassthroughAction` |
+| `_detect_subcommand()` (manual argv walk) | Replaced by argparse subparsers |
+| `_ProjectContext` / `_find_project_context()` | Combined store+dc walk replaced by separate `_default_store_dir()` + `find_devcontainer_json()` |
+| Hardcoded `PODMAN_RUN_VALUE_FLAGS` / `PODMAN_SUBCOMMANDS` | Replaced by live scraping into `PodmanFlags` |
+| `merge_config()` (monolithic) | Replaced by `resolve_config()` with cleaner separation |
+| `_expand_volume_tilde()` / `_expand_export_tilde()` | Not yet addressed -- may need porting in Phase 2 |
+| `check_flags()` / `_scrape_podman_value_flags()` (diff tool) | No longer needed -- flags are scraped live |
+
+### Phase 2 -- Porting Plan
+
+Each sub-phase should:
+1. Update the module docstring at the top of `podrun2.py` with a brief summary
+   line for the phase completed (e.g. "Phase 2.1: ...").
+2. Add a test file under `tests2/` named `test_podrun2_<phase_topic>.py`
+   (e.g. `test_podrun2_utils.py` for 2.1, `test_podrun2_entrypoint.py` for 2.2).
+
+| Phase | Test file |
+|---|---|
+| 2.1 | `tests2/test_podrun2_utils.py` |
+| 2.2 | `tests2/test_podrun2_entrypoint.py` |
+| 2.3 | `tests2/test_podrun2_overlays.py` |
+| 2.4 | `tests2/test_podrun2_state.py` |
+| 2.5 | `tests2/test_podrun2_main.py` |
+
+**Guiding principle for every sub-phase:** look for opportunities to simplify
+the ported code by leveraging podrun2's `ns` dict, `ParseResult`, argparse
+backbone, and existing helpers (`build_run_command`, `resolve_config`,
+`_apply_store`). Specifically:
+
+- **`ns` dict replaces `Config` dataclass** -- functions should read
+  `ns.get('run.field')` directly instead of accepting a `Config` object.
+  No intermediate dataclass to build or maintain.
+- **Overlay args inject into `ns['run.passthrough_args']`** before calling
+  the existing `build_run_command()`, rather than rebuilding the full command.
+- **`resolve_config()` and `_apply_store()` already run in `main()`**, so the
+  Phase 2 run handler is purely: state -> entrypoints -> overlays -> exec.
+- **Argparse already collects passthrough** via `_PassthroughAction`, so
+  manual flag accumulation code can be dropped.
+- **`PodmanFlags` live-scrape** replaces hardcoded flag sets -- validation
+  can reference scraped data instead of static frozensets where appropriate.
+
+#### Phase 2.1: Constants, Utilities, and Parsing Helpers
+
+Foundation layer. All pure functions, no side effects, immediately testable.
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| Module constants | `UID`, `GID`, `UNAME`, `USER_HOME`, `PODRUN_TMP`, `PODRUN_*_PATH`, `BOOTSTRAP_CAPS`, `_OVERLAY_FIELDS` | Top-of-module, used everywhere downstream |
+| `_parse_export()` | Lines 295-308 | Export spec parsing (`SRC:DST[:0]`) |
+| `_parse_image_ref()` | Lines 2699-2723 | Image ref splitting for `PODRUN_IMG*` env vars |
+| Passthrough introspection | `_passthrough_has_flag`, `_passthrough_has_exact`, `_passthrough_has_short_flag` (lines 2725-2743) | Pure string checks on arg lists |
+| Passthrough extraction | `_extract_label_value`, `_extract_passthrough_entrypoint`, `_volume_mount_destinations` (lines 2744-2809) | Extract/remove flags from passthrough |
+| Tilde expansion | `_expand_volume_tilde`, `_expand_export_tilde` (lines 1953-1996) | `~/` -> `$HOME/` in volumes and exports |
+| `_write_sha_file()` | Lines 2298-2313 | Idempotent SHA-named script writer under `PODRUN_TMP` |
+| `yes_no_prompt()` | Lines 320-336 | Interactive Y/N prompting for lifecycle decisions |
+
+#### Phase 2.2: Entrypoint Generation
+
+Self-contained shell script generators (~330 lines, mostly templates).
+Take `ns` dict directly instead of `Config` dataclass.
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| `generate_run_entrypoint()` | Lines 2316-2489 | UID/GID/passwd, home dir, shell, sudo, caps, exports |
+| `generate_rc_sh()` | Lines 2497-2582 | Prompt banner, CPU/vCPU info, stty |
+| `generate_exec_entrypoint()` | Lines 2583-2654 | READY sentinel wait, shell resolution, login flag |
+
+Depends on 2.1 (`_write_sha_file`, `_parse_export`).
+
+#### Phase 2.3: Overlay Arg Builders
+
+Each builder returns a list of podman args. Read from `ns` dict directly.
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| `_user_overlay_args()` | Lines 2810-2830 | `--userns=keep-id`, passwd-entry, caps, entrypoint mounts |
+| `_host_overlay_args()` | Lines 2842-2860 | hostname, network, seccomp, workspace, localtime |
+| `_interactive_overlay_args()` | Lines 2833-2839 | `-it`, detach-keys |
+| `_x11_args()` | Lines 2863-2874 | X11 socket + DISPLAY |
+| `_podman_remote_args()` | Lines 2877-2893 | Socket passthrough, CONTAINER_HOST |
+| `_env_args()` | Lines 2896-2918 | PODRUN_* env vars |
+| `_validate_overlay_args()` | Lines 2921-2954 | Conflict checks |
+| `print_overlays()` | Lines 2662-2697 | `--print-overlays` implementation |
+
+Depends on 2.1 (passthrough introspection, `_parse_export`, `_parse_image_ref`),
+2.2 (entrypoint paths for user overlay mounts).
+
+**Cap-drop filtering:** `generate_run_entrypoint()` currently hardcodes
+`sorted(BOOTSTRAP_CAPS)` as the caps to drop. Phase 2.3 must compute the
+actual caps-to-drop list by checking passthrough for user `--cap-add` overlaps
+and `--privileged` (skip dropping entirely). Pass the filtered list to
+`generate_run_entrypoint()` — add a `caps_to_drop` parameter at that point.
+
+#### Phase 2.4: Command Assembly + Container State
+
+Wire overlay args into the existing command-building backbone.
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| `detect_container_state()` | Lines 2224-2242 | `podman inspect` state query |
+| `handle_container_state()` | Lines 2245-2290 | Action decision: run/attach/replace |
+| `query_container_info()` | Lines 3021-3043 | Inspect running container workdir/overlays |
+| `build_podman_exec_args()` | Lines 3044-3089 | Exec command for attach sessions |
+| Extend `build_run_command()` | Lines 2957-3020 | Inject overlay args into passthrough before calling existing builder |
+
+Depends on 2.1-2.3.
+
+#### Phase 2.5: Main Orchestration + Execution
+
+Final integration into `main()`.
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| Run handler | Lines 3103-3226 | state -> entrypoints -> overlays -> exec (simpler than podrun.py since config/store already resolved) |
+| `_main_exec()` | Lines 3097-3100 | Exec passthrough |
+| Fuse-overlayfs fixup | Lines 3193-3218 | `:O`->`:ro` for files |
+| `_warn_missing_subids()` | Lines 1416-1439 | subuid/subgid check |
+| `_default_podman_path()` | Lines 237-245 | Nested podman-remote detection |
+
+Depends on 2.1-2.4.
+
+#### Phase 2.6: Store Service Lifecycle (orthogonal)
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| `_store_socket_path()` | Line 1308 | Socket path from graphroot |
+| `_store_pid_path()` | Line 1314 | PID file path |
+| `_socket_is_alive()` | Lines 1320-1330 | Health check |
+| `_wait_for_socket()` | Lines 1332-1342 | Block until ready |
+| `_ensure_store_service()` | Lines 1344-1394 | Start `podman system service` |
+| `_stop_store_service()` | Lines 1395-1415 | Stop service (currently stub) |
+
+#### Phase 2.7: Shell Completion (orthogonal, low priority)
+
+| Item | Source (podrun.py) | Notes |
+|---|---|---|
+| `_generate_bash_completion()` | Lines 818-972 | ~150 lines |
+| `_generate_zsh_completion()` | Lines 974-1136 | ~150 lines |
+| `_generate_fish_completion()` | Lines 1137-1297 | ~150 lines |

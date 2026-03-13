@@ -31,6 +31,7 @@ import argparse
 import dataclasses
 import json
 import os
+import pathlib
 import re
 import shlex
 import shutil
@@ -49,7 +50,7 @@ _PODRUN_HANDLED_ROOT_FLAGS = frozenset({'--version', '-v'})
 
 # Podrun run flags that overlap with podman run value flags and are handled
 # by the run parser directly (skip registering as passthrough).
-_PODRUN_HANDLED_RUN_FLAGS = frozenset({'--name'})
+_PODRUN_HANDLED_RUN_FLAGS = frozenset({'--name', '--label', '-l'})
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +213,417 @@ def is_podman_remote(podman_path: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == 'true'
 
 
-def expand_config_scripts(argv: list) -> Tuple[List[str], bool]:
-    """Stub for Phase 1.1 — returns argv unchanged.
+def run_config_scripts(script_paths: List[str]) -> List[str]:
+    """Execute scripts left-to-right, return concatenated shlex.split tokens.
 
-    Phase 1.2 will run the script and splice its stdout into argv.
+    Fatal (sys.exit(1)) on non-zero exit.
     """
-    return list(argv), False
+    tokens: List[str] = []
+    for path in script_paths:
+        out = run_os_cmd(shlex.quote(path))
+        if out.returncode != 0:
+            print(
+                f'Error: --config-script {path} failed '
+                f'(exit {out.returncode}):\n{out.stderr}',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        tokens.extend(shlex.split(out.stdout))
+    return tokens
+
+
+def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]:
+    """Parse config tokens through root + run parsers.
+
+    Returns (config_ns_dict, podman_passthrough).
+    config_ns_dict has only non-None values with root.*/run.* keys.
+
+    Config tokens don't include subcommands.  The root parser is tried
+    first (for global flags like ``--store``); if it errors on a
+    positional that looks like an invalid subcommand, all tokens are
+    forwarded to the run parser instead.
+    """
+    if not tokens:
+        return {}, []
+
+    # Config scripts must not emit meta-controls that govern config resolution
+    # itself — that would create circular or ambiguous resolution order.
+    _FORBIDDEN = {'--config', '--config-script', '--no-devconfig'}
+    found = _FORBIDDEN.intersection(tokens)
+    if found:
+        print(
+            f'Error: config-script output must not contain {", ".join(sorted(found))}',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    root = build_root_parser(flags)
+
+    # Suppress subcommand validation — config tokens have no subcommand.
+    # Remove the subcommand subparsers action so positionals don't trigger
+    # "invalid choice" errors.
+    saved_actions = root._subparsers._group_actions[:]
+    root._subparsers._group_actions.clear()
+    # Also remove the subparsers action from _actions to prevent positional matching
+    saved_sub_actions = [a for a in root._actions if isinstance(a, argparse._SubParsersAction)]
+    for a in saved_sub_actions:
+        root._actions.remove(a)
+
+    root_ns, unknowns = root.parse_known_args(tokens)
+    root_dict = vars(root_ns)
+
+    # Restore actions
+    root._subparsers._group_actions.extend(saved_actions)
+    root._actions.extend(saved_sub_actions)
+
+    # Second pass: run parser on unknowns
+    run_parser = root._run_subparser
+    run_ns, podman_passthrough = run_parser.parse_known_args(unknowns)
+    run_dict = vars(run_ns)
+
+    # Merge, keeping only explicitly-set values with root.* or run.* keys.
+    # Exclude False (store_true defaults), None, and passthrough/trailing lists.
+    _SKIP_KEYS = {'run.passthrough_args', 'run.trailing', 'run.print_overlays'}
+    config_ns = {}
+    for src in (root_dict, run_dict):
+        for k, v in src.items():
+            if k in _SKIP_KEYS:
+                continue
+            if v is None or v is False:
+                continue
+            if not (k.startswith('root.') or k.startswith('run.')):
+                continue
+            config_ns[k] = v
+
+    # Podman passthrough = unknowns from the run parser + any run.passthrough_args
+    run_passthrough = run_dict.get('run.passthrough_args') or []
+    podman_passthrough = podman_passthrough + run_passthrough
+
+    return config_ns, podman_passthrough
+
+
+# ---------------------------------------------------------------------------
+# devcontainer.json discovery and parsing
+# ---------------------------------------------------------------------------
+
+
+def find_devcontainer_json(start_dir=None):
+    """Walk upward looking for devcontainer.json (standard, shorthand, named configs)."""
+    start = pathlib.Path(start_dir) if start_dir else pathlib.Path.cwd()
+    for path in [start, *start.parents]:
+        # 1. Standard location
+        candidate = path / '.devcontainer' / 'devcontainer.json'
+        if candidate.exists():
+            return candidate
+        # 2. Root-level shorthand
+        candidate = path / '.devcontainer.json'
+        if candidate.exists():
+            return candidate
+        # 3. Named configurations (.devcontainer/<subfolder>/devcontainer.json)
+        devcontainer_dir = path / '.devcontainer'
+        if devcontainer_dir.is_dir():
+            for child in sorted(devcontainer_dir.iterdir()):
+                if child.is_dir():
+                    candidate = child / 'devcontainer.json'
+                    if candidate.exists():
+                        return candidate
+    return None
+
+
+def find_project_context(start_dir=None):
+    """Walk upward once, discovering both devcontainer.json and store.
+
+    At each directory level, checks for:
+    - ``.devcontainer/.podrun/store/graphroot/`` (initialized store)
+    - ``devcontainer.json`` (standard, shorthand, named configs)
+
+    Returns a ``ProjectContext`` with the first match for each.
+    """
+    ctx = ProjectContext()
+    start = pathlib.Path(start_dir) if start_dir else pathlib.Path.cwd()
+    for path in [start, *start.parents]:
+        devcontainer_dir = path / '.devcontainer'
+
+        # --- Store discovery ---
+        if ctx.store_dir is None and devcontainer_dir.is_dir():
+            store_candidate = devcontainer_dir / '.podrun' / 'store'
+            if (store_candidate / 'graphroot').is_dir():
+                ctx.store_dir = str(store_candidate)
+
+        # --- devcontainer.json discovery ---
+        if ctx.devcontainer_json is None:
+            candidate = devcontainer_dir / 'devcontainer.json'
+            if candidate.exists():
+                ctx.devcontainer_json = candidate
+            else:
+                candidate = path / '.devcontainer.json'
+                if candidate.exists():
+                    ctx.devcontainer_json = candidate
+                elif devcontainer_dir.is_dir():
+                    for child in sorted(devcontainer_dir.iterdir()):
+                        if child.is_dir():
+                            candidate = child / 'devcontainer.json'
+                            if candidate.exists():
+                                ctx.devcontainer_json = candidate
+                                break
+
+        # Early exit when both found
+        if ctx.devcontainer_json is not None and ctx.store_dir is not None:
+            break
+
+    return ctx
+
+
+def _strip_jsonc(text: str) -> str:
+    """Strip // and /* */ comments (not inside strings) and trailing commas."""
+    result = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            # consume entire string literal
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            result.append(text[i:j])
+            i = j
+        elif c == '/' and i + 1 < n and text[i + 1] == '/':
+            # line comment -- skip to end of line
+            i += 2
+            while i < n and text[i] != '\n':
+                i += 1
+        elif c == '/' and i + 1 < n and text[i + 1] == '*':
+            # block comment -- skip to closing */
+            i += 2
+            while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                i += 1
+            i += 2
+        else:
+            result.append(c)
+            i += 1
+    # remove trailing commas before } or ]
+    cleaned = ''.join(result)
+    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+    return cleaned
+
+
+def parse_devcontainer_json(path):
+    """Parse devcontainer.json from path (None, file, or directory)."""
+    if path is None:
+        return {}
+    p = pathlib.Path(path)
+    if p.is_dir():
+        candidate = p / 'devcontainer.json'
+        if candidate.exists():
+            p = candidate
+        else:
+            p = find_devcontainer_json(p)
+            if p is None:
+                print(f'Error: no devcontainer.json found under {path}', file=sys.stderr)
+                sys.exit(1)
+    text = p.read_text()
+    return json.loads(_strip_jsonc(text))
+
+
+def extract_podrun_config(devcontainer: dict) -> dict:
+    """Extract customizations.podrun from a devcontainer dict."""
+    return devcontainer.get('customizations', {}).get('podrun', {})
+
+
+def devcontainer_run_args(devcontainer: dict) -> list:
+    """Convert devcontainer.json top-level fields to podman run args."""
+    args: list = []
+
+    for mount in devcontainer.get('mounts', []):
+        if isinstance(mount, dict):
+            parts = ','.join(f'{k}={v}' for k, v in mount.items())
+            args.append(f'--mount={parts}')
+        else:
+            args.append(f'--mount={mount}')
+
+    for cap in devcontainer.get('capAdd', []):
+        args.append(f'--cap-add={cap}')
+
+    for opt in devcontainer.get('securityOpt', []):
+        args.append(f'--security-opt={opt}')
+
+    if devcontainer.get('privileged', False):
+        args.append('--privileged')
+
+    if devcontainer.get('init', False):
+        args.append('--init')
+
+    args.extend(devcontainer.get('runArgs', []))
+
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Config key mapping and merge
+# ---------------------------------------------------------------------------
+
+_ROOT_CONFIG_MAP = {
+    'store': 'root.store',
+    'autoInitStore': 'root.auto_init_store',
+    'storeRegistry': 'root.store.registry',
+}
+
+_RUN_CONFIG_MAP = {
+    'name': 'run.name',
+    'userOverlay': 'run.user_overlay',
+    'hostOverlay': 'run.host_overlay',
+    'interactiveOverlay': 'run.interactive_overlay',
+    'workspace': 'run.workspace',
+    'adhoc': 'run.adhoc',
+    'x11': 'run.x11',
+    'podmanRemote': 'run.podman_remote',
+    'shell': 'run.shell',
+    'login': 'run.login',
+    'promptBanner': 'run.prompt_banner',
+    'autoAttach': 'run.auto_attach',
+    'autoReplace': 'run.auto_replace',
+    'fuseOverlayfs': 'run.fuse_overlayfs',
+}
+
+
+def _devcontainer_to_ns(podrun_cfg: dict) -> dict:
+    """Convert customizations.podrun to namespace-keyed dict (non-None only)."""
+    result = {}
+    for json_key, ns_key in _ROOT_CONFIG_MAP.items():
+        val = podrun_cfg.get(json_key)
+        if val is not None:
+            result[ns_key] = val
+    for json_key, ns_key in _RUN_CONFIG_MAP.items():
+        val = podrun_cfg.get(json_key)
+        if val is not None:
+            result[ns_key] = val
+    return result
+
+
+def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa: C901 — three-way merge across CLI, config-script, and devcontainer.json
+    """Three-way merge: CLI > config-script > devcontainer.json.
+
+    Updates result.ns in place and attaches context.
+    """
+
+    def _first(*values):
+        for v in values:
+            if v is not None:
+                return v
+        return None
+
+    ns = result.ns
+
+    # 1. Discover project context
+    ctx = find_project_context()
+
+    # 2. Load devcontainer.json — honor root.config / root.no_devconfig / run.label
+    dc = {}
+    dc_path = None
+    podrun_cfg = {}
+
+    if not ns.get('root.no_devconfig'):
+        # Check for label-based dc selection
+        label_config_path = None
+        for lbl in ns.get('run.label') or []:
+            if lbl.startswith('devcontainer.config_file='):
+                label_config_path = lbl.split('=', 1)[1]
+
+        if ns.get('root.config'):
+            dc_path = ns['root.config']
+        elif label_config_path:
+            dc_path = label_config_path
+        elif ctx.devcontainer_json is not None:
+            dc_path = ctx.devcontainer_json
+
+        if dc_path is not None:
+            dc = parse_devcontainer_json(dc_path)
+
+        # 3. Extract customizations.podrun
+        podrun_cfg = extract_podrun_config(dc)
+
+    # 4. Determine scripts — devcontainer configScript first, then CLI --config-script
+    script_paths = []
+    dc_script = podrun_cfg.get('configScript')
+    if dc_script:
+        script_paths.extend([dc_script] if isinstance(dc_script, str) else dc_script)
+    cli_scripts = ns.get('root.config_script')
+    if cli_scripts:
+        script_paths.extend(cli_scripts)
+
+    # 5. Execute scripts → run_config_scripts() → parse_config_tokens()
+    script_ns = {}
+    script_passthrough = []
+    if script_paths:
+        script_tokens = run_config_scripts(script_paths)
+        script_ns, script_passthrough = parse_config_tokens(script_tokens, flags)
+
+    # 6. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
+    dc_ns = _devcontainer_to_ns(podrun_cfg)
+    dc_run_args = devcontainer_run_args(dc)
+
+    # 7. Merge scalars — _first(cli_ns, script_ns, dc_ns) per key
+    all_keys = set()
+    for k in ns:
+        if k.startswith('root.') or k.startswith('run.'):
+            all_keys.add(k)
+    all_keys.update(script_ns.keys())
+    all_keys.update(dc_ns.keys())
+
+    for key in all_keys:
+        cli_val = ns.get(key)
+        script_val = script_ns.get(key)
+        dc_val = dc_ns.get(key)
+        merged = _first(cli_val, script_val, dc_val)
+        if merged is not None:
+            ns[key] = merged
+
+    # 8. Prepend podman args — DC run args first (lowest priority), then script,
+    #    then CLI passthrough (already in the list, highest priority).
+    existing_passthrough = ns.get('run.passthrough_args') or []
+    ns['run.passthrough_args'] = dc_run_args + script_passthrough + existing_passthrough
+
+    # 9. Handle run specifics
+    if ns.get('subcommand') == 'run':
+        # Overlay implication chain: adhoc→workspace→host+interactive→user
+        if ns.get('run.adhoc'):
+            ns['run.workspace'] = True
+        if ns.get('run.workspace'):
+            ns['run.host_overlay'] = True
+            ns['run.interactive_overlay'] = True
+        if ns.get('run.host_overlay'):
+            ns['run.user_overlay'] = True
+
+        # Image/command resolution: CLI trailing > devcontainer image
+        dc_image = dc.get('image')
+        if not result.trailing_args and dc_image:
+            result.trailing_args = [dc_image]
+
+        # Exports append: dc + script + cli
+        dc_exports = podrun_cfg.get('exports', [])
+        script_exports = script_ns.get('run.export') or []
+        cli_exports = ns.get('run.export') or []
+        combined_exports = dc_exports + script_exports + cli_exports
+        if combined_exports:
+            ns['run.export'] = combined_exports
+
+    # Store auto-discovery (when not explicitly set and not ignored)
+    if not ns.get('root.store') and not ns.get('root.ignore_store') and ctx.store_dir:
+        ns['root.store'] = ctx.store_dir
+
+    # 10. Attach context for Phase 2
+    result._devcontainer = dc
+    result._project_context = ctx
+    result._podrun_cfg = podrun_cfg
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +672,10 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         description='A podman run superset with host identity overlays.',
         add_help=False,
     )
-    parser._optionals.title = 'Options'
+    opts = parser.add_argument_group('Options')
 
     # -- Podrun global flags (dest='root_*') ----------------------------------
-    parser.add_argument(
+    opts.add_argument(
         '--print-cmd',
         '--dry-run',
         dest='root.print_cmd',
@@ -277,33 +683,35 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         default=False,
         help='Print the podman command instead of executing it',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--config',
         dest='root.config',
         metavar='PATH',
         help='Explicit path to devcontainer.json',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--config-script',
         dest='root.config_script',
+        action='append',
+        default=None,
         metavar='PATH',
-        help='Run script and inline its stdout as args',
+        help='Run script and inline its stdout as args (may be repeated)',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--no-devconfig',
         dest='root.no_devconfig',
         action='store_true',
         default=False,
         help='Skip devcontainer.json discovery',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--completion',
         dest='root.completion',
         metavar='SHELL',
         choices=['bash', 'zsh', 'fish'],
         help='Generate shell completion script and exit',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--version',
         '-v',
         dest='root.version',
@@ -313,28 +721,28 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
     )
 
     # -- Store-related global flags (with translation) ------------------------
-    parser.add_argument(
+    opts.add_argument(
         '--store',
         dest='root.store',
         metavar='DIR',
         default=None,
         help='Use project-local store directory',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--ignore-store',
         dest='root.ignore_store',
         action='store_true',
         default=False,
         help='Suppress auto-discovery of project-local store',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--auto-init-store',
         dest='root.auto_init_store',
         action='store_true',
         default=False,
         help='Auto-create store if missing (requires --store)',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--store-registry',
         dest='root.store.registry',
         metavar='HOST',
@@ -346,7 +754,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
     for flag in sorted(flags.global_value_flags):
         if flag in _PODRUN_HANDLED_ROOT_FLAGS:
             continue
-        parser.add_argument(
+        opts.add_argument(
             flag,
             action=_PassthroughAction,
             dest='podman_global_args',
@@ -358,7 +766,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
     for flag in sorted(flags.global_boolean_flags):
         if flag in _PODRUN_HANDLED_ROOT_FLAGS:
             continue
-        parser.add_argument(
+        opts.add_argument(
             flag,
             action=_PassthroughAction,
             dest='podman_global_args',
@@ -398,71 +806,75 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         add_help=False,
         description='Additional run options for host identity overlays.',
     )
-    parser._optionals.title = 'Options'
+    opts = parser.add_argument_group('Options')
 
     # -- Podrun run flags (dest='run_*') --------------------------------------
-    parser.add_argument('--name', dest='run.name', metavar='NAME', help=argparse.SUPPRESS)
-    parser.add_argument(
+    opts.add_argument('--name', dest='run.name', metavar='NAME', help=argparse.SUPPRESS)
+    opts.add_argument(
+        '--label', '-l', dest='run.label', action='append',
+        default=None, metavar='KEY=VALUE', help=argparse.SUPPRESS,
+    )
+    opts.add_argument(
         '--user-overlay',
         dest='run.user_overlay',
         action='store_true',
         default=None,
         help='Map host user identity into container',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--host-overlay',
         dest='run.host_overlay',
         action='store_true',
         default=None,
         help='Overlay host system context (implies --user-overlay)',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--interactive-overlay',
         dest='run.interactive_overlay',
         action='store_true',
         default=None,
         help='Interactive overlay (-it, --detach-keys)',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--workspace',
         dest='run.workspace',
         action='store_true',
         default=None,
         help='Workspace overlay (implies --host-overlay + --interactive-overlay)',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--adhoc',
         dest='run.adhoc',
         action='store_true',
         default=None,
         help='Ad-hoc overlay (implies --workspace + --rm)',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--print-overlays',
         dest='run.print_overlays',
         action='store_true',
         default=False,
         help='Print each overlay group and its settings, then exit',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--x11',
         dest='run.x11',
         action='store_true',
         default=None,
         help='Enable X11 forwarding',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--podman-remote',
         dest='run.podman_remote',
         action='store_true',
         default=None,
         help='Podman socket passthrough',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--shell', dest='run.shell', metavar='SHELL', help='Shell to use inside container'
     )
 
-    login_group = parser.add_mutually_exclusive_group()
+    login_group = opts.add_mutually_exclusive_group()
     login_group.add_argument(
         '--login',
         action='store_const',
@@ -479,24 +891,24 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         help='Disable login shell',
     )
 
-    parser.add_argument(
+    opts.add_argument(
         '--prompt-banner', dest='run.prompt_banner', metavar='TEXT', help='Prompt banner text'
     )
-    parser.add_argument(
+    opts.add_argument(
         '--auto-attach',
         dest='run.auto_attach',
         action='store_true',
         default=None,
         help='Auto attach to named container if already running',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--auto-replace',
         dest='run.auto_replace',
         action='store_true',
         default=None,
         help='Auto replace named container if already running',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--export',
         dest='run.export',
         action='append',
@@ -504,7 +916,7 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         metavar='SRC:DST[:0]',
         help='Export container path to host. May be repeated.',
     )
-    parser.add_argument(
+    opts.add_argument(
         '--fuse-overlayfs',
         dest='run.fuse_overlayfs',
         action='store_true',
@@ -516,7 +928,7 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     for flag in sorted(run_value_flags):
         if flag in _PODRUN_HANDLED_RUN_FLAGS:
             continue
-        parser.add_argument(
+        opts.add_argument(
             flag,
             action=_PassthroughAction,
             dest='run.passthrough_args',
@@ -526,7 +938,7 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
 
     # -- Podman run boolean flags (passthrough, dest='run.passthrough_args') --
     for flag in sorted(run_boolean_flags):
-        parser.add_argument(
+        opts.add_argument(
             flag,
             action=_PassthroughAction,
             dest='run.passthrough_args',
@@ -552,25 +964,26 @@ def _build_store_subparser(subs) -> argparse.ArgumentParser:
         description='Manage project-local podrun stores.',
         help='Manage project-local podrun stores',
     )
-    parser._optionals.title = 'Options'
+    parser.add_argument_group('Options')
 
     store_subs = parser.add_subparsers(dest='store.action', title='Available Commands')
     store_subs.required = False
 
     init_p = store_subs.add_parser('init', help='Create a new project-local podrun store')
-    init_p.add_argument(
+    init_opts = init_p.add_argument_group('Options')
+    init_opts.add_argument(
         '--store-dir',
         dest='store.store_dir',
         default='.devcontainer/.podrun/store',
         help='Store directory (default: .devcontainer/.podrun/store)',
     )
-    init_p.add_argument(
+    init_opts.add_argument(
         '--registry',
         dest='store.registry',
         default=None,
         help='Registry mirror for pulling images',
     )
-    init_p.add_argument(
+    init_opts.add_argument(
         '--storage-driver',
         dest='store.storage_driver',
         default='overlay',
@@ -578,7 +991,8 @@ def _build_store_subparser(subs) -> argparse.ArgumentParser:
     )
 
     destroy_p = store_subs.add_parser('destroy', help='Remove a project-local podrun store')
-    destroy_p.add_argument(
+    destroy_opts = destroy_p.add_argument_group('Options')
+    destroy_opts.add_argument(
         '--store-dir',
         dest='store.store_dir',
         default='.devcontainer/.podrun/store',
@@ -586,7 +1000,8 @@ def _build_store_subparser(subs) -> argparse.ArgumentParser:
     )
 
     info_p = store_subs.add_parser('info', help='Show information about a podrun store')
-    info_p.add_argument(
+    info_opts = info_p.add_argument_group('Options')
+    info_opts.add_argument(
         '--store-dir',
         dest='store.store_dir',
         default='.devcontainer/.podrun/store',
@@ -640,7 +1055,6 @@ def parse_args(argv: List[str], flags=None) -> ParseResult:
     6. No subcommand: for immediate-exit flags (``--version``, ``--help``, etc.).
     """
     raw_argv = list(argv)
-    argv, _had_config_script = expand_config_scripts(argv)
 
     # Split on '--' separator
     if '--' in argv:
@@ -701,6 +1115,8 @@ def build_run_command(result: ParseResult, podman_path: str = 'podman') -> List[
     # Named podrun run flags that map to podman flags
     if ns.get('run.name'):
         cmd.append(f'--name={ns["run.name"]}')
+    for lbl in ns.get('run.label') or []:
+        cmd.append(f'--label={lbl}')
 
     # Passthrough args (podman value + boolean flags)
     cmd.extend(ns.get('run.passthrough_args') or [])
@@ -905,6 +1321,10 @@ def main(argv=None):
 
     # Help — pass the raw argv so print_help can check for --help before --
     print_help(ns['subcommand'], raw, podman_path)
+
+    # Config resolution (three-way merge: CLI > config-script > devcontainer.json)
+    result = resolve_config(result)
+    ns = result.ns
 
     # Route
     if ns['subcommand'] == 'run':

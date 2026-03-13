@@ -9,7 +9,6 @@ from podrun.podrun2 import (
     build_root_parser,
     build_run_command,
     build_store_command,
-    expand_config_scripts,
     is_podman_remote,
     load_podman_flags,
     main,
@@ -26,6 +25,12 @@ import podrun.podrun2 as podrun2_mod
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_filesystem(monkeypatch):
+    """Prevent CLI tests from picking up real devcontainer.json or store dirs."""
+    monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: (None, None))
 
 
 @pytest.fixture
@@ -230,7 +235,11 @@ class TestBuildRootParser:
 
     def test_config_script_flag(self):
         ns, _ = self._parse(['--config-script', '/path/to/script'])
-        assert ns['root.config_script'] == '/path/to/script'
+        assert ns['root.config_script'] == ['/path/to/script']
+
+    def test_config_script_repeated(self):
+        ns, _ = self._parse(['--config-script', '/a.sh', '--config-script', '/b.sh'])
+        assert ns['root.config_script'] == ['/a.sh', '/b.sh']
 
     def test_completion_flag(self):
         ns, _ = self._parse(['--completion', 'bash'])
@@ -384,6 +393,18 @@ class TestBuildRunParser:
         ns, _ = self._parse_run([])
         assert ns['run.fuse_overlayfs'] is None
 
+    def test_label_single(self):
+        ns, _ = self._parse_run(['--label', 'app=test'])
+        assert ns['run.label'] == ['app=test']
+
+    def test_label_multiple(self):
+        ns, _ = self._parse_run(['-l', 'app=test', '-l', 'env=dev'])
+        assert ns['run.label'] == ['app=test', 'env=dev']
+
+    def test_label_default_none(self):
+        ns, _ = self._parse_run([])
+        assert ns['run.label'] is None
+
     def test_podman_value_flags_collected(self):
         ns, _ = self._parse_run(['-e', 'FOO=bar', '-v', '/a:/b'])
         pt = ns.get('run.passthrough_args') or []
@@ -406,6 +427,7 @@ class TestBuildRunParser:
     def test_defaults(self):
         ns, _ = self._parse_run([])
         assert ns['run.name'] is None
+        assert ns['run.label'] is None
         assert ns['run.user_overlay'] is None
         assert ns['run.host_overlay'] is None
         assert ns['run.interactive_overlay'] is None
@@ -711,30 +733,6 @@ class TestBuildPassthroughCommand:
         assert 'mycontainer' in cmd
         assert '--' in cmd
         assert 'bash' in cmd
-
-
-# ---------------------------------------------------------------------------
-# TestExpandConfigScripts
-# ---------------------------------------------------------------------------
-
-
-class TestExpandConfigScripts:
-    def test_no_scripts_passthrough(self):
-        result, found = expand_config_scripts(['--name', 'test', 'image'])
-        assert result == ['--name', 'test', 'image']
-        assert found is False
-
-    def test_stub_returns_argv_unchanged(self):
-        argv = ['--config-script=/path/to/script', '--rm', 'alpine']
-        result, found = expand_config_scripts(argv)
-        assert result == argv
-        assert found is False
-
-    def test_returns_copy(self):
-        argv = ['--rm', 'alpine']
-        result, found = expand_config_scripts(argv)
-        assert result == argv
-        assert result is not argv
 
 
 # ---------------------------------------------------------------------------
@@ -1192,9 +1190,8 @@ class TestPrintCmdOutput:
             '--annotation', 'note=hello',
             'alpine',
         ], capsys)
-        assert cmd.count('-l') == 2
-        assert 'app=test' in cmd
-        assert 'env=dev' in cmd
+        assert '--label=app=test' in cmd
+        assert '--label=env=dev' in cmd
         assert '--annotation' in cmd
         assert 'note=hello' in cmd
 
@@ -1384,7 +1381,7 @@ class TestRootFlagCombinations:
     def test_config_and_config_script(self):
         r = parse_args(['--config', '/c.json', '--config-script', '/s.sh', 'run', 'alpine'])
         assert r.ns['root.config'] == '/c.json'
-        assert r.ns['root.config_script'] == '/s.sh'
+        assert r.ns['root.config_script'] == ['/s.sh']
 
     def test_store_and_auto_init_and_registry(self):
         r = parse_args([
@@ -1409,7 +1406,7 @@ class TestRootFlagCombinations:
         ])
         assert r.ns['root.print_cmd'] is True
         assert r.ns['root.config'] == '/c.json'
-        assert r.ns['root.config_script'] == '/s.sh'
+        assert r.ns['root.config_script'] == ['/s.sh']
         assert r.ns['root.no_devconfig'] is True
         assert r.ns['root.store'] == '/s'
         assert r.ns['root.ignore_store'] is True
@@ -1452,7 +1449,7 @@ class TestRootAndRunCombinations:
         r = parse_args([
             '--config-script', '/s.sh', 'run', '--export', '/a:/b', 'alpine',
         ])
-        assert r.ns['root.config_script'] == '/s.sh'
+        assert r.ns['root.config_script'] == ['/s.sh']
         assert r.ns['run.export'] == ['/a:/b']
 
     def test_print_cmd_with_multiple_run_flags(self):
@@ -1707,9 +1704,8 @@ class TestPodmanPassthroughWithRunFlags:
             '-l', 'app=test', '--annotation', 'key=val', 'alpine',
         ])
         assert r.ns['run.export'] == ['/a:/b']
+        assert r.ns['run.label'] == ['app=test']
         pt = r.ns.get('run.passthrough_args') or []
-        assert '-l' in pt
-        assert 'app=test' in pt
         assert '--annotation' in pt
         assert 'key=val' in pt
 

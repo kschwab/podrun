@@ -74,7 +74,7 @@ backbone, and existing helpers (`build_run_command`, `resolve_config`,
 - **`PodmanFlags` live-scrape** replaces hardcoded flag sets -- validation
   can reference scraped data instead of static frozensets where appropriate.
 
-#### Phase 2.1: Constants, Utilities, and Parsing Helpers
+#### Phase 2.1: Constants, Utilities, and Parsing Helpers ✓
 
 Foundation layer. All pure functions, no side effects, immediately testable.
 
@@ -89,7 +89,7 @@ Foundation layer. All pure functions, no side effects, immediately testable.
 | `_write_sha_file()` | Lines 2298-2313 | Idempotent SHA-named script writer under `PODRUN_TMP` |
 | `yes_no_prompt()` | Lines 320-336 | Interactive Y/N prompting for lifecycle decisions |
 
-#### Phase 2.2: Entrypoint Generation
+#### Phase 2.2: Entrypoint Generation ✓
 
 Self-contained shell script generators (~330 lines, mostly templates).
 Take `ns` dict directly instead of `Config` dataclass.
@@ -102,29 +102,30 @@ Take `ns` dict directly instead of `Config` dataclass.
 
 Depends on 2.1 (`_write_sha_file`, `_parse_export`).
 
-#### Phase 2.3: Overlay Arg Builders
+#### Phase 2.3: Overlay Arg Builders ✓
 
 Each builder returns a list of podman args. Read from `ns` dict directly.
+**Status: Complete — 73 tests in `tests2/test_podrun2_overlays.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
-| `_user_overlay_args()` | Lines 2810-2830 | `--userns=keep-id`, passwd-entry, caps, entrypoint mounts |
+| `compute_caps_to_drop()` | New | Filters `BOOTSTRAP_CAPS` vs user `--cap-add`/`--privileged` |
+| `_user_overlay_args()` | Lines 2810-2830 | Returns `(args, caps_to_drop)` tuple; `--userns=keep-id`, passwd-entry, caps, entrypoint mounts, export volumes |
 | `_host_overlay_args()` | Lines 2842-2860 | hostname, network, seccomp, workspace, localtime |
 | `_interactive_overlay_args()` | Lines 2833-2839 | `-it`, detach-keys |
+| `_dot_files_overlay_args()` | New | Mount-mode dotfiles (`.emacs`, `.emacs.d`, `.vimrc`) from host HOME into container |
 | `_x11_args()` | Lines 2863-2874 | X11 socket + DISPLAY |
 | `_podman_remote_args()` | Lines 2877-2893 | Socket passthrough, CONTAINER_HOST |
 | `_env_args()` | Lines 2896-2918 | PODRUN_* env vars |
 | `_validate_overlay_args()` | Lines 2921-2954 | Conflict checks |
 | `print_overlays()` | Lines 2662-2697 | `--print-overlays` implementation |
 
-Depends on 2.1 (passthrough introspection, `_parse_export`, `_parse_image_ref`),
-2.2 (entrypoint paths for user overlay mounts).
-
-**Cap-drop filtering:** `generate_run_entrypoint()` currently hardcodes
-`sorted(BOOTSTRAP_CAPS)` as the caps to drop. Phase 2.3 must compute the
-actual caps-to-drop list by checking passthrough for user `--cap-add` overlaps
-and `--privileged` (skip dropping entirely). Pass the filtered list to
-`generate_run_entrypoint()` — add a `caps_to_drop` parameter at that point.
+Key decisions:
+- `generate_run_entrypoint()` gained a `caps_to_drop` parameter (default: all BOOTSTRAP_CAPS)
+- `_user_overlay_args()` returns `(args, caps_to_drop)` so orchestration can pass filtered caps to entrypoint generation
+- `compute_caps_to_drop(pt)` handles `--cap-add` (equals/space/comma forms, case-insensitive) and `--privileged`
+- `--dot-files-overlay`/`--dotfiles` CLI flag added; implies `user_overlay` via `resolve_config()`
+- `_DOTFILES_MOUNT = ['.emacs', '.emacs.d', '.vimrc']` — mount-mode only; copy-mode deferred to Phase 2.8
 
 #### Phase 2.4: Command Assembly + Container State
 
@@ -172,3 +173,11 @@ Depends on 2.1-2.4.
 | `_generate_bash_completion()` | Lines 818-972 | ~150 lines |
 | `_generate_zsh_completion()` | Lines 974-1136 | ~150 lines |
 | `_generate_fish_completion()` | Lines 1137-1297 | ~150 lines |
+
+#### Phase 2.8: Copy-mode Dotfiles (evaluate strategy)
+
+Evaluate and implement copy-mode dotfiles for `--dot-files-overlay`. Mount-mode
+dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
+`.gitconfig`) need to be writable in the container, so they require a
+host->container copy mechanism (similar to exports but reversed direction).
+Options: entrypoint copy block from staging mount, or a new staging pattern.

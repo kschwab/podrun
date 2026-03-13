@@ -23,6 +23,10 @@ Phase 2.2: Entrypoint generation — run-entrypoint.sh (user identity, home dir,
            shell, sudo, exports, cap-drop), rc.sh (prompt banner), and
            exec-entrypoint.sh (attach session setup). Functions take ns dict
            directly instead of Config dataclass.
+Phase 2.3: Overlay arg builders — user, host, interactive, dot-files, x11,
+           podman-remote, env, validation. Cap-drop filtering for user
+           --cap-add/--privileged. New --dot-files-overlay (mount-mode).
+           print_overlays() implementation.
 """
 
 __version__ = '1.0.0'
@@ -78,8 +82,18 @@ _OVERLAY_FIELDS = [
     ('run.user_overlay', 'user'),
     ('run.host_overlay', 'host'),
     ('run.interactive_overlay', 'interactive'),
+    ('run.dot_files_overlay', 'dotfiles'),
     ('run.workspace', 'workspace'),
     ('run.adhoc', 'adhoc'),
+]
+
+# Mount-mode dotfiles: (relative_path, description).
+# Only mounted if they exist on the host.  All are :ro bind mounts.
+# Copy-mode dotfiles (.ssh, .gitconfig) deferred to Phase 2.8.
+_DOTFILES_MOUNT = [
+    '.emacs',
+    '.emacs.d',
+    '.vimrc',
 ]
 
 # ---------------------------------------------------------------------------
@@ -554,14 +568,18 @@ def _expand_export_tilde(exports: list) -> list:
 # ---------------------------------------------------------------------------
 
 
-def generate_run_entrypoint(ns: dict) -> str:
+def generate_run_entrypoint(ns: dict, caps_to_drop: list = None) -> str:
     """Generate the run-entrypoint script and return its path (SHA-named, idempotent).
 
     Reads from the *ns* dict: ``run.login``, ``run.shell``, ``run.export``.
-    Bootstrap caps come from the module-level ``BOOTSTRAP_CAPS`` constant.
+
+    *caps_to_drop* is the list of capabilities to drop after entrypoint setup.
+    Defaults to ``BOOTSTRAP_CAPS``.  Callers should filter out any caps the user
+    explicitly requested via ``--cap-add`` or pass an empty list for ``--privileged``.
     """
     login_flag = ' -l' if ns.get('run.login') else ''
-    caps_to_drop = sorted(BOOTSTRAP_CAPS)
+    if caps_to_drop is None:
+        caps_to_drop = sorted(BOOTSTRAP_CAPS)
     default_shell = ns.get('run.shell')
     exports = sorted(ns.get('run.export') or [])
 
@@ -890,6 +908,240 @@ def generate_exec_entrypoint() -> str:
         fi
     """)
     return _write_sha_file(script, 'exec_entry_', '.sh')
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.3 — Overlay arg builders
+# ---------------------------------------------------------------------------
+
+
+def compute_caps_to_drop(pt):
+    """Compute bootstrap caps to drop, filtering out user --cap-add overlaps.
+
+    Returns an empty list if ``--privileged`` is in passthrough (all caps
+    retained).  Otherwise returns ``BOOTSTRAP_CAPS`` minus any caps the
+    user explicitly added via ``--cap-add``.
+    """
+    if _passthrough_has_exact(pt, '--privileged'):
+        return []
+    # Collect user-requested caps from --cap-add=X and --cap-add X
+    user_caps = set()
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        if arg.startswith('--cap-add='):
+            for cap in arg.split('=', 1)[1].split(','):
+                user_caps.add(cap.strip().upper())
+        elif arg == '--cap-add' and i + 1 < len(pt):
+            for cap in pt[i + 1].split(','):
+                user_caps.add(cap.strip().upper())
+            i += 2
+            continue
+        i += 1
+    return sorted(c for c in BOOTSTRAP_CAPS if c not in user_caps)
+
+
+def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
+    """Build args for --user-overlay: map host user identity into container."""
+    args = []
+    if not _passthrough_has_flag(pt, '--userns'):
+        args.append('--userns=keep-id')
+    if not _passthrough_has_flag(pt, '--passwd-entry'):
+        args.append(f'--passwd-entry={UNAME}:*:{UID}:{GID}:{UNAME}:/home/{UNAME}:/bin/sh')
+    caps_to_drop = compute_caps_to_drop(pt)
+    for cap in BOOTSTRAP_CAPS:
+        args.append(f'--cap-add={cap}')
+    args.append(f'--entrypoint={PODRUN_ENTRYPOINT_PATH}')
+    args.append(f'-v={entrypoint_path}:{PODRUN_ENTRYPOINT_PATH}:ro')
+    args.append(f'-v={rc_path}:{PODRUN_RC_PATH}:ro')
+    args.append(f'-v={exec_entry_path}:{PODRUN_EXEC_ENTRY_PATH}:ro')
+    args.append(f'--env=ENV={PODRUN_RC_PATH}')
+    for entry in ns.get('run.export') or []:
+        container_path, host_path, _ = _parse_export(entry)
+        abs_host = os.path.abspath(host_path)
+        os.makedirs(abs_host, exist_ok=True)
+        staging_hash = hashlib.sha256(container_path.encode()).hexdigest()[:12]
+        args.append(f'-v={abs_host}:/.podrun/exports/{staging_hash}')
+    return args, caps_to_drop
+
+
+def _interactive_overlay_args(ns, pt):
+    """Build args for --interactive-overlay: interactive session flags."""
+    args = []
+    if not (_passthrough_has_short_flag(pt, 'i') or _passthrough_has_short_flag(pt, 't')):
+        args.append('-it')
+    args.append('--detach-keys=ctrl-q,ctrl-q')
+    return args
+
+
+def _host_overlay_args(ns, pt):
+    """Build args for --host-overlay: overlay host system context onto container."""
+    workspace_folder = ns.get('run.workspace_folder') or '/app'
+    workspace_mount_src = ns.get('run.workspace_mount_src') or str(pathlib.Path.cwd())
+    args = []
+    if not _passthrough_has_flag(pt, '--hostname'):
+        args.append(f'--hostname={platform.node()}')
+    if not _passthrough_has_flag(pt, '--network'):
+        args.append('--network=host')
+    if not _passthrough_has_exact(pt, '--security-opt=seccomp=unconfined'):
+        args.append('--security-opt=seccomp=unconfined')
+    if not _passthrough_has_exact(pt, '--init'):
+        args.append('--init')
+    args.append(f'-v={workspace_mount_src}:{workspace_folder}')
+    if not _passthrough_has_flag(pt, '-w') and not _passthrough_has_flag(pt, '--workdir'):
+        args.append(f'-w={workspace_folder}')
+    if not _passthrough_has_exact(pt, '--env=TERM=xterm-256color'):
+        args.append('--env=TERM=xterm-256color')
+    if os.path.exists('/etc/localtime'):
+        args.append('-v=/etc/localtime:/etc/localtime:ro')
+    return args
+
+
+def _dot_files_overlay_args(ns, pt):
+    """Build args for --dot-files-overlay: mount-mode dotfiles from host HOME."""
+    args = []
+    for name in _DOTFILES_MOUNT:
+        host_path = os.path.join(USER_HOME, name)
+        if os.path.exists(host_path):
+            container_path = f'/home/{UNAME}/{name}'
+            args.append(f'-v={host_path}:{container_path}:ro')
+    return args
+
+
+def _x11_args(ns):
+    """Build args for X11 socket and xauth forwarding."""
+    args = []
+    x11_socket = pathlib.Path('/tmp/.X11-unix')
+    if x11_socket.exists():
+        result = run_os_cmd('xauth info | grep "Authority file" | awk \'{ print $3 }\'')
+        if result.returncode == 0 and result.stdout.strip():
+            xauth_path = result.stdout.strip()
+            args.append('--env=DISPLAY')
+            args.append('-v=/tmp/.X11-unix:/tmp/.X11-unix:ro')
+            args.append(f'-v={xauth_path}:/home/{UNAME}/.Xauthority:ro')
+    return args
+
+
+def _podman_remote_args(ns):
+    """Build args for podman-remote (rootless Podman socket passthrough)."""
+    args = []
+    store_socket = ns.get('run.store_socket')
+    if store_socket and pathlib.Path(store_socket).exists():
+        args.append(f'-v={store_socket}:/run/podman/podman.sock')
+        args.append('--env=CONTAINER_HOST=unix:///run/podman/podman.sock')
+    else:
+        podman_socket = f'/run/user/{UID}/podman/podman.sock'
+        if pathlib.Path(podman_socket).exists():
+            args.append(f'-v={podman_socket}:/run/podman/podman.sock')
+            args.append('--env=CONTAINER_HOST=unix:///run/podman/podman.sock')
+        else:
+            print('Warning: podman remote was requested but podman.socket not found.', file=sys.stderr)
+            print('systemctl --user enable --now podman.socket', file=sys.stderr)
+    return args
+
+
+def _env_args(ns):
+    """Build args for container environment variables and PODRUN_* env vars."""
+    args = []
+    for key, val in (ns.get('run.remote_env') or {}).items():
+        args.append(f'--env={key}={val}')
+
+    overlays = [name for ns_key, name in _OVERLAY_FIELDS if ns.get(ns_key)]
+    overlay_str = ','.join(overlays) if overlays else 'none'
+    args.append(f'--env=PODRUN_OVERLAYS={overlay_str}')
+
+    if ns.get('run.host_overlay'):
+        workspace_folder = ns.get('run.workspace_folder') or '/app'
+        args.append(f'--env=PODRUN_WORKDIR={workspace_folder}')
+    if ns.get('run.shell'):
+        args.append(f'--env=PODRUN_SHELL={ns["run.shell"]}')
+    if ns.get('run.login') is not None:
+        args.append(f'--env=PODRUN_LOGIN={"1" if ns["run.login"] else "0"}')
+
+    image = ns.get('run.image')
+    if image:
+        repo, name, tag = _parse_image_ref(image)
+        args.append(f'--env=PODRUN_IMG={image}')
+        args.append(f'--env=PODRUN_IMG_NAME={name}')
+        args.append(f'--env=PODRUN_IMG_REPO={repo}')
+        args.append(f'--env=PODRUN_IMG_TAG={tag}')
+    return args
+
+
+def _validate_overlay_args(ns):
+    """Error on args that conflict with enabled overlays."""
+    if not ns.get('run.user_overlay'):
+        return
+    all_args = ns.get('run.passthrough_args') or []
+
+    for arg in all_args:
+        if arg.startswith('--userns'):
+            continue
+        if (
+            arg == '--user'
+            or arg.startswith('--user=')
+            or arg == '-u'
+            or (arg.startswith('-u') and not arg.startswith('--') and len(arg) > 2)
+        ):
+            print(
+                f'Error: {arg} conflicts with --user-overlay.\n'
+                'user-overlay maps host identity via --userns=keep-id and --passwd-entry.\n'
+                'Remove --user-overlay or remove the --user flag.',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    for arg in all_args:
+        m = re.match(r'--userns=(.*)', arg)
+        if m and m.group(1) != 'keep-id':
+            print(
+                f"Warning: {arg} overrides --user-overlay's --userns=keep-id.\n"
+                'User identity mapping may not work correctly.',
+                file=sys.stderr,
+            )
+            break
+
+
+def print_overlays():
+    """Print each overlay group and its constituent settings."""
+    print('Overlay groups:')
+    print()
+    print('  user:')
+    print('    --userns=keep-id')
+    print('    --passwd-entry=<user>:*:<uid>:<gid>:<user>:/home/<user>:/bin/sh')
+    print(f'    --cap-add={",".join(BOOTSTRAP_CAPS)}  (dropped after entrypoint)')
+    print(f'    --entrypoint={PODRUN_ENTRYPOINT_PATH}')
+    print(f'    -v=<run-entrypoint>:{PODRUN_ENTRYPOINT_PATH}:ro')
+    print(f'    -v=<rc.sh>:{PODRUN_RC_PATH}:ro')
+    print(f'    -v=<exec-entrypoint>:{PODRUN_EXEC_ENTRY_PATH}:ro')
+    print()
+    print('  host (implies user):')
+    print('    --user-overlay')
+    print(f'    --hostname={platform.node()}')
+    print('    --network=host')
+    print('    --security-opt=seccomp=unconfined')
+    print('    --init')
+    print('    -v=<cwd>:<workspaceFolder>')
+    print('    -w=<workspaceFolder>')
+    print('    --env=TERM=xterm-256color')
+    print()
+    print('  interactive:')
+    print('    -it')
+    print('    --detach-keys=ctrl-q,ctrl-q')
+    print()
+    print('  dotfiles (implies user):')
+    print('    --user-overlay')
+    for name in _DOTFILES_MOUNT:
+        print(f'    -v=~/{name}:/home/<user>/{name}:ro  (if exists)')
+    print()
+    print('  workspace (implies host + interactive):')
+    print('    --host-overlay')
+    print('    --interactive-overlay')
+    print()
+    print('  adhoc (implies workspace):')
+    print('    --workspace')
+    print('    --rm')
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -1296,6 +1548,7 @@ _RUN_CONFIG_MAP = {
     'autoAttach': 'run.auto_attach',
     'autoReplace': 'run.auto_replace',
     'fuseOverlayfs': 'run.fuse_overlayfs',
+    'dotFilesOverlay': 'run.dot_files_overlay',
 }
 
 
@@ -1396,12 +1649,15 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa:
     # 9. Handle run specifics
     if ns.get('subcommand') == 'run':
         # Overlay implication chain: adhoc→workspace→host+interactive→user
+        #                           dot_files→user
         if ns.get('run.adhoc'):
             ns['run.workspace'] = True
         if ns.get('run.workspace'):
             ns['run.host_overlay'] = True
             ns['run.interactive_overlay'] = True
         if ns.get('run.host_overlay'):
+            ns['run.user_overlay'] = True
+        if ns.get('run.dot_files_overlay'):
             ns['run.user_overlay'] = True
 
         # Image/command resolution: CLI trailing > devcontainer image
@@ -1650,6 +1906,13 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         action='store_true',
         default=None,
         help='Ad-hoc overlay (implies --workspace + --rm)',
+    )
+    opts.add_argument(
+        '--dot-files-overlay', '--dotfiles',
+        dest='run.dot_files_overlay',
+        action='store_true',
+        default=None,
+        help='Mount host dotfiles into container (implies --user-overlay)',
     )
     opts.add_argument(
         '--print-overlays',

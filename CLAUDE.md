@@ -166,17 +166,26 @@ Key decisions:
 - `_expand_volume_tilde()` enhanced to handle space-separated form (`-v ~/src`) from `_PassthroughAction`, not just equals form (`-v=~/src`)
 - `build_podman_exec_args()` takes ns dict + name + container_workdir + trailing_args + explicit_command; command from explicit_command takes priority over trailing_args
 
-#### Phase 2.5: Main Orchestration + Execution
+#### Phase 2.5: Main Orchestration + Execution ✓
 
-Final integration into `main()`.
+Final integration into `main()`. Tests: `tests2/test_podrun2_main.py` (35 tests).
 
-| Item | Source (podrun.py) | Notes |
+| Item | Source (podrun.py) | Status |
 |---|---|---|
-| Run handler | Lines 3103-3226 | state -> entrypoints -> overlays -> exec (simpler than podrun.py since config/store already resolved) |
-| `_main_exec()` | Lines 3097-3100 | Exec passthrough |
-| Fuse-overlayfs fixup | Lines 3193-3218 | `:O`->`:ro` for files |
-| `_warn_missing_subids()` | Lines 1416-1439 | subuid/subgid check |
-| `_default_podman_path()` | Lines 237-245 | Nested podman-remote detection |
+| `_is_nested()` | replaces `is_podman_remote()` | ✓ Single source of truth for nested-execution detection via `PODRUN_CONTAINER` env var |
+| `_default_podman_path()` | Lines 237-245 | ✓ Uses `_is_nested()` + `CONTAINER_HOST` to prefer podman-remote |
+| `_warn_missing_subids()` | Lines 1416-1439 | ✓ subuid/subgid check |
+| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files, storage-opt injection (TODO: space-form fix in Phase 2.8) |
+| `_handle_run()` | Lines 3103-3226 | ✓ state → entrypoints → overlays → exec |
+| `main()` updated | — | ✓ Nested guard via `_is_nested()`, `_default_podman_path()`, routes to `_handle_run()` |
+| `_volume_mount_destinations()` | — | ✓ Fixed space-form volume parsing (`-v /host:/ctr`) |
+
+Key decisions:
+- **`PODRUN_CONTAINER=1`** is set by `_env_args()` in every child container. It is the single source of truth for "am I inside a podrun container?" — used by `_is_nested()`, which replaced the old `is_podman_remote()` function (which spawned `podman info`). All guards (nested-run refusal, podman-remote preference, store-flag suppression, flag-scrape refusal) go through `_is_nested()`.
+- `_handle_run()` orchestrates: image extraction → container state → export conflict filtering → subid warning → overlay build → fuse-overlayfs fixup → stale cleanup → exec
+- `_volume_mount_destinations()` handles both equals form (`-v=/host:/ctr`) and space form (`-v /host:/ctr`) from `_PassthroughAction`
+- `TestPrintCmdOutput` tests updated to use structural assertions (not exact equality) since `_handle_run` injects PODRUN_* env vars
+- `_fuse_overlayfs_fixup()` has a TODO for Phase 2.8: its `:O`→`:ro` conversion only handles equals form, same space-form bug class as `_expand_volume_tilde` and `_volume_mount_destinations`
 
 Depends on 2.1-2.4.
 
@@ -190,6 +199,14 @@ Depends on 2.1-2.4.
 | `_wait_for_socket()` | Lines 1332-1342 | Block until ready |
 | `_ensure_store_service()` | Lines 1344-1394 | Start `podman system service` |
 | `_stop_store_service()` | Lines 1395-1415 | Stop service (currently stub) |
+
+**TODO: Harden `_is_nested()` detection.** Currently uses `PODRUN_CONTAINER=1`
+env var (can be `unset` by user). Nested podrun requires podman-remote which
+requires a socket — podrun mounts the host socket to `/run/podman/podman.sock`
+inside the container and sets `CONTAINER_HOST`. Checking socket existence +
+`CONTAINER_HOST` would be a tamper-resistant complement to the env var. This is
+the natural place to implement it since the socket paths and lifecycle are
+defined here.
 
 #### Phase 2.7: Shell Completion (orthogonal, low priority)
 
@@ -206,6 +223,10 @@ dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
 `.gitconfig`) need to be writable in the container, so they require a
 host->container copy mechanism (similar to exports but reversed direction).
 Options: entrypoint copy block from staging mount, or a new staging pattern.
+
+Also: fix `_fuse_overlayfs_fixup()` space-form volume parsing (`:O`→`:ro` only
+handles `-v=src:dst:O`, not `-v src:dst:O` from `_PassthroughAction`). Same
+class of bug already fixed in `_expand_volume_tilde` and `_volume_mount_destinations`.
 
 ### Phase 3 — Live Testing + Bug Fixes
 

@@ -32,6 +32,10 @@ Phase 2.4: Command assembly + container state — detect_container_state(),
            build_podman_exec_args(), build_overlay_run_command().
            Wire entrypoint generation and overlay builders into command
            assembly. Alt-entrypoint extraction for user-overlay.
+Phase 2.5: Main orchestration + execution — _default_podman_path(),
+           _warn_missing_subids(), _fuse_overlayfs_fixup(),
+           _handle_run(), and full main() wiring. Nested podrun guard,
+           export/mount conflict filtering, stale file cleanup.
 """
 
 __version__ = '1.0.0'
@@ -237,11 +241,11 @@ def load_podman_flags(podman_path='podman'):
         _loaded_flags[podman_path] = flags
         return flags
 
-    # Must scrape — refuse if remote-only
-    if is_podman_remote(podman_path):
+    # Must scrape — refuse if nested (help pages on podman-remote are incomplete)
+    if _is_nested():
         print(
-            f'Error: {podman_path} is a remote client (no local engine).\n'
-            'Cannot scrape flags from a remote client and no cache file found.\n'
+            f'Error: running inside a podrun container but no flags cache found.\n'
+            'The flags cache must be pre-built on the host before nested use.\n'
             f'Expected cache at: {cache_path}',
             file=sys.stderr,
         )
@@ -268,10 +272,52 @@ def run_os_cmd(cmd: str) -> subprocess.CompletedProcess:
     )
 
 
-def is_podman_remote(podman_path: str) -> bool:
-    """Return True if *podman_path* is a remote-only client (no local engine)."""
-    result = run_os_cmd(f'{shlex.quote(podman_path)} info --format {{{{.Host.ServiceIsRemote}}}}')
-    return result.returncode == 0 and result.stdout.strip() == 'true'
+def _default_podman_path():
+    """Resolve the default podman binary, preferring podman-remote inside containers.
+
+    Uses :func:`_is_nested` together with ``CONTAINER_HOST`` to decide
+    whether podman-remote should be preferred.
+    """
+    if os.environ.get('CONTAINER_HOST') and _is_nested():
+        remote = shutil.which('podman-remote')
+        if remote:
+            return remote
+    return shutil.which('podman')
+
+
+def _is_nested() -> bool:
+    """Return True if running inside a podrun-managed container.
+
+    This is the single source of truth for nested-execution detection.
+    ``PODRUN_CONTAINER=1`` is set by podrun in every child container
+    (via ``_env_args``).  All guards — nested-run refusal, podman-remote
+    preference, store-flag suppression, flag-scrape refusal — should use
+    this rather than probing the podman binary at runtime.
+    """
+    return bool(os.environ.get('PODRUN_CONTAINER'))
+
+
+def _warn_missing_subids():
+    """Print a note if the current user lacks subuid/subgid ranges."""
+    try:
+        missing = []
+        for path in ('/etc/subuid', '/etc/subgid'):
+            try:
+                with open(path) as f:
+                    if UNAME not in f.read():
+                        missing.append(path)
+            except FileNotFoundError:
+                missing.append(path)
+        if missing:
+            print(f'\nNote: {UNAME} not found in {" or ".join(missing)}.', file=sys.stderr)
+            print('  Podman will show rootless warnings and --userns=keep-id', file=sys.stderr)
+            print('  (used by --user-overlay) will not work. To fix:', file=sys.stderr)
+            print(
+                f'    sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {UNAME}',
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
 
 
 def run_config_scripts(script_paths: List[str]) -> List[str]:
@@ -512,14 +558,25 @@ def _volume_mount_destinations(*arg_lists) -> set:
     """Extract container destination paths from -v/--volume args across all arg lists."""
     dests = set()
     for args in arg_lists:
-        for arg in args:
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            # Equals form: -v=/host:/container or --volume=/host:/container
             m = re.match(r'^(-v|--volume)=(.*)', arg)
-            if not m:
+            if m:
+                vol_spec = m.group(2)
+            # Space form: -v /host:/container or --volume /host:/container
+            elif arg in ('-v', '--volume') and i + 1 < len(args):
+                vol_spec = args[i + 1]
+                i += 1
+            else:
+                i += 1
                 continue
-            parts = m.group(2).split(':')
+            parts = vol_spec.split(':')
             if len(parts) >= 2:
                 dest = re.sub(r'^~', f'/home/{UNAME}', parts[1])
                 dests.add(dest)
+            i += 1
     return dests
 
 
@@ -1072,6 +1129,10 @@ def _env_args(ns):
     for key, val in (ns.get('run.remote_env') or {}).items():
         args.append(f'--env={key}={val}')
 
+    # Canonical "inside a podrun container" marker — used by the nested guard
+    # and _default_podman_path() to detect re-entry.
+    args.append('--env=PODRUN_CONTAINER=1')
+
     overlays = [name for ns_key, name in _OVERLAY_FIELDS if ns.get(ns_key)]
     overlay_str = ','.join(overlays) if overlays else 'none'
     args.append(f'--env=PODRUN_OVERLAYS={overlay_str}')
@@ -1516,16 +1577,16 @@ def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], di
 def _apply_store(ns: dict, podman_path: str = 'podman') -> None:
     """Resolve store, prepend flags, and handle store-only exits.
 
-    With podman remote the store is determined by the service socket
-    established at container launch — local store flags do not apply.
+    Inside a nested podrun container the store is determined by the service
+    socket established at container launch — local store flags do not apply.
     """
-    remote = is_podman_remote(podman_path)
+    nested = _is_nested()
 
-    if ns.get('root.local_store_destroy') and remote:
+    if ns.get('root.local_store_destroy') and nested:
         print('Error: --local-store-destroy not supported with podman remote', file=sys.stderr)
         sys.exit(1)
 
-    if not remote:
+    if not nested:
         flags, _env = _resolve_store(ns, podman_path)
         if flags:
             existing = ns.get('podman_global_args') or []
@@ -1537,7 +1598,7 @@ def _apply_store(ns: dict, podman_path: str = 'podman') -> None:
             sys.exit(0)
 
     if ns.get('root.local_store_info'):
-        if remote:
+        if nested:
             print('Local store: disabled (podman remote)', file=sys.stderr)
         else:
             store_dir = ns.get('root.local_store')
@@ -2501,6 +2562,186 @@ def print_completion(shell: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fuse-overlayfs fixup
+# ---------------------------------------------------------------------------
+
+
+def _fuse_overlayfs_fixup(ns, cmd):
+    """Apply fuse-overlayfs storage-opt and convert :O to :ro for files.
+
+    Returns the updated *cmd* list, and mutates ``ns['podman_global_args']``
+    to inject ``--storage-opt overlay.mount_program=<path>``.
+
+    .. todo:: Phase 2.8 — the :O→:ro conversion only handles the equals form
+       (``-v=src:dst:O``).  ``_PassthroughAction`` stores value flags in
+       space-separated form (``['-v', 'src:dst:O']``), which this misses.
+       Same class of bug fixed in ``_expand_volume_tilde`` and
+       ``_volume_mount_destinations``.  Evaluate and fix in Phase 2.8.
+    """
+    fuse_path = shutil.which('fuse-overlayfs')
+    if not fuse_path:
+        print(
+            'Error: --fuse-overlayfs requested but fuse-overlayfs not found in PATH',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    existing = ns.get('podman_global_args') or []
+    ns['podman_global_args'] = existing + ['--storage-opt', f'overlay.mount_program={fuse_path}']
+
+    # fuse-overlayfs cannot overlay single files — only directories.
+    # Convert :O to :ro for file-type volume mounts.
+    converted = []
+    for arg in cmd:
+        m = re.match(r'^(-v=|--volume=)(.+)$', arg)
+        if not m:
+            converted.append(arg)
+            continue
+        prefix, spec = m.group(1), m.group(2)
+        parts = spec.split(':')
+        if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
+            parts[-1] = 'ro'
+        converted.append(prefix + ':'.join(parts))
+    return converted
+
+
+# ---------------------------------------------------------------------------
+# Run handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_run(result, podman_path):
+    """Handle the ``run`` subcommand: state → entrypoints → overlays → exec.
+
+    This is the main orchestration function.  ``resolve_config()`` and
+    ``_apply_store()`` have already run by the time this is called.
+    """
+    ns = result.ns
+    global_flags = ns.get('podman_global_args') or []
+
+    # Guard: no image
+    if not result.trailing_args:
+        print(
+            'Error: No image specified. Pass image as argument or set "image" in devcontainer.json.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Guard: exports require user overlay
+    if (ns.get('run.export') or []) and not ns.get('run.user_overlay'):
+        print(
+            'Error: --export requires --user-overlay (or an overlay that implies it).',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Print overlays
+    if ns.get('run.print_overlays'):
+        print_overlays()
+        sys.exit(0)
+
+    # Set run.image for _env_args (image ref parsing for PODRUN_IMG_* env vars)
+    ns['run.image'] = result.trailing_args[0]
+
+    # Set workspace defaults for _host_overlay_args
+    if ns.get('run.host_overlay'):
+        if not ns.get('run.workspace_folder'):
+            ns['run.workspace_folder'] = '/app'
+        if not ns.get('run.workspace_mount_src'):
+            ns['run.workspace_mount_src'] = os.getcwd()
+
+    # Container state management
+    # For --print-cmd, allow prompts so the printed command reflects the user's choice.
+    if ns.get('root.print_cmd') and not ns.get('run.auto_attach') and not ns.get('run.auto_replace'):
+        ns['run.auto_attach'] = None
+        ns['run.auto_replace'] = None
+    action = handle_container_state(ns, global_flags=global_flags, podman_path=podman_path)
+    if action is None:
+        sys.exit(0)
+
+    replace_rm_cmd = None
+    if action == 'replace':
+        pm = shlex.quote(podman_path)
+        gf_str = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
+        replace_rm_cmd = f'{pm} {gf_str}rm -f {shlex.quote(ns["run.name"])}'
+        if not ns.get('root.print_cmd'):
+            run_os_cmd(replace_rm_cmd)
+        action = 'run'
+
+    if action == 'attach':
+        name = ns['run.name']
+        container_workdir, container_overlays = query_container_info(
+            name, global_flags=global_flags, podman_path=podman_path,
+        )
+        if 'user' not in container_overlays.split(','):
+            print(
+                f'Error: container {name!r} was not created with podrun user overlay.\n'
+                f'Cannot auto-attach: exec-entrypoint.sh is not present in the container.\n'
+                f'Use --auto-replace instead to replace the container, or remove it with:\n'
+                f'  podman rm {name}',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cmd = (
+            [podman_path]
+            + global_flags
+            + build_podman_exec_args(
+                ns, name, container_workdir=container_workdir,
+                trailing_args=result.trailing_args,
+                explicit_command=result.explicit_command,
+            )
+        )
+        if ns.get('root.print_cmd'):
+            print(shlex.join(cmd))
+            sys.exit(0)
+        os.execvpe(podman_path, cmd, os.environ.copy())
+
+    # action == 'run'
+
+    # Filter exports that conflict with existing volume mounts
+    if ns.get('run.user_overlay') and (ns.get('run.export') or []):
+        pt = ns.get('run.passthrough_args') or []
+        mount_dests = _volume_mount_destinations(pt)
+        filtered = []
+        for entry in ns['run.export']:
+            cp, _, _ = _parse_export(entry)
+            cp = re.sub(r'^~', f'/home/{UNAME}', cp)
+            if cp in mount_dests:
+                print(
+                    f'Warning: export {entry!r} skipped — {cp} already mounted via -v',
+                    file=sys.stderr,
+                )
+            else:
+                filtered.append(entry)
+        ns['run.export'] = filtered
+
+    # Warn about missing subuid/subgid ranges
+    if ns.get('run.user_overlay'):
+        _warn_missing_subids()
+
+    # Build the full run command with overlay injection
+    cmd, _caps_to_drop = build_overlay_run_command(result, podman_path)
+
+    # Fuse-overlayfs fixup
+    if ns.get('run.fuse_overlayfs'):
+        cmd = _fuse_overlayfs_fixup(ns, cmd)
+        # Rebuild command since global args may have changed
+        cmd, _caps_to_drop = build_overlay_run_command(result, podman_path)
+
+    # Clean stale files (>48h) from previous configs
+    if ns.get('run.user_overlay'):
+        run_os_cmd(f'find {PODRUN_TMP} -mtime +1 -delete 2>/dev/null')
+
+    if ns.get('root.print_cmd'):
+        if replace_rm_cmd:
+            print(replace_rm_cmd)
+        print(shlex.join(cmd))
+        sys.exit(0)
+
+    os.execvpe(podman_path, cmd, os.environ.copy())
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -2508,7 +2749,16 @@ def print_completion(shell: str) -> None:
 def main(argv=None):
     raw = argv if argv is not None else sys.argv[1:]
 
-    podman_path = shutil.which('podman') or 'podman'
+    # Guard: refuse to run inside a podrun container
+    if _is_nested():
+        print(
+            'Error: podrun cannot be run inside a podrun container.\n'
+            'Nested podrun is not supported.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    podman_path = _default_podman_path() or 'podman'
 
     # Podman-not-found guard — fail early before parsing.
     if get_podman_version(podman_path) is None:
@@ -2537,19 +2787,14 @@ def main(argv=None):
 
     # Route
     if ns['subcommand'] == 'run':
-        cmd = build_run_command(result, podman_path)
+        _handle_run(result, podman_path)
+    elif ns['subcommand'] is not None:
+        # Passthrough to podman
+        cmd = build_passthrough_command(result, podman_path)
         if ns['root.print_cmd']:
             print(shlex.join(cmd))
             sys.exit(0)
-        # Phase 2: os.execvpe(cmd[0], cmd, ...)
-    else:
-        if ns['subcommand'] is not None:
-            # Passthrough to podman
-            cmd = build_passthrough_command(result, podman_path)
-            if ns['root.print_cmd']:
-                print(shlex.join(cmd))
-                sys.exit(0)
-            os.execvpe(podman_path, cmd, os.environ.copy())
+        os.execvpe(podman_path, cmd, os.environ.copy())
 
 
 if __name__ == '__main__':

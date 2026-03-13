@@ -19,10 +19,10 @@ from podrun.podrun2 import (
     _store_destroy,
     _store_init,
     _store_print_info,
+    _is_nested,
     build_passthrough_command,
     build_root_parser,
     build_run_command,
-    is_podman_remote,
     load_podman_flags,
     main,
     parse_args,
@@ -44,12 +44,14 @@ import podrun.podrun2 as podrun2_mod
 def _isolate_from_filesystem(monkeypatch):
     """Prevent CLI tests from picking up real devcontainer.json or store dirs.
 
-    Also force is_podman_remote=False so store tests behave consistently
-    regardless of the test environment (this container runs podman-remote).
+    Also force _is_nested=False so store tests behave consistently
+    regardless of the test environment (this container runs inside podrun).
     """
     monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
     monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, 'is_podman_remote', lambda path: False)
+    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
+    # Clear nested podrun guard env var (we're running inside a podrun container)
+    monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
 
 
 @pytest.fixture
@@ -1227,21 +1229,38 @@ class TestPrintCmdOutput:
 
     def test_bare_run(self, capsys):
         cmd = self._cmd(['run', 'alpine'], capsys)
-        assert cmd == ['podman', 'run', 'alpine']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        assert cmd[-1] == 'alpine'
 
     def test_run_with_image_and_command(self, capsys):
         cmd = self._cmd(['run', 'alpine', 'bash', '-c', 'echo hi'], capsys)
-        assert cmd == ['podman', 'run', 'alpine', 'bash', '-c', 'echo hi']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        img_idx = cmd.index('alpine')
+        assert cmd[img_idx + 1:] == ['bash', '-c', 'echo hi']
 
     def test_run_with_separator(self, capsys):
         cmd = self._cmd(['run', 'alpine', '--', 'bash', '-c', 'echo hi'], capsys)
-        assert cmd == ['podman', 'run', 'alpine', '--', 'bash', '-c', 'echo hi']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        sep_idx = cmd.index('--')
+        assert cmd[sep_idx + 1:] == ['bash', '-c', 'echo hi']
 
     # -- multiple -e flags ---------------------------------------------------
 
     def test_multiple_env(self, capsys):
         cmd = self._cmd(['run', '-e', 'A=1', '-e', 'B=2', '-e', 'C=3', 'alpine'], capsys)
-        assert cmd == ['podman', 'run', '-e', 'A=1', '-e', 'B=2', '-e', 'C=3', 'alpine']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        assert 'alpine' in cmd
+        # User-provided env vars are present between run and image
+        run_idx = cmd.index('run')
+        img_idx = cmd.index('alpine')
+        mid = cmd[run_idx + 1 : img_idx]
+        assert 'A=1' in mid
+        assert 'B=2' in mid
+        assert 'C=3' in mid
 
     def test_env_equals_syntax(self, capsys):
         cmd = self._cmd(['run', '--env=FOO=bar', 'alpine'], capsys)
@@ -1255,17 +1274,28 @@ class TestPrintCmdOutput:
         cmd = self._cmd(
             ['run', '-v', '/a:/b', '-v', '/c:/d', '-v', '/e:/f:ro', 'alpine'], capsys,
         )
-        assert cmd == [
-            'podman', 'run',
-            '-v', '/a:/b', '-v', '/c:/d', '-v', '/e:/f:ro',
-            'alpine',
-        ]
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        assert 'alpine' in cmd
+        run_idx = cmd.index('run')
+        img_idx = cmd.index('alpine')
+        mid = cmd[run_idx + 1 : img_idx]
+        assert '/a:/b' in mid
+        assert '/c:/d' in mid
+        assert '/e:/f:ro' in mid
 
     def test_volume_long_form(self, capsys):
         cmd = self._cmd(
             ['run', '--volume', '/a:/b', '--volume', '/c:/d', 'alpine'], capsys,
         )
-        assert cmd == ['podman', 'run', '--volume', '/a:/b', '--volume', '/c:/d', 'alpine']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        assert 'alpine' in cmd
+        run_idx = cmd.index('run')
+        img_idx = cmd.index('alpine')
+        mid = cmd[run_idx + 1 : img_idx]
+        assert '/a:/b' in mid
+        assert '/c:/d' in mid
 
     # -- mixed env + volume + boolean flags ----------------------------------
 
@@ -1346,12 +1376,19 @@ class TestPrintCmdOutput:
     def test_command_flag_not_consumed(self, capsys):
         """'-c' after image is part of the command, not consumed as --cpu-shares."""
         cmd = self._cmd(['run', '-e', 'A=1', 'alpine', 'bash', '-c', 'echo hi'], capsys)
-        assert cmd == ['podman', 'run', '-e', 'A=1', 'alpine', 'bash', '-c', 'echo hi']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        img_idx = cmd.index('alpine')
+        assert cmd[img_idx + 1:] == ['bash', '-c', 'echo hi']
+        assert 'A=1' in cmd
 
     def test_flag_like_command_args(self, capsys):
         """All flag-like tokens after image are passed through literally."""
         cmd = self._cmd(['run', 'alpine', 'ls', '-la', '--color=auto'], capsys)
-        assert cmd == ['podman', 'run', 'alpine', 'ls', '-la', '--color=auto']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        img_idx = cmd.index('alpine')
+        assert cmd[img_idx + 1:] == ['ls', '-la', '--color=auto']
 
     def test_double_dash_command_with_flags(self, capsys):
         """Explicit '--' separator still works."""
@@ -2579,7 +2616,9 @@ class TestStoreCommandIntegration:
         assert '--root' not in cmd
         assert '--runroot' not in cmd
         assert '--storage-driver' not in cmd
-        assert cmd == ['podman', 'run', 'alpine']
+        assert cmd[0] == 'podman'
+        assert 'run' in cmd
+        assert cmd[-1] == 'alpine'
 
     def test_ignore_passthrough(self, init_store, capsys):
         """--local-store-ignore → no store flags in passthrough command."""
@@ -2803,25 +2842,19 @@ class TestStoreCommandIntegration:
 
     # -- podman remote ------------------------------------------------------
 
-    def test_remote_no_store_flags_run(self, init_store, capsys, monkeypatch):
-        """Podman remote → no store flags even with initialized store."""
-        monkeypatch.setattr(podrun2_mod, 'is_podman_remote', lambda path: True)
-        cmd = self._cmd(['--local-store', init_store, 'run', 'alpine'], capsys)
-        assert '--root' not in cmd
-        assert '--runroot' not in cmd
-        assert '--storage-driver' not in cmd
+    def test_nested_no_store_flags(self, init_store, monkeypatch):
+        """Nested (inside podrun container) → _apply_store skips store flags."""
+        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        ns = {'root.local_store': init_store}
+        _apply_store(ns, 'podman')
+        assert 'podman_global_args' not in ns or '--root' not in (ns.get('podman_global_args') or [])
 
-    def test_remote_no_store_flags_passthrough(self, init_store, capsys, monkeypatch):
-        """Podman remote → no store flags on passthrough subcommand."""
-        monkeypatch.setattr(podrun2_mod, 'is_podman_remote', lambda path: True)
-        cmd = self._cmd(['--local-store', init_store, 'ps', '-a'], capsys)
-        assert '--root' not in cmd
-
-    def test_remote_store_info(self, init_store, capsys, monkeypatch):
-        """--local-store-info with podman remote → disabled message."""
-        monkeypatch.setattr(podrun2_mod, 'is_podman_remote', lambda path: True)
+    def test_nested_store_info(self, init_store, capsys, monkeypatch):
+        """Nested + --local-store-info → disabled message."""
+        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        ns = {'root.local_store': init_store, 'root.local_store_info': True}
         with pytest.raises(SystemExit) as exc_info:
-            main(['--local-store', init_store, '--local-store-info'])
+            _apply_store(ns, 'podman')
         assert exc_info.value.code == 0
         err = capsys.readouterr().err
         assert 'disabled' in err
@@ -3022,11 +3055,12 @@ class TestStoreDestroyIntegration:
             main(['--local-store', store_dir, '--local-store-destroy'])
         assert exc_info.value.code == 0
 
-    def test_store_destroy_remote_error(self, capsys, monkeypatch):
-        """Podman remote + --local-store-destroy → exits 1 with error."""
-        monkeypatch.setattr(podrun2_mod, 'is_podman_remote', lambda path: True)
+    def test_store_destroy_nested_error(self, capsys, monkeypatch):
+        """Nested (inside podrun) + --local-store-destroy → exits 1 with error."""
+        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        ns = {'root.local_store_destroy': True}
         with pytest.raises(SystemExit) as exc_info:
-            main(['--local-store-destroy'])
+            _apply_store(ns, 'podman')
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert '--local-store-destroy' in err

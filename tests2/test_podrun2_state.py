@@ -27,7 +27,7 @@ def _isolate(monkeypatch):
     """Prevent tests from picking up real devcontainer.json or store dirs."""
     monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
     monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, 'is_podman_remote', lambda path: False)
+    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ from podrun.podrun2 import (
     devcontainer_run_args,
     extract_podrun_config,
     find_devcontainer_json,
-    find_project_context,
     parse_args,
     parse_config_tokens,
     parse_devcontainer_json,
@@ -117,9 +116,9 @@ class TestRunConfigScripts:
 
 class TestParseConfigTokens:
     def test_root_flags(self):
-        ns, pt = parse_config_tokens(['--store', '/s', '--auto-init-store'])
-        assert ns['root.store'] == '/s'
-        assert ns['root.auto_init_store'] is True
+        ns, pt = parse_config_tokens(['--local-store', '/s', '--local-store-auto-init'])
+        assert ns['root.local_store'] == '/s'
+        assert ns['root.local_store_auto_init'] is True
         assert pt == []
 
     def test_run_flags(self):
@@ -129,8 +128,8 @@ class TestParseConfigTokens:
         assert pt == []
 
     def test_mixed_root_and_run(self):
-        ns, pt = parse_config_tokens(['--store', '/s', '--name', 'test'])
-        assert ns['root.store'] == '/s'
+        ns, pt = parse_config_tokens(['--local-store', '/s', '--name', 'test'])
+        assert ns['root.local_store'] == '/s'
         assert ns['run.name'] == 'test'
 
     def test_passthrough(self):
@@ -381,45 +380,6 @@ class TestDevcontainerRunArgs:
         assert '--rm' in args
 
 
-# ---------------------------------------------------------------------------
-# TestProjectContext
-# ---------------------------------------------------------------------------
-
-
-class TestFindProjectContext:
-    def test_finds_both(self, tmp_project):
-        dc_dir = tmp_project / '.devcontainer'
-        dc_dir.mkdir()
-        dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text('{}')
-        store = dc_dir / '.podrun' / 'store' / 'graphroot'
-        store.mkdir(parents=True)
-        dc_json, store_dir = find_project_context(str(tmp_project))
-        assert dc_json == dc_file
-        assert store_dir == str(dc_dir / '.podrun' / 'store')
-
-    def test_finds_devcontainer_only(self, tmp_project):
-        dc_dir = tmp_project / '.devcontainer'
-        dc_dir.mkdir()
-        dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text('{}')
-        dc_json, store_dir = find_project_context(str(tmp_project))
-        assert dc_json == dc_file
-        assert store_dir is None
-
-    def test_finds_store_only(self, tmp_project):
-        dc_dir = tmp_project / '.devcontainer'
-        store = dc_dir / '.podrun' / 'store' / 'graphroot'
-        store.mkdir(parents=True)
-        dc_json, store_dir = find_project_context(str(tmp_project))
-        assert dc_json is None
-        assert store_dir == str(dc_dir / '.podrun' / 'store')
-
-    def test_finds_neither(self, tmp_project):
-        dc_json, store_dir = find_project_context(str(tmp_project))
-        assert dc_json is None
-        assert store_dir is None
-
 
 # ---------------------------------------------------------------------------
 # TestDevcontainerToNs
@@ -428,11 +388,33 @@ class TestFindProjectContext:
 
 class TestDevcontainerToNs:
     def test_root_keys(self):
-        cfg = {'store': '/s', 'autoInitStore': True, 'storeRegistry': 'mirror.io'}
+        cfg = {'localStore': '/s', 'localStoreAutoInit': True}
         ns = _devcontainer_to_ns(cfg)
-        assert ns['root.store'] == '/s'
-        assert ns['root.auto_init_store'] is True
-        assert ns['root.store.registry'] == 'mirror.io'
+        assert ns['root.local_store'] == '/s'
+        assert ns['root.local_store_auto_init'] is True
+
+    def test_root_store_ignore_key(self):
+        cfg = {'localStoreIgnore': True}
+        ns = _devcontainer_to_ns(cfg)
+        assert ns['root.local_store_ignore'] is True
+
+    def test_root_storage_driver_key(self):
+        cfg = {'storageDriver': 'vfs'}
+        ns = _devcontainer_to_ns(cfg)
+        assert ns['root.storage_driver'] == 'vfs'
+
+    def test_all_store_keys(self):
+        cfg = {
+            'localStore': '/s',
+            'localStoreAutoInit': True,
+            'localStoreIgnore': False,
+            'storageDriver': 'overlay',
+        }
+        ns = _devcontainer_to_ns(cfg)
+        assert ns['root.local_store'] == '/s'
+        assert ns['root.local_store_auto_init'] is True
+        assert ns['root.local_store_ignore'] is False
+        assert ns['root.storage_driver'] == 'overlay'
 
     def test_run_keys(self):
         cfg = {'name': 'test', 'adhoc': True, 'shell': '/bin/zsh'}
@@ -457,11 +439,11 @@ class TestDevcontainerToNs:
 
 
 class TestResolveConfig:
-    def _resolve(self, argv, monkeypatch, dc=None, ctx=None, script_stdout=None):
+    def _resolve(self, argv, monkeypatch, dc=None, dc_json_path=None, script_stdout=None):
         """Helper to parse + resolve with controlled config sources."""
-        if ctx is None:
-            ctx = (None, None)
-        monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: ctx)
+        monkeypatch.setattr(
+            podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path,
+        )
 
         if script_stdout is not None:
             monkeypatch.setattr(
@@ -491,8 +473,7 @@ class TestResolveConfig:
             'image': 'ubuntu:22.04',
             'customizations': {'podrun': {'adhoc': True, 'shell': '/bin/zsh'}},
         }))
-        ctx = (dc_file, None)
-        r = self._resolve(['run'], monkeypatch, ctx=ctx)
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
         assert r.ns.get('run.adhoc') is True
         assert r.ns.get('run.shell') == '/bin/zsh'
         # Image from devcontainer
@@ -511,12 +492,11 @@ class TestResolveConfig:
                 'workspace': True,
             }},
         }))
-        ctx = (dc_file, None)
         # Script sets name and shell
         r = self._resolve(
             ['--config-script', '/s.sh', 'run', '--name', 'cli-name', 'alpine'],
             monkeypatch,
-            ctx=ctx,
+            dc_json_path=dc_file,
             script_stdout='--name script-name --shell /bin/script-shell',
         )
         # CLI wins for name
@@ -536,7 +516,7 @@ class TestResolveConfig:
             return subprocess.CompletedProcess(args='', returncode=0, stdout='--name from-script')
 
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
-        monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: (None, None))
+        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
         r = parse_args([
             '--config-script', '/a.sh', '--config-script', '/b.sh',
@@ -555,11 +535,10 @@ class TestResolveConfig:
             'image': 'alpine',
             'customizations': {'podrun': {'configScript': '/dc-script.sh'}},
         }))
-        ctx = (dc_file, None)
         r = self._resolve(
             ['run'],
             monkeypatch,
-            ctx=ctx,
+            dc_json_path=dc_file,
             script_stdout='--workspace',
         )
         assert r.ns.get('run.workspace') is True
@@ -575,7 +554,6 @@ class TestResolveConfig:
                 'configScript': ['/dc-a.sh', '/dc-b.sh'],
             }},
         }))
-        ctx = (dc_file, None)
         calls = []
         def fake_run_os_cmd(cmd):
             calls.append(cmd)
@@ -584,7 +562,7 @@ class TestResolveConfig:
             return subprocess.CompletedProcess(args='', returncode=0, stdout='--shell /bin/zsh')
 
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
-        monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: ctx)
+        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
         monkeypatch.setattr(podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text()))
 
         r = parse_args(['run'])
@@ -609,7 +587,6 @@ class TestResolveConfig:
                 'configScript': ['/dc-a.sh', '/dc-b.sh'],
             }},
         }))
-        ctx = (dc_file, None)
         calls = []
         def fake_run_os_cmd(cmd):
             calls.append(cmd)
@@ -624,7 +601,7 @@ class TestResolveConfig:
             )
 
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
-        monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: ctx)
+        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
         monkeypatch.setattr(podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text()))
 
         r = parse_args([
@@ -677,8 +654,7 @@ class TestResolveConfig:
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
         dc_file.write_text(json.dumps({'image': 'dc-image'}))
-        ctx = (dc_file, None)
-        r = self._resolve(['run', 'cli-image'], monkeypatch, ctx=ctx)
+        r = self._resolve(['run', 'cli-image'], monkeypatch, dc_json_path=dc_file)
         assert r.trailing_args[0] == 'cli-image'
 
     def test_image_resolution_dc_fallback(self, monkeypatch, tmp_project):
@@ -687,8 +663,7 @@ class TestResolveConfig:
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
         dc_file.write_text(json.dumps({'image': 'dc-image'}))
-        ctx = (dc_file, None)
-        r = self._resolve(['run'], monkeypatch, ctx=ctx)
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
         assert r.trailing_args == ['dc-image']
 
     def test_exports_append(self, monkeypatch, tmp_project):
@@ -700,11 +675,10 @@ class TestResolveConfig:
             'image': 'alpine',
             'customizations': {'podrun': {'exports': ['/dc:/dc']}},
         }))
-        ctx = (dc_file, None)
         r = self._resolve(
             ['--config-script', '/s.sh', 'run', '--export', '/cli:/cli', 'alpine'],
             monkeypatch,
-            ctx=ctx,
+            dc_json_path=dc_file,
             script_stdout='--export /script:/script',
         )
         exports = r.ns.get('run.export') or []
@@ -715,18 +689,14 @@ class TestResolveConfig:
         assert exports.index('/dc:/dc') < exports.index('/script:/script')
         assert exports.index('/script:/script') < exports.index('/cli:/cli')
 
-    def test_store_autodiscovery(self, monkeypatch, tmp_project):
-        """Store auto-discovered from project context when not CLI-set."""
-        dc_dir = tmp_project / '.devcontainer'
-        store = dc_dir / '.podrun' / 'store' / 'graphroot'
-        store.mkdir(parents=True)
-        ctx = (None, str(dc_dir / '.podrun' / 'store'))
+    def test_store_not_autodiscovered_in_resolve_config(self, monkeypatch):
+        """Store auto-discovery is handled by _resolve_store, not resolve_config."""
         r = self._resolve(
             ['--no-devconfig', 'run', 'alpine'],
             monkeypatch,
-            ctx=ctx,
         )
-        assert r.ns['root.store'] == str(dc_dir / '.podrun' / 'store')
+        # resolve_config no longer sets root.local_store — _apply_store does
+        assert r.ns.get('root.local_store') is None
 
     def test_label_based_dc_selection(self, monkeypatch, tmp_project):
         """Label devcontainer.config_file=<path> selects devcontainer.json."""
@@ -735,8 +705,7 @@ class TestResolveConfig:
             'image': 'custom-image',
             'customizations': {'podrun': {'shell': '/bin/custom'}},
         }))
-        ctx = (None, None)
-        monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: ctx)
+        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
         r = parse_args([
             'run', '-l', f'devcontainer.config_file={dc_file}', 'alpine',
@@ -744,19 +713,14 @@ class TestResolveConfig:
         r = resolve_config(r)
         assert r.ns.get('run.shell') == '/bin/custom'
 
-    def test_ignore_store(self, monkeypatch, tmp_project):
-        """--ignore-store prevents store auto-discovery."""
-        ctx = (None, '/some/store')
+    def test_ignore_store_flag_parsed(self, monkeypatch):
+        """--local-store-ignore is parsed correctly by resolve_config."""
         r = self._resolve(
-            ['--ignore-store', '--no-devconfig', 'run', 'alpine'],
+            ['--local-store-ignore', '--no-devconfig', 'run', 'alpine'],
             monkeypatch,
-            ctx=ctx,
         )
-        assert r.ns.get('root.store') is None or r.ns.get('root.ignore_store') is True
-        # Store should not be set when ignore_store is True
-        # (the resolve_config only sets store if not ignore_store)
-        # root.store remains None (default) because ignore_store prevents auto-discovery
-        assert r.ns['root.ignore_store'] is True
+        assert r.ns['root.local_store_ignore'] is True
+        assert r.ns.get('root.local_store') is None
 
     def test_no_devconfig(self, monkeypatch, tmp_project):
         """--no-devconfig skips devcontainer loading."""
@@ -767,11 +731,10 @@ class TestResolveConfig:
             'image': 'dc-image',
             'customizations': {'podrun': {'adhoc': True}},
         }))
-        ctx = (dc_file, None)
         r = self._resolve(
             ['--no-devconfig', 'run', 'alpine'],
             monkeypatch,
-            ctx=ctx,
+            dc_json_path=dc_file,
         )
         # adhoc from devcontainer should NOT be applied
         assert r.ns.get('run.adhoc') is None
@@ -786,11 +749,10 @@ class TestResolveConfig:
             'capAdd': ['SYS_PTRACE'],
             'runArgs': ['--rm'],
         }))
-        ctx = (dc_file, None)
         r = self._resolve(
             ['run', '-e', 'FOO=bar', 'alpine'],
             monkeypatch,
-            ctx=ctx,
+            dc_json_path=dc_file,
         )
         pt = r.ns.get('run.passthrough_args') or []
         # DC args should come before CLI args
@@ -820,11 +782,10 @@ class TestResolveConfig:
             'image': 'alpine',
             'capAdd': ['SYS_PTRACE'],
         }))
-        ctx = (dc_file, None)
         r = self._resolve(
             ['--config-script', '/s.sh', 'run', '-e', 'CLI=1', 'alpine'],
             monkeypatch,
-            ctx=ctx,
+            dc_json_path=dc_file,
             script_stdout='-e SCRIPT=1',
         )
         pt = r.ns.get('run.passthrough_args') or []
@@ -841,7 +802,6 @@ class TestResolveConfig:
             monkeypatch,
         )
         assert hasattr(r, '_devcontainer')
-        assert hasattr(r, '_project_context')
         assert hasattr(r, '_podrun_cfg')
 
     def test_build_run_command_with_labels(self, monkeypatch):
@@ -875,20 +835,18 @@ class TestIntegrationPipeline:
     CLI flags) produce the correct final podman command line.
     """
 
-    def _cmd(self, argv, monkeypatch, dc_file=None, ctx=None, script_effects=None):
+    def _cmd(self, argv, monkeypatch, dc_file=None, script_effects=None):
         """Parse + resolve + build, returning the final command list.
 
         Args:
             argv: CLI args (without podman path).
             dc_file: Path to a real devcontainer.json on disk (in tmp_path).
-            ctx: (devcontainer_json, store_dir) tuple; defaults to (dc_file, None)
-                 if dc_file is given, else (None, None).
             script_effects: List of (returncode, stdout) tuples for successive
                             run_os_cmd calls, or None for no mocking.
         """
-        if ctx is None:
-            ctx = (dc_file, None) if dc_file else (None, None)
-        monkeypatch.setattr(podrun2_mod, 'find_project_context', lambda start_dir=None: ctx)
+        monkeypatch.setattr(
+            podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file,
+        )
 
         if script_effects is not None:
             call_idx = [0]

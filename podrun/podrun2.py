@@ -5,10 +5,16 @@
 # This source code is licensed under the MIT license found at
 # https://github.com/kschwab/podrun/blob/main/LICENSE.md
 """
-podrun2 — CLI parsing module
-#############################
+podrun2
+#######
 
 Phase 1.1: argparse-based CLI parsing for podrun.
+Phase 1.2: Configuration integration — config-script execution,
+           devcontainer.json discovery/parsing, and three-way merge
+           (CLI > config-script > devcontainer.json).
+Phase 1.3: Local store management — local store resolution, initialization,
+           --root/--runroot/--storage-driver injection, and podman
+           remote detection.
 """
 
 __version__ = '1.0.0'
@@ -29,6 +35,7 @@ https://github.com/kschwab/podrun/blob/main/LICENSE.md"""
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
@@ -38,11 +45,6 @@ import shutil
 import subprocess
 import sys
 from typing import List, Tuple
-
-# Podrun-specific subcommands (not forwarded to podman).
-_PODRUN_SUBCOMMANDS = frozenset({
-    'store',
-})
 
 # Podrun root flags that overlap with podman global flags and are handled
 # by the root parser directly (skip registering as passthrough).
@@ -330,49 +332,6 @@ def find_devcontainer_json(start_dir=None):
     return None
 
 
-def find_project_context(start_dir=None):
-    """Walk upward once, discovering both devcontainer.json and store.
-
-    At each directory level, checks for:
-    - ``.devcontainer/.podrun/store/graphroot/`` (initialized store)
-    - ``devcontainer.json`` (standard, shorthand, named configs)
-
-    Returns a ``ProjectContext`` with the first match for each.
-    """
-    ctx = ProjectContext()
-    start = pathlib.Path(start_dir) if start_dir else pathlib.Path.cwd()
-    for path in [start, *start.parents]:
-        devcontainer_dir = path / '.devcontainer'
-
-        # --- Store discovery ---
-        if ctx.store_dir is None and devcontainer_dir.is_dir():
-            store_candidate = devcontainer_dir / '.podrun' / 'store'
-            if (store_candidate / 'graphroot').is_dir():
-                ctx.store_dir = str(store_candidate)
-
-        # --- devcontainer.json discovery ---
-        if ctx.devcontainer_json is None:
-            candidate = devcontainer_dir / 'devcontainer.json'
-            if candidate.exists():
-                ctx.devcontainer_json = candidate
-            else:
-                candidate = path / '.devcontainer.json'
-                if candidate.exists():
-                    ctx.devcontainer_json = candidate
-                elif devcontainer_dir.is_dir():
-                    for child in sorted(devcontainer_dir.iterdir()):
-                        if child.is_dir():
-                            candidate = child / 'devcontainer.json'
-                            if candidate.exists():
-                                ctx.devcontainer_json = candidate
-                                break
-
-        # Early exit when both found
-        if ctx.devcontainer_json is not None and ctx.store_dir is not None:
-            break
-
-    return ctx
-
 
 def _strip_jsonc(text: str) -> str:
     """Strip // and /* */ comments (not inside strings) and trailing commas."""
@@ -466,13 +425,272 @@ def devcontainer_run_args(devcontainer: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Store management
+# ---------------------------------------------------------------------------
+
+_PODRUN_STORES_DIR = '/tmp/podrun-stores'
+
+
+def _runroot_path(graphroot: str) -> str:
+    """Return a deterministic runroot path under ``/tmp`` for *graphroot*.
+
+    Uses a short SHA-256 prefix to stay well within
+    the 108-byte ``sun_path`` limit and is unique per graphroot.
+    """
+    h = hashlib.sha256(graphroot.encode()).hexdigest()[:12]
+    return f'{_PODRUN_STORES_DIR}/{h}'
+
+
+def _default_store_dir():
+    """Walk upward from cwd looking for a devcontainer project root.
+
+    If ``.devcontainer/`` dir found → ``<root>/.devcontainer/.podrun/store``.
+    Else if ``.devcontainer.json`` found → ``<root>/.podrun/store``.
+    If no project root exists, returns ``None``.
+    """
+    start = pathlib.Path.cwd()
+    for path in [start, *start.parents]:
+        if (path / '.devcontainer').is_dir():
+            return str(path / '.devcontainer' / '.podrun' / 'store')
+        if (path / '.devcontainer.json').exists():
+            return str(path / '.podrun' / 'store')
+    return None
+
+
+def _store_init(store_dir: str) -> None:
+    """Create a project-local podrun store (graphroot + runroot symlink)."""
+    store_path = pathlib.Path(store_dir).resolve()
+    graphroot = store_path / 'graphroot'
+    graphroot.mkdir(parents=True, exist_ok=True)
+
+    # Runroot under /tmp (deterministic, short path)
+    runroot_target = _runroot_path(str(graphroot))
+    pathlib.Path(runroot_target).mkdir(parents=True, exist_ok=True)
+
+    # Symlink store_dir/runroot → /tmp/podrun-stores/<hash>/
+    runroot_link = store_path / 'runroot'
+    if runroot_link.is_symlink() or runroot_link.exists():
+        runroot_link.unlink()
+    runroot_link.symlink_to(runroot_target)
+
+
+def _store_print_info(store_dir: str) -> None:
+    """Print summary information about a podrun store."""
+    store_path = pathlib.Path(store_dir).resolve()
+    rel_store = os.path.relpath(store_path)
+    graphroot = store_path / 'graphroot'
+
+    if not graphroot.is_dir():
+        print(f'Local store: {rel_store} (not initialized)')
+        return
+
+    runroot_link = store_path / 'runroot'
+    runroot_target = os.readlink(str(runroot_link)) if runroot_link.is_symlink() else '?'
+    runroot_exists = os.path.isdir(runroot_target) if runroot_target != '?' else False
+
+    print(f'Local store: {rel_store}')
+    print(f'  graphroot:  {rel_store}/graphroot')
+    runroot_status = '' if runroot_exists else '  (missing — will be created on use)'
+    print(f'  runroot:    {rel_store}/runroot → {runroot_target}{runroot_status}')
+
+
+def _stop_store_service(graphroot: str) -> None:
+    """Stop the podman system service for a store, if running.
+
+    TODO: phase 2 — full service management.
+    """
+
+
+def _store_destroy(store_dir: str, podman_path: str) -> None:
+    """Remove a project-local podrun store and its runroot."""
+    store_path = pathlib.Path(store_dir).resolve()
+    if not store_path.exists():
+        return
+
+    # Read runroot symlink target before removing
+    runroot_link = store_path / 'runroot'
+    runroot_target = None
+    if runroot_link.is_symlink():
+        try:
+            runroot_target = os.readlink(str(runroot_link))
+        except OSError:
+            pass
+
+    # Let podman clean up overlay layers (UID-mapped files) before rm.
+    # Reset every graphroot directory found in the store.
+    runroot_targets = set()
+    if runroot_target:
+        runroot_targets.add(runroot_target)
+    for gr in sorted(store_path.glob('graphroot*')):
+        if not gr.is_dir():
+            continue
+        _stop_store_service(str(gr))
+        gr_runroot = _runroot_path(str(gr))
+        runroot_targets.add(gr_runroot)
+        try:
+            subprocess.run(
+                [
+                    podman_path,
+                    '--root',
+                    str(gr),
+                    '--runroot',
+                    gr_runroot,
+                    '--storage-driver',
+                    'overlay',
+                    'system',
+                    'reset',
+                    '--force',
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # Remove the store directory.  Overlay storage may contain UID-mapped
+    # files inaccessible outside podman's user namespace, so fall back to
+    # ``podman unshare rm -rf`` when shutil.rmtree hits PermissionError.
+    try:
+        shutil.rmtree(str(store_path))
+    except PermissionError:
+        subprocess.run(
+            [podman_path, 'unshare', 'rm', '-rf', str(store_path)],
+            capture_output=True,
+            timeout=120,
+        )
+        if store_path.exists():
+            print(f'Error: failed to remove {store_path}', file=sys.stderr)
+            sys.exit(1)
+    print(f'Removed {store_path}')
+
+    # Remove associated runroot directories
+    for rt in sorted(runroot_targets):
+        if os.path.exists(rt):
+            shutil.rmtree(rt)
+            print(f'Removed {rt}')
+
+    # Clean up parent if empty
+    parent = pathlib.Path(_PODRUN_STORES_DIR)
+    if parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+        print(f'Removed {parent} (empty)')
+
+
+def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], dict]:
+    """Resolve store directory into podman global flags.
+
+    Returns ``(flags_list, env_dict)`` where *flags_list* contains
+    ``['--root', ..., '--runroot', ...]`` (and ``--storage-driver`` when
+    not already supplied via podman global args) or empty if no store is
+    active.
+
+    If ``--storage-driver`` is already present in ``podman_global_args``
+    (i.e. the user passed it explicitly), that value is respected and
+    the local store does not inject a redundant ``--storage-driver``.
+    """
+    # --local-store-ignore → skip store entirely
+    if ns.get('root.local_store_ignore'):
+        return [], {}
+
+    store_dir = ns.get('root.local_store')
+
+    # Auto-discover if not explicitly set
+    if not store_dir:
+        store_dir = _default_store_dir()
+        ns['root.local_store'] = store_dir
+
+    # No project root found — no default store
+    if not store_dir:
+        return [], {}
+
+    # Destroy store if requested — wipe before checking graphroot so the
+    # existing auto-init / uninitialised logic handles post-destroy state.
+    if ns.get('root.local_store_destroy'):
+        _store_destroy(store_dir, podman_path)
+
+    store_path = pathlib.Path(store_dir).resolve()
+    graphroot = store_path / 'graphroot'
+
+    if not graphroot.is_dir():
+        if ns.get('root.local_store_auto_init'):
+            _store_init(store_dir)
+        else:
+            # No initialized store — clear and return empty
+            ns['root.local_store'] = None
+            return [], {}
+
+    graphroot_str = str(graphroot)
+    runroot = _runroot_path(graphroot_str)
+    pathlib.Path(runroot).mkdir(parents=True, exist_ok=True)
+
+    # Conflict check: error if podman_global_args already has --root/--runroot
+    pga = ns.get('podman_global_args') or []
+    conflicts = {'--root', '--runroot'}
+    found = conflicts.intersection(pga)
+    if found:
+        print(
+            f'Error: local store conflicts with explicit podman flags: {", ".join(sorted(found))}\n'
+            f'Use --local-store-ignore to suppress local store.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    flags = ['--root', graphroot_str, '--runroot', runroot]
+
+    # Only inject --storage-driver if the user hasn't already provided one
+    # via podman global args.  Prefer the devcontainer/config-script value
+    # (root.storage_driver) over the default 'overlay'.
+    if '--storage-driver' not in pga:
+        driver = ns.get('root.storage_driver') or 'overlay'
+        flags.extend(['--storage-driver', driver])
+
+    return flags, {}
+
+
+def _apply_store(ns: dict, podman_path: str = 'podman') -> None:
+    """Resolve store, prepend flags, and handle store-only exits.
+
+    With podman remote the store is determined by the service socket
+    established at container launch — local store flags do not apply.
+    """
+    remote = is_podman_remote(podman_path)
+
+    if ns.get('root.local_store_destroy') and remote:
+        print('Error: --local-store-destroy not supported with podman remote', file=sys.stderr)
+        sys.exit(1)
+
+    if not remote:
+        flags, _env = _resolve_store(ns, podman_path)
+        if flags:
+            existing = ns.get('podman_global_args') or []
+            ns['podman_global_args'] = flags + existing
+
+    # If destroy, exit if there is nothing else to do
+    if ns.get('root.local_store_destroy'):
+        if ns['subcommand'] is None and not ns.get('root.local_store_info'):
+            sys.exit(0)
+
+    if ns.get('root.local_store_info'):
+        if remote:
+            print('Local store: disabled (podman remote)', file=sys.stderr)
+        else:
+            store_dir = ns.get('root.local_store')
+            if store_dir:
+                _store_print_info(store_dir)
+            else:
+                print('No local store configured.', file=sys.stderr)
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Config key mapping and merge
 # ---------------------------------------------------------------------------
 
 _ROOT_CONFIG_MAP = {
-    'store': 'root.store',
-    'autoInitStore': 'root.auto_init_store',
-    'storeRegistry': 'root.store.registry',
+    'localStore': 'root.local_store',
+    'localStoreAutoInit': 'root.local_store_auto_init',
+    'localStoreIgnore': 'root.local_store_ignore',
+    'storageDriver': 'root.storage_driver',
 }
 
 _RUN_CONFIG_MAP = {
@@ -521,10 +739,7 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa:
 
     ns = result.ns
 
-    # 1. Discover project context
-    ctx = find_project_context()
-
-    # 2. Load devcontainer.json — honor root.config / root.no_devconfig / run.label
+    # 1. Load devcontainer.json — honor root.config / root.no_devconfig / run.label
     dc = {}
     dc_path = None
     podrun_cfg = {}
@@ -540,8 +755,8 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa:
             dc_path = ns['root.config']
         elif label_config_path:
             dc_path = label_config_path
-        elif ctx.devcontainer_json is not None:
-            dc_path = ctx.devcontainer_json
+        else:
+            dc_path = find_devcontainer_json()
 
         if dc_path is not None:
             dc = parse_devcontainer_json(dc_path)
@@ -614,13 +829,8 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa:
         if combined_exports:
             ns['run.export'] = combined_exports
 
-    # Store auto-discovery (when not explicitly set and not ignored)
-    if not ns.get('root.store') and not ns.get('root.ignore_store') and ctx.store_dir:
-        ns['root.store'] = ctx.store_dir
-
     # 10. Attach context for Phase 2
     result._devcontainer = dc
-    result._project_context = ctx
     result._podrun_cfg = podrun_cfg
 
     return result
@@ -722,32 +932,39 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
 
     # -- Store-related global flags (with translation) ------------------------
     opts.add_argument(
-        '--store',
-        dest='root.store',
+        '--local-store',
+        dest='root.local_store',
         metavar='DIR',
         default=None,
         help='Use project-local store directory',
     )
     opts.add_argument(
-        '--ignore-store',
-        dest='root.ignore_store',
+        '--local-store-ignore',
+        dest='root.local_store_ignore',
         action='store_true',
         default=False,
         help='Suppress auto-discovery of project-local store',
     )
     opts.add_argument(
-        '--auto-init-store',
-        dest='root.auto_init_store',
+        '--local-store-auto-init',
+        dest='root.local_store_auto_init',
         action='store_true',
         default=False,
-        help='Auto-create store if missing (requires --store)',
+        help='Auto-create store if missing (requires --local-store)',
     )
     opts.add_argument(
-        '--store-registry',
-        dest='root.store.registry',
-        metavar='HOST',
-        default=None,
-        help='Registry mirror for auto-init',
+        '--local-store-info',
+        dest='root.local_store_info',
+        action='store_true',
+        default=False,
+        help='Print store information and exit',
+    )
+    opts.add_argument(
+        '--local-store-destroy',
+        dest='root.local_store_destroy',
+        action='store_true',
+        default=False,
+        help='Remove project-local store before proceeding',
     )
 
     # -- Podman global value flags (passthrough) ------------------------------
@@ -775,13 +992,11 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         )
 
     # -- Subparsers for routing -----------------------------------------------
-    _podrun_metavar = '{' + ','.join(sorted(_PODRUN_SUBCOMMANDS)) + '}'
-    subs = parser.add_subparsers(dest='subcommand', title='Available Commands', metavar=_podrun_metavar)
+    subs = parser.add_subparsers(dest='subcommand', title='Available Commands')
     subs.required = False  # Allow no subcommand (for --version, --help, etc.)
 
     # Real subparsers for podrun commands (full flag parsing)
     run_parser = _build_run_subparser(subs, flags.run_value_flags, flags.run_boolean_flags)
-    store_parser = _build_store_subparser(subs)
 
     # Empty subparsers for podman passthrough commands
     for subcmd in sorted(flags.subcommands - {'run'}):
@@ -789,7 +1004,6 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
 
     # Stash for help/completion access
     parser._run_subparser = run_parser
-    parser._store_subparser = store_parser
 
     return parser
 
@@ -954,63 +1168,6 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     return parser
 
 
-def _build_store_subparser(subs) -> argparse.ArgumentParser:
-    """Add ``store`` subparser with init/destroy/info sub-subcommands.
-
-    Store flags use ``dest='store_*'`` prefix.
-    """
-    parser = subs.add_parser(
-        'store',
-        description='Manage project-local podrun stores.',
-        help='Manage project-local podrun stores',
-    )
-    parser.add_argument_group('Options')
-
-    store_subs = parser.add_subparsers(dest='store.action', title='Available Commands')
-    store_subs.required = False
-
-    init_p = store_subs.add_parser('init', help='Create a new project-local podrun store')
-    init_opts = init_p.add_argument_group('Options')
-    init_opts.add_argument(
-        '--store-dir',
-        dest='store.store_dir',
-        default='.devcontainer/.podrun/store',
-        help='Store directory (default: .devcontainer/.podrun/store)',
-    )
-    init_opts.add_argument(
-        '--registry',
-        dest='store.registry',
-        default=None,
-        help='Registry mirror for pulling images',
-    )
-    init_opts.add_argument(
-        '--storage-driver',
-        dest='store.storage_driver',
-        default='overlay',
-        help='Podman storage driver (default: overlay)',
-    )
-
-    destroy_p = store_subs.add_parser('destroy', help='Remove a project-local podrun store')
-    destroy_opts = destroy_p.add_argument_group('Options')
-    destroy_opts.add_argument(
-        '--store-dir',
-        dest='store.store_dir',
-        default='.devcontainer/.podrun/store',
-        help='Store directory (default: .devcontainer/.podrun/store)',
-    )
-
-    info_p = store_subs.add_parser('info', help='Show information about a podrun store')
-    info_opts = info_p.add_argument_group('Options')
-    info_opts.add_argument(
-        '--store-dir',
-        dest='store.store_dir',
-        default='.devcontainer/.podrun/store',
-        help='Store directory (default: .devcontainer/.podrun/store)',
-    )
-
-    return parser
-
-
 # ---------------------------------------------------------------------------
 # ParseResult
 # ---------------------------------------------------------------------------
@@ -1080,10 +1237,6 @@ def parse_args(argv: List[str], flags=None) -> ParseResult:
         run_trailing = ns.pop('run.trailing', None) or []
         trailing_args = list(unknowns) + run_trailing
 
-    elif subcmd == 'store':
-        if unknowns:
-            root.error(f'unrecognized arguments for store: {" ".join(unknowns)}')
-
     elif subcmd is not None:
         # Passthrough subcommand: unknowns are the raw args after the
         # subcommand token.
@@ -1142,26 +1295,6 @@ def build_passthrough_command(result: ParseResult, podman_path: str = 'podman') 
     if result.explicit_command:
         cmd.append('--')
         cmd.extend(result.explicit_command)
-    return cmd
-
-
-def build_store_command(result: ParseResult, podman_path: str = 'podman') -> List[str]:
-    """Build a ``podrun store`` command from a ParseResult."""
-    ns = result.ns
-    cmd = [podman_path, 'store']
-    action = ns.get('store.action')
-    if action:
-        cmd.append(action)
-        store_dir = ns.get('store.store_dir')
-        if store_dir:
-            cmd.extend(['--store-dir', store_dir])
-        if action == 'init':
-            registry = ns.get('store.registry')
-            if registry:
-                cmd.extend(['--registry', registry])
-            storage_driver = ns.get('store.storage_driver')
-            if storage_driver:
-                cmd.extend(['--storage-driver', storage_driver])
     return cmd
 
 
@@ -1326,6 +1459,9 @@ def main(argv=None):
     result = resolve_config(result)
     ns = result.ns
 
+    # Store resolution (destroy, resolve, info — all handled inside)
+    _apply_store(ns, podman_path)
+
     # Route
     if ns['subcommand'] == 'run':
         cmd = build_run_command(result, podman_path)
@@ -1333,12 +1469,6 @@ def main(argv=None):
             print(shlex.join(cmd))
             sys.exit(0)
         # Phase 2: os.execvpe(cmd[0], cmd, ...)
-    elif ns['subcommand'] == 'store':
-        cmd = build_store_command(result, podman_path)
-        if ns['root.print_cmd']:
-            print(shlex.join(cmd))
-            sys.exit(0)
-        # Phase 2: execute store operation
     else:
         if ns['subcommand'] is not None:
             # Passthrough to podman

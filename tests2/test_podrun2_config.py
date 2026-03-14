@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 
 import pytest
@@ -84,10 +83,12 @@ class TestRunConfigScripts:
         assert len(mock_run_os_cmd.calls) == 1
 
     def test_multiple_scripts_concatenated(self, mock_run_os_cmd):
-        mock_run_os_cmd.set_side_effect([
-            subprocess.CompletedProcess(args='', returncode=0, stdout='--rm'),
-            subprocess.CompletedProcess(args='', returncode=0, stdout='--name test'),
-        ])
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess(args='', returncode=0, stdout='--rm'),
+                subprocess.CompletedProcess(args='', returncode=0, stdout='--name test'),
+            ]
+        )
         tokens = run_config_scripts(['/a.sh', '/b.sh'])
         assert tokens == ['--rm', '--name', 'test']
         assert len(mock_run_os_cmd.calls) == 2
@@ -380,7 +381,6 @@ class TestDevcontainerRunArgs:
         assert '--rm' in args
 
 
-
 # ---------------------------------------------------------------------------
 # TestDevcontainerToNs
 # ---------------------------------------------------------------------------
@@ -442,13 +442,18 @@ class TestResolveConfig:
     def _resolve(self, argv, monkeypatch, dc=None, dc_json_path=None, script_stdout=None):
         """Helper to parse + resolve with controlled config sources."""
         monkeypatch.setattr(
-            podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path,
+            podrun2_mod,
+            'find_devcontainer_json',
+            lambda start_dir=None: dc_json_path,
         )
 
         if script_stdout is not None:
             monkeypatch.setattr(
-                podrun2_mod, 'run_os_cmd',
-                lambda cmd: subprocess.CompletedProcess(args='', returncode=0, stdout=script_stdout),
+                podrun2_mod,
+                'run_os_cmd',
+                lambda cmd: subprocess.CompletedProcess(
+                    args='', returncode=0, stdout=script_stdout
+                ),
             )
 
         if dc is not None:
@@ -469,10 +474,14 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'ubuntu:22.04',
-            'customizations': {'podrun': {'adhoc': True, 'shell': '/bin/zsh'}},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'ubuntu:22.04',
+                    'customizations': {'podrun': {'adhoc': True, 'shell': '/bin/zsh'}},
+                }
+            )
+        )
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
         assert r.ns.get('run.adhoc') is True
         assert r.ns.get('run.shell') == '/bin/zsh'
@@ -484,14 +493,20 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'dc-image',
-            'customizations': {'podrun': {
-                'name': 'dc-name',
-                'shell': '/bin/dc-shell',
-                'workspace': True,
-            }},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'dc-image',
+                    'customizations': {
+                        'podrun': {
+                            'name': 'dc-name',
+                            'shell': '/bin/dc-shell',
+                            'workspace': True,
+                        }
+                    },
+                }
+            )
+        )
         # Script sets name and shell
         r = self._resolve(
             ['--config-script', '/s.sh', 'run', '--name', 'cli-name', 'alpine'],
@@ -509,6 +524,7 @@ class TestResolveConfig:
     def test_multiple_scripts(self, monkeypatch):
         """Multiple --config-script: tokens concatenated."""
         call_count = [0]
+
         def fake_run_os_cmd(cmd):
             call_count[0] += 1
             if call_count[0] == 1:
@@ -518,10 +534,17 @@ class TestResolveConfig:
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
         monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
-        r = parse_args([
-            '--config-script', '/a.sh', '--config-script', '/b.sh',
-            '--no-devconfig', 'run', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--config-script',
+                '/a.sh',
+                '--config-script',
+                '/b.sh',
+                '--no-devconfig',
+                'run',
+                'alpine',
+            ]
+        )
         r = resolve_config(r)
         # --name from script should be set
         assert r.ns['run.name'] == 'from-script'
@@ -531,10 +554,14 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'alpine',
-            'customizations': {'podrun': {'configScript': '/dc-script.sh'}},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'configScript': '/dc-script.sh'}},
+                }
+            )
+        )
         r = self._resolve(
             ['run'],
             monkeypatch,
@@ -548,13 +575,20 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'alpine',
-            'customizations': {'podrun': {
-                'configScript': ['/dc-a.sh', '/dc-b.sh'],
-            }},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {
+                        'podrun': {
+                            'configScript': ['/dc-a.sh', '/dc-b.sh'],
+                        }
+                    },
+                }
+            )
+        )
         calls = []
+
         def fake_run_os_cmd(cmd):
             calls.append(cmd)
             if len(calls) == 1:
@@ -563,7 +597,9 @@ class TestResolveConfig:
 
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
         monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
-        monkeypatch.setattr(podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text()))
+        monkeypatch.setattr(
+            podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
+        )
 
         r = parse_args(['run'])
         r = resolve_config(r)
@@ -581,33 +617,49 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'alpine',
-            'customizations': {'podrun': {
-                'configScript': ['/dc-a.sh', '/dc-b.sh'],
-            }},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {
+                        'podrun': {
+                            'configScript': ['/dc-a.sh', '/dc-b.sh'],
+                        }
+                    },
+                }
+            )
+        )
         calls = []
+
         def fake_run_os_cmd(cmd):
             calls.append(cmd)
             outputs = {
-                1: '--shell /bin/dc-a',       # dc script 0
-                2: '--shell /bin/dc-b',        # dc script 1 overrides dc-a
-                3: '--workspace',              # cli script 0
-                4: '--shell /bin/cli-b',       # cli script 1 overrides dc-b
+                1: '--shell /bin/dc-a',  # dc script 0
+                2: '--shell /bin/dc-b',  # dc script 1 overrides dc-a
+                3: '--workspace',  # cli script 0
+                4: '--shell /bin/cli-b',  # cli script 1 overrides dc-b
             }
             return subprocess.CompletedProcess(
-                args='', returncode=0, stdout=outputs.get(len(calls), ''),
+                args='',
+                returncode=0,
+                stdout=outputs.get(len(calls), ''),
             )
 
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
         monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
-        monkeypatch.setattr(podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text()))
+        monkeypatch.setattr(
+            podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
+        )
 
-        r = parse_args([
-            '--config-script', '/cli-a.sh', '--config-script', '/cli-b.sh',
-            'run',
-        ])
+        r = parse_args(
+            [
+                '--config-script',
+                '/cli-a.sh',
+                '--config-script',
+                '/cli-b.sh',
+                'run',
+            ]
+        )
         r = resolve_config(r)
         # All 4 scripts ran in order
         assert len(calls) == 4
@@ -671,10 +723,14 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'alpine',
-            'customizations': {'podrun': {'exports': ['/dc:/dc']}},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'exports': ['/dc:/dc']}},
+                }
+            )
+        )
         r = self._resolve(
             ['--config-script', '/s.sh', 'run', '--export', '/cli:/cli', 'alpine'],
             monkeypatch,
@@ -701,15 +757,24 @@ class TestResolveConfig:
     def test_label_based_dc_selection(self, monkeypatch, tmp_project):
         """Label devcontainer.config_file=<path> selects devcontainer.json."""
         dc_file = tmp_project / 'custom.json'
-        dc_file.write_text(json.dumps({
-            'image': 'custom-image',
-            'customizations': {'podrun': {'shell': '/bin/custom'}},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'custom-image',
+                    'customizations': {'podrun': {'shell': '/bin/custom'}},
+                }
+            )
+        )
         monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
-        r = parse_args([
-            'run', '-l', f'devcontainer.config_file={dc_file}', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '-l',
+                f'devcontainer.config_file={dc_file}',
+                'alpine',
+            ]
+        )
         r = resolve_config(r)
         assert r.ns.get('run.shell') == '/bin/custom'
 
@@ -727,10 +792,14 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'dc-image',
-            'customizations': {'podrun': {'adhoc': True}},
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'dc-image',
+                    'customizations': {'podrun': {'adhoc': True}},
+                }
+            )
+        )
         r = self._resolve(
             ['--no-devconfig', 'run', 'alpine'],
             monkeypatch,
@@ -744,11 +813,15 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE'],
-            'runArgs': ['--rm'],
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'capAdd': ['SYS_PTRACE'],
+                    'runArgs': ['--rm'],
+                }
+            )
+        )
         r = self._resolve(
             ['run', '-e', 'FOO=bar', 'alpine'],
             monkeypatch,
@@ -778,10 +851,14 @@ class TestResolveConfig:
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE'],
-        }))
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'capAdd': ['SYS_PTRACE'],
+                }
+            )
+        )
         r = self._resolve(
             ['--config-script', '/s.sh', 'run', '-e', 'CLI=1', 'alpine'],
             monkeypatch,
@@ -845,18 +922,24 @@ class TestIntegrationPipeline:
                             run_os_cmd calls, or None for no mocking.
         """
         monkeypatch.setattr(
-            podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file,
+            podrun2_mod,
+            'find_devcontainer_json',
+            lambda start_dir=None: dc_file,
         )
 
         if script_effects is not None:
             call_idx = [0]
+
             def fake_run_os_cmd(cmd):
                 i = call_idx[0]
                 call_idx[0] += 1
                 if i < len(script_effects):
                     rc, stdout = script_effects[i]
-                    return subprocess.CompletedProcess(args='', returncode=rc, stdout=stdout, stderr='')
+                    return subprocess.CompletedProcess(
+                        args='', returncode=rc, stdout=stdout, stderr=''
+                    )
                 return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
+
             monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
 
         r = parse_args(argv)
@@ -874,60 +957,81 @@ class TestIntegrationPipeline:
     # -- DC-only command building ---------------------------------------------
 
     def test_dc_mounts_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'mounts': ['type=bind,src=/host,dst=/ctr'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'mounts': ['type=bind,src=/host,dst=/ctr'],
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--mount=type=bind,src=/host,dst=/ctr' in cmd
         assert cmd[-1] == 'alpine'
 
     def test_dc_mounts_dict_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'mounts': [{'type': 'bind', 'src': '/a', 'dst': '/b'}],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'mounts': [{'type': 'bind', 'src': '/a', 'dst': '/b'}],
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--mount=type=bind,src=/a,dst=/b' in cmd
 
     def test_dc_cap_add_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE', 'NET_ADMIN'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'capAdd': ['SYS_PTRACE', 'NET_ADMIN'],
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--cap-add=SYS_PTRACE' in cmd
         assert '--cap-add=NET_ADMIN' in cmd
 
     def test_dc_security_opt_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'securityOpt': ['seccomp=unconfined'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'securityOpt': ['seccomp=unconfined'],
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--security-opt=seccomp=unconfined' in cmd
 
     def test_dc_privileged_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'privileged': True,
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'privileged': True,
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--privileged' in cmd
 
     def test_dc_init_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'init': True,
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'init': True,
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--init' in cmd
 
     def test_dc_run_args_in_command(self, monkeypatch, tmp_project):
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'runArgs': ['--rm', '--network=host'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'runArgs': ['--rm', '--network=host'],
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--rm' in cmd
         assert '--network=host' in cmd
@@ -947,15 +1051,18 @@ class TestIntegrationPipeline:
 
     def test_dc_combined_fields_in_command(self, monkeypatch, tmp_project):
         """Multiple DC fields all appear in the final command."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'mounts': ['type=tmpfs,dst=/tmp'],
-            'capAdd': ['SYS_PTRACE'],
-            'securityOpt': ['seccomp=unconfined'],
-            'privileged': True,
-            'init': True,
-            'runArgs': ['--rm'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'mounts': ['type=tmpfs,dst=/tmp'],
+                'capAdd': ['SYS_PTRACE'],
+                'securityOpt': ['seccomp=unconfined'],
+                'privileged': True,
+                'init': True,
+                'runArgs': ['--rm'],
+            },
+        )
         cmd = self._cmd(['run'], monkeypatch, dc_file=dc_file)
         assert '--mount=type=tmpfs,dst=/tmp' in cmd
         assert '--cap-add=SYS_PTRACE' in cmd
@@ -992,10 +1099,13 @@ class TestIntegrationPipeline:
 
     def test_dc_args_before_cli_passthrough(self, monkeypatch, tmp_project):
         """DC run args appear before CLI passthrough args in final command."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'capAdd': ['SYS_PTRACE'],
+            },
+        )
         cmd = self._cmd(
             ['run', '-e', 'CLI=1', 'alpine'],
             monkeypatch,
@@ -1022,18 +1132,21 @@ class TestIntegrationPipeline:
         Podman uses last-writer-wins, so this ordering means CLI overrides
         script which overrides DC.
         """
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE'],
-            'customizations': {'podrun': {'configScript': '/dc-script.sh'}},
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'capAdd': ['SYS_PTRACE'],
+                'customizations': {'podrun': {'configScript': '/dc-script.sh'}},
+            },
+        )
         cmd = self._cmd(
             ['--config-script', '/cli-script.sh', 'run', '-e', 'CLI=1', 'alpine'],
             monkeypatch,
             dc_file=dc_file,
             script_effects=[
-                (0, '-e DC_SCRIPT=1'),      # dc configScript
-                (0, '-e CLI_SCRIPT=1'),     # cli --config-script
+                (0, '-e DC_SCRIPT=1'),  # dc configScript
+                (0, '-e CLI_SCRIPT=1'),  # cli --config-script
             ],
         )
         # All three sources contribute flags; verify ordering
@@ -1058,10 +1171,13 @@ class TestIntegrationPipeline:
 
     def test_cli_name_overrides_dc_name(self, monkeypatch, tmp_project):
         """CLI --name wins over devcontainer name in the final command."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'customizations': {'podrun': {'name': 'dc-name'}},
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'customizations': {'podrun': {'name': 'dc-name'}},
+            },
+        )
         cmd = self._cmd(
             ['run', '--name', 'cli-name', 'alpine'],
             monkeypatch,
@@ -1072,13 +1188,18 @@ class TestIntegrationPipeline:
 
     def test_script_name_overrides_dc_name(self, monkeypatch, tmp_project):
         """Script --name wins over devcontainer name in the final command."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'customizations': {'podrun': {
-                'name': 'dc-name',
-                'configScript': '/s.sh',
-            }},
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'customizations': {
+                    'podrun': {
+                        'name': 'dc-name',
+                        'configScript': '/s.sh',
+                    }
+                },
+            },
+        )
         cmd = self._cmd(
             ['run'],
             monkeypatch,
@@ -1092,10 +1213,13 @@ class TestIntegrationPipeline:
 
     def test_labels_with_dc_args(self, monkeypatch, tmp_project):
         """Labels and DC args both appear in the final command."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'capAdd': ['SYS_PTRACE'],
+            },
+        )
         cmd = self._cmd(
             ['run', '-l', 'app=test', 'alpine'],
             monkeypatch,
@@ -1120,11 +1244,14 @@ class TestIntegrationPipeline:
 
     def test_no_devconfig_excludes_dc_from_command(self, monkeypatch, tmp_project):
         """--no-devconfig prevents DC mounts/caps from appearing in command."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'dc-image',
-            'capAdd': ['SYS_PTRACE'],
-            'mounts': ['type=bind,src=/a,dst=/b'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'dc-image',
+                'capAdd': ['SYS_PTRACE'],
+                'mounts': ['type=bind,src=/a,dst=/b'],
+            },
+        )
         cmd = self._cmd(
             ['--no-devconfig', 'run', 'alpine'],
             monkeypatch,
@@ -1139,10 +1266,13 @@ class TestIntegrationPipeline:
 
     def test_global_flags_with_dc_args(self, monkeypatch, tmp_project):
         """Global podman flags appear before 'run', DC args after."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'alpine',
-            'capAdd': ['SYS_PTRACE'],
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'capAdd': ['SYS_PTRACE'],
+            },
+        )
         cmd = self._cmd(
             ['--remote', 'run', 'alpine'],
             monkeypatch,
@@ -1158,31 +1288,41 @@ class TestIntegrationPipeline:
 
     def test_full_scenario(self, monkeypatch, tmp_project):
         """Real-world-like scenario: DC + script + CLI all contributing."""
-        dc_file = self._write_dc(tmp_project, {
-            'image': 'dc-image:latest',
-            'mounts': [{'type': 'bind', 'src': '/data', 'dst': '/data'}],
-            'capAdd': ['SYS_PTRACE'],
-            'init': True,
-            'runArgs': ['--network=host'],
-            'customizations': {'podrun': {
-                'name': 'dc-name',
-                'configScript': '/dc-script.sh',
-            }},
-        })
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'dc-image:latest',
+                'mounts': [{'type': 'bind', 'src': '/data', 'dst': '/data'}],
+                'capAdd': ['SYS_PTRACE'],
+                'init': True,
+                'runArgs': ['--network=host'],
+                'customizations': {
+                    'podrun': {
+                        'name': 'dc-name',
+                        'configScript': '/dc-script.sh',
+                    }
+                },
+            },
+        )
         cmd = self._cmd(
             [
-                '--config-script', '/cli-script.sh',
+                '--config-script',
+                '/cli-script.sh',
                 'run',
-                '--name', 'my-container',
-                '-l', 'env=prod',
-                '-e', 'CLI_VAR=1',
-                '-v', '/host:/ctr',
+                '--name',
+                'my-container',
+                '-l',
+                'env=prod',
+                '-e',
+                'CLI_VAR=1',
+                '-v',
+                '/host:/ctr',
                 'my-image:v2',
             ],
             monkeypatch,
             dc_file=dc_file,
             script_effects=[
-                (0, '-e DC_SCRIPT_VAR=1'),       # dc configScript
+                (0, '-e DC_SCRIPT_VAR=1'),  # dc configScript
                 (0, '-e CLI_SCRIPT_VAR=1 --rm'),  # cli --config-script
             ],
         )

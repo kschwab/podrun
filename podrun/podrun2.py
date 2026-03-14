@@ -41,6 +41,17 @@ Phase 2.6: Store service lifecycle — _store_hash(), _store_socket_path(),
            _ensure_store_service(), _stop_store_service(). Hardened
            _is_nested() with PODRUN_SOCKET_PATH fallback. Socket mount
            path moved to podrun-specific /.podrun/podman/podman.sock.
+Phase 2.7: Shell completion — _completion_data(), _generate_bash_completion(),
+           _generate_zsh_completion(), _generate_fish_completion(). Builds
+           flag metadata by introspecting argparse parsers (auto-picks up
+           new flags). Simplified from podrun1: no nested subcommand
+           handling (store replaced by --local-store-* global flags).
+Phase 2.8: Linting + coverage — ruff, mypy, shellcheck, vulture, pytest-cov.
+           All lint errors fixed (F401, F541, F841, E741, C901 noqa). Mypy
+           type annotations added. Shellcheck at warning severity for
+           entrypoint scripts, error severity for completion scripts.
+           Vulture whitelist for downstream-phase symbols. Coverage
+           threshold enforced at 90%.
 """
 
 __version__ = '1.0.0'
@@ -74,7 +85,7 @@ import signal
 import subprocess
 import sys
 import textwrap
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Identity and path constants
@@ -141,7 +152,7 @@ class PodmanFlags:
 
 
 # In-memory cache keyed by podman_path.
-_loaded_flags = {}
+_loaded_flags: dict = {}
 
 
 def get_podman_version(podman_path):
@@ -296,8 +307,7 @@ def _default_podman_path():
     if env_path:
         resolved = shutil.which(env_path)
         if not resolved:
-            print(f"Error: PODRUN_PODMAN_PATH='{env_path}' not found.",
-                  file=sys.stderr)
+            print(f"Error: PODRUN_PODMAN_PATH='{env_path}' not found.", file=sys.stderr)
             sys.exit(1)
         return resolved
     if os.environ.get('CONTAINER_HOST') and _is_nested():
@@ -323,7 +333,9 @@ def _is_nested() -> bool:
     """
     if os.environ.get('PODRUN_CONTAINER'):
         return True
-    if os.environ.get('CONTAINER_HOST') == PODRUN_CONTAINER_HOST and os.path.exists(PODRUN_SOCKET_PATH):
+    if os.environ.get('CONTAINER_HOST') == PODRUN_CONTAINER_HOST and os.path.exists(
+        PODRUN_SOCKET_PATH
+    ):
         return True
     return False
 
@@ -361,8 +373,7 @@ def run_config_scripts(script_paths: List[str]) -> List[str]:
         out = run_os_cmd(shlex.quote(path))
         if out.returncode != 0:
             print(
-                f'Error: --config-script {path} failed '
-                f'(exit {out.returncode}):\n{out.stderr}',
+                f'Error: --config-script {path} failed (exit {out.returncode}):\n{out.stderr}',
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -400,8 +411,8 @@ def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]
     # Suppress subcommand validation — config tokens have no subcommand.
     # Remove the subcommand subparsers action so positionals don't trigger
     # "invalid choice" errors.
-    saved_actions = root._subparsers._group_actions[:]
-    root._subparsers._group_actions.clear()
+    saved_actions = root._subparsers._group_actions[:]  # type: ignore[union-attr]
+    root._subparsers._group_actions.clear()  # type: ignore[union-attr]
     # Also remove the subparsers action from _actions to prevent positional matching
     saved_sub_actions = [a for a in root._actions if isinstance(a, argparse._SubParsersAction)]
     for a in saved_sub_actions:
@@ -411,11 +422,11 @@ def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]
     root_dict = vars(root_ns)
 
     # Restore actions
-    root._subparsers._group_actions.extend(saved_actions)
+    root._subparsers._group_actions.extend(saved_actions)  # type: ignore[union-attr]
     root._actions.extend(saved_sub_actions)
 
     # Second pass: run parser on unknowns
-    run_parser = root._run_subparser
+    run_parser = root._run_subparser  # type: ignore[attr-defined]
     run_ns, podman_passthrough = run_parser.parse_known_args(unknowns)
     run_dict = vars(run_ns)
 
@@ -552,11 +563,11 @@ def _extract_label_value(pt, label_key):
         if arg.startswith(('--label=', '-l=')):
             val = arg.split('=', 1)[1]
             if val.startswith(prefix):
-                return val[len(prefix):]
+                return val[len(prefix) :]
         elif arg in ('-l', '--label') and i + 1 < len(pt):
             val = pt[i + 1]
             if val.startswith(prefix):
-                return val[len(prefix):]
+                return val[len(prefix) :]
             i += 2
             continue
         i += 1
@@ -682,7 +693,7 @@ def _expand_export_tilde(exports: list) -> list:
 # ---------------------------------------------------------------------------
 
 
-def generate_run_entrypoint(ns: dict, caps_to_drop: list = None) -> str:
+def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> str:
     """Generate the run-entrypoint script and return its path (SHA-named, idempotent).
 
     Reads from the *ns* dict: ``run.login``, ``run.shell``, ``run.export``.
@@ -973,7 +984,7 @@ def generate_exec_entrypoint() -> str:
         # --- HOME resolution ---
         # The image may bake in ENV HOME=/root which podman exec inherits.
         # Read HOME from /etc/passwd (set by --passwd-entry) to override it.
-        _home="$(awk -v uid=$(id -u) -F: '$3==uid{{print $6}}' /etc/passwd 2>/dev/null)"
+        _home="$(awk -v uid="$(id -u)" -F: '$3==uid{{print $6}}' /etc/passwd 2>/dev/null)"
         if [ -n "$_home" ] && [ -d "$_home" ]; then
           HOME="$_home"; export HOME
         fi
@@ -986,7 +997,7 @@ def generate_exec_entrypoint() -> str:
           _shell="${{PODRUN_SHELL:-}}"
         fi
         if [ -z "$_shell" ]; then
-          _shell="$(awk -v uid=$(id -u) -F: '$3==uid{{print $NF}}' /etc/passwd 2>/dev/null)"
+          _shell="$(awk -v uid="$(id -u)" -F: '$3==uid{{print $NF}}' /etc/passwd 2>/dev/null)"
         fi
         if [ -z "$_shell" ] || ! command -v "$_shell" > /dev/null 2>&1; then
           _shell="/bin/sh"
@@ -1149,7 +1160,9 @@ def _podman_remote_args(ns):
             args.append(f'-v={podman_socket}:{PODRUN_SOCKET_PATH}')
             args.append(f'--env=CONTAINER_HOST={PODRUN_CONTAINER_HOST}')
         else:
-            print('Warning: podman remote was requested but podman.socket not found.', file=sys.stderr)
+            print(
+                'Warning: podman remote was requested but podman.socket not found.', file=sys.stderr
+            )
             print('systemctl --user enable --now podman.socket', file=sys.stderr)
     return args
 
@@ -1290,7 +1303,6 @@ def find_devcontainer_json(start_dir=None):
     return None
 
 
-
 def _strip_jsonc(text: str) -> str:
     """Strip // and /* */ comments (not inside strings) and trailing commas."""
     result = []
@@ -1351,7 +1363,7 @@ def parse_devcontainer_json(path):
 
 def extract_podrun_config(devcontainer: dict) -> dict:
     """Extract customizations.podrun from a devcontainer dict."""
-    return devcontainer.get('customizations', {}).get('podrun', {})
+    return devcontainer.get('customizations', {}).get('podrun', {})  # type: ignore[no-any-return]
 
 
 def devcontainer_run_args(devcontainer: dict) -> list:
@@ -1473,11 +1485,16 @@ def _ensure_store_service(graphroot, runroot, store_dir=None, podman_path='podma
 
     cmd = [
         podman_path,
-        '--root', graphroot,
-        '--runroot', runroot,
-        '--storage-driver', 'overlay',
-        'system', 'service',
-        '--time', '0',
+        '--root',
+        graphroot,
+        '--runroot',
+        runroot,
+        '--storage-driver',
+        'overlay',
+        'system',
+        'service',
+        '--time',
+        '0',
         f'unix://{sock}',
     ]
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1565,7 +1582,7 @@ def _stop_store_service(graphroot: str) -> None:
         pass
 
 
-def _store_destroy(store_dir: str, podman_path: str) -> None:
+def _store_destroy(store_dir: str, podman_path: str) -> None:  # noqa: C901
     """Remove a project-local podrun store and its runroot."""
     store_path = pathlib.Path(store_dir).resolve()
     if not store_path.exists():
@@ -1790,7 +1807,79 @@ def _devcontainer_to_ns(podrun_cfg: dict) -> dict:
     return result
 
 
-def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa: C901 — three-way merge across CLI, config-script, and devcontainer.json
+def _load_devcontainer(ns) -> Tuple[dict, dict]:
+    """Load devcontainer.json and extract podrun config.
+
+    Returns ``(dc, podrun_cfg)``.  When ``root.no_devconfig`` is set or no
+    devcontainer.json is found, both are empty dicts.
+    """
+    if ns.get('root.no_devconfig'):
+        return {}, {}
+
+    # Check for label-based dc selection
+    label_config_path = None
+    for lbl in ns.get('run.label') or []:
+        if lbl.startswith('devcontainer.config_file='):
+            label_config_path = lbl.split('=', 1)[1]
+
+    if ns.get('root.config'):
+        dc_path = ns['root.config']
+    elif label_config_path:
+        dc_path = label_config_path
+    else:
+        dc_path = find_devcontainer_json()
+
+    dc = parse_devcontainer_json(dc_path) if dc_path is not None else {}
+    podrun_cfg = extract_podrun_config(dc)
+    return dc, podrun_cfg
+
+
+def _collect_script_config(ns, podrun_cfg, flags) -> Tuple[dict, list]:
+    """Find and execute config scripts, return ``(script_ns, script_passthrough)``."""
+    script_paths: list = []
+    dc_script = podrun_cfg.get('configScript')
+    if dc_script:
+        script_paths.extend([dc_script] if isinstance(dc_script, str) else dc_script)
+    cli_scripts = ns.get('root.config_script')
+    if cli_scripts:
+        script_paths.extend(cli_scripts)
+
+    if not script_paths:
+        return {}, []
+
+    script_tokens = run_config_scripts(script_paths)
+    return parse_config_tokens(script_tokens, flags)
+
+
+def _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns):
+    """Apply run-subcommand-specific merges: overlays, image fallback, exports."""
+    # Overlay implication chain: adhoc→workspace→host+interactive→user
+    #                           dot_files→user
+    if ns.get('run.adhoc'):
+        ns['run.workspace'] = True
+    if ns.get('run.workspace'):
+        ns['run.host_overlay'] = True
+        ns['run.interactive_overlay'] = True
+    if ns.get('run.host_overlay'):
+        ns['run.user_overlay'] = True
+    if ns.get('run.dot_files_overlay'):
+        ns['run.user_overlay'] = True
+
+    # Image/command resolution: CLI trailing > devcontainer image
+    dc_image = dc.get('image')
+    if not result.trailing_args and dc_image:
+        result.trailing_args = [dc_image]
+
+    # Exports append: dc + script + cli
+    dc_exports = podrun_cfg.get('exports', [])
+    script_exports = script_ns.get('run.export') or []
+    cli_exports = ns.get('run.export') or []
+    combined_exports = dc_exports + script_exports + cli_exports
+    if combined_exports:
+        ns['run.export'] = combined_exports
+
+
+def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
     """Three-way merge: CLI > config-script > devcontainer.json.
 
     Updates result.ns in place and attaches context.
@@ -1804,46 +1893,11 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa:
 
     ns = result.ns
 
-    # 1. Load devcontainer.json — honor root.config / root.no_devconfig / run.label
-    dc = {}
-    dc_path = None
-    podrun_cfg = {}
+    # 1–3. Load devcontainer.json + extract customizations.podrun
+    dc, podrun_cfg = _load_devcontainer(ns)
 
-    if not ns.get('root.no_devconfig'):
-        # Check for label-based dc selection
-        label_config_path = None
-        for lbl in ns.get('run.label') or []:
-            if lbl.startswith('devcontainer.config_file='):
-                label_config_path = lbl.split('=', 1)[1]
-
-        if ns.get('root.config'):
-            dc_path = ns['root.config']
-        elif label_config_path:
-            dc_path = label_config_path
-        else:
-            dc_path = find_devcontainer_json()
-
-        if dc_path is not None:
-            dc = parse_devcontainer_json(dc_path)
-
-        # 3. Extract customizations.podrun
-        podrun_cfg = extract_podrun_config(dc)
-
-    # 4. Determine scripts — devcontainer configScript first, then CLI --config-script
-    script_paths = []
-    dc_script = podrun_cfg.get('configScript')
-    if dc_script:
-        script_paths.extend([dc_script] if isinstance(dc_script, str) else dc_script)
-    cli_scripts = ns.get('root.config_script')
-    if cli_scripts:
-        script_paths.extend(cli_scripts)
-
-    # 5. Execute scripts → run_config_scripts() → parse_config_tokens()
-    script_ns = {}
-    script_passthrough = []
-    if script_paths:
-        script_tokens = run_config_scripts(script_paths)
-        script_ns, script_passthrough = parse_config_tokens(script_tokens, flags)
+    # 4–5. Determine and execute config scripts
+    script_ns, script_passthrough = _collect_script_config(ns, podrun_cfg, flags)
 
     # 6. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
     dc_ns = _devcontainer_to_ns(podrun_cfg)
@@ -1872,34 +1926,11 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':  # noqa:
 
     # 9. Handle run specifics
     if ns.get('subcommand') == 'run':
-        # Overlay implication chain: adhoc→workspace→host+interactive→user
-        #                           dot_files→user
-        if ns.get('run.adhoc'):
-            ns['run.workspace'] = True
-        if ns.get('run.workspace'):
-            ns['run.host_overlay'] = True
-            ns['run.interactive_overlay'] = True
-        if ns.get('run.host_overlay'):
-            ns['run.user_overlay'] = True
-        if ns.get('run.dot_files_overlay'):
-            ns['run.user_overlay'] = True
-
-        # Image/command resolution: CLI trailing > devcontainer image
-        dc_image = dc.get('image')
-        if not result.trailing_args and dc_image:
-            result.trailing_args = [dc_image]
-
-        # Exports append: dc + script + cli
-        dc_exports = podrun_cfg.get('exports', [])
-        script_exports = script_ns.get('run.export') or []
-        cli_exports = ns.get('run.export') or []
-        combined_exports = dc_exports + script_exports + cli_exports
-        if combined_exports:
-            ns['run.export'] = combined_exports
+        _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns)
 
     # 10. Attach context for Phase 2
-    result._devcontainer = dc
-    result._podrun_cfg = podrun_cfg
+    result._devcontainer = dc  # type: ignore[attr-defined]
+    result._podrun_cfg = podrun_cfg  # type: ignore[attr-defined]
 
     return result
 
@@ -2071,7 +2102,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         subs.add_parser(subcmd, add_help=False)
 
     # Stash for help/completion access
-    parser._run_subparser = run_parser
+    parser._run_subparser = run_parser  # type: ignore[attr-defined]
 
     return parser
 
@@ -2093,8 +2124,13 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     # -- Podrun run flags (dest='run_*') --------------------------------------
     opts.add_argument('--name', dest='run.name', metavar='NAME', help=argparse.SUPPRESS)
     opts.add_argument(
-        '--label', '-l', dest='run.label', action='append',
-        default=None, metavar='KEY=VALUE', help=argparse.SUPPRESS,
+        '--label',
+        '-l',
+        dest='run.label',
+        action='append',
+        default=None,
+        metavar='KEY=VALUE',
+        help=argparse.SUPPRESS,
     )
     opts.add_argument(
         '--user-overlay',
@@ -2132,7 +2168,8 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         help='Ad-hoc overlay (implies --workspace + --rm)',
     )
     opts.add_argument(
-        '--dot-files-overlay', '--dotfiles',
+        '--dot-files-overlay',
+        '--dotfiles',
         dest='run.dot_files_overlay',
         action='store_true',
         default=None,
@@ -2240,7 +2277,7 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     # args like ``bash -c echo`` are not consumed as podman flags.
     parser.add_argument('run.trailing', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
-    return parser
+    return parser  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
@@ -2334,7 +2371,9 @@ def parse_args(argv: List[str], flags=None) -> ParseResult:
 
 
 def detect_container_state(
-    name: str, global_flags=None, podman_path: str = 'podman',
+    name: str,
+    global_flags=None,
+    podman_path: str = 'podman',
 ):
     """Returns ``"running"``, ``"stopped"``, or ``None``."""
     if not name:
@@ -2351,6 +2390,37 @@ def detect_container_state(
         return 'running'
     if status in ('created', 'exited', 'stopped', 'dead', 'paused'):
         return 'stopped'
+    return None
+
+
+def _handle_running_state(auto_attach, auto_replace, is_interactive):
+    """Decide action for a running container: attach, replace, or None."""
+    if auto_attach:
+        return 'attach'
+    if auto_replace:
+        return 'replace'
+    if auto_attach is False and auto_replace is False:
+        return None
+    if yes_no_prompt('Attach to already running instance?', True, is_interactive):
+        return 'attach'
+    if yes_no_prompt('Replace already running instance?', False, is_interactive):
+        return 'replace'
+    return None
+
+
+def _handle_stopped_state(name, auto_attach, auto_replace, is_interactive):
+    """Decide action for a stopped container: replace or None."""
+    if auto_attach:
+        print(
+            f'Warning: Cannot auto-attach to container {name!r} in non-running state',
+            file=sys.stderr,
+        )
+    if auto_replace:
+        return 'replace'
+    if auto_attach is False and auto_replace is False and not is_interactive:
+        return None
+    if yes_no_prompt('Replace stopped instance?', False, is_interactive):
+        return 'replace'
     return None
 
 
@@ -2372,35 +2442,14 @@ def handle_container_state(ns, global_flags=None, podman_path: str = 'podman'):
     auto_replace = ns.get('run.auto_replace')
 
     if state == 'running':
-        if auto_attach:
-            return 'attach'
-        if auto_replace:
-            return 'replace'
-        if auto_attach is False and auto_replace is False:
-            return None
-        if yes_no_prompt('Attach to already running instance?', True, is_interactive):
-            return 'attach'
-        if yes_no_prompt('Replace already running instance?', False, is_interactive):
-            return 'replace'
-        return None
-
-    # Stopped — cannot attach to a non-running container.
-    if auto_attach:
-        print(
-            f'Warning: Cannot auto-attach to container {name!r} in non-running state',
-            file=sys.stderr,
-        )
-    if auto_replace:
-        return 'replace'
-    if auto_attach is False and auto_replace is False and not is_interactive:
-        return None
-    if yes_no_prompt('Replace stopped instance?', False, is_interactive):
-        return 'replace'
-    return None
+        return _handle_running_state(auto_attach, auto_replace, is_interactive)
+    return _handle_stopped_state(name, auto_attach, auto_replace, is_interactive)
 
 
 def query_container_info(
-    name: str, global_flags=None, podman_path: str = 'podman',
+    name: str,
+    global_flags=None,
+    podman_path: str = 'podman',
 ) -> Tuple[str, str]:
     """Read PODRUN_WORKDIR and PODRUN_OVERLAYS from container env via inspect.
 
@@ -2423,8 +2472,11 @@ def query_container_info(
 
 
 def build_podman_exec_args(
-    ns, name: str, container_workdir: str = '',
-    trailing_args=None, explicit_command=None,
+    ns,
+    name: str,
+    container_workdir: str = '',
+    trailing_args=None,
+    explicit_command=None,
 ) -> List[str]:
     """Build ``podman exec`` args for attaching to a running container.
 
@@ -2454,7 +2506,9 @@ def build_podman_exec_args(
     args.append(name)
 
     # Determine command: explicit_command ('--' args) > trailing_args after image > interactive
-    command = explicit_command or (trailing_args[1:] if trailing_args and len(trailing_args) > 1 else [])
+    command = explicit_command or (
+        trailing_args[1:] if trailing_args and len(trailing_args) > 1 else []
+    )
     if command:
         args.extend(command)
     else:
@@ -2495,7 +2549,9 @@ def build_run_command(result: ParseResult, podman_path: str = 'podman') -> List[
     return cmd
 
 
-def build_overlay_run_command(result: ParseResult, podman_path: str = 'podman') -> Tuple[List[str], List[str]]:
+def build_overlay_run_command(  # noqa: C901
+    result: ParseResult, podman_path: str = 'podman'
+) -> Tuple[List[str], List[str]]:
     """Generate entrypoints, build overlay args, and return the full run command.
 
     Returns ``(cmd, caps_to_drop)`` where *cmd* is the complete
@@ -2524,7 +2580,9 @@ def build_overlay_run_command(result: ParseResult, podman_path: str = 'podman') 
         entrypoint_path = generate_run_entrypoint(ns, caps_to_drop=compute_caps_to_drop(pt))
         rc_path = generate_rc_sh(ns)
         exec_entry_path = generate_exec_entrypoint()
-        user_args, caps_to_drop = _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path)
+        user_args, caps_to_drop = _user_overlay_args(
+            ns, pt, entrypoint_path, rc_path, exec_entry_path
+        )
         overlay_args.extend(user_args)
         if alt_entrypoint:
             overlay_args.append(f'--env=PODRUN_ALT_ENTRYPOINT={alt_entrypoint}')
@@ -2591,7 +2649,7 @@ def print_help(subcmd, argv, podman_path):
     if subcmd == 'run':
         podman_cmd = f'{shlex.quote(podman_path)} run --help'
         replace_from, replace_to = 'podman run', 'podrun run'
-        podrun_parser = build_root_parser()._run_subparser
+        podrun_parser = build_root_parser()._run_subparser  # type: ignore[attr-defined]
     else:
         podman_cmd = f'{shlex.quote(podman_path)} --help'
         replace_from, replace_to = 'podman', 'podrun'
@@ -2682,19 +2740,324 @@ def _scrape_podman_help(podman_path, subcmd=None):
     return value_flags, bool_flags, subcommands
 
 
+# ---------------------------------------------------------------------------
+# Completion generators
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Completion generators (stub — lift from podrun1 in a later phase)
-# ---------------------------------------------------------------------------
+
+def _completion_data(flags: Optional[PodmanFlags] = None) -> dict:
+    """Build completion metadata by introspecting argparse parsers.
+
+    Returns a dict with:
+    - ``flags_str`` — space-joined list of all podrun-specific flags
+    - ``value_flags_str`` — subset that take values
+    - ``subcmds_str`` — empty string (no podrun subcommands in podrun2)
+    """
+    if flags is None:
+        flags = load_podman_flags()
+    parser = build_root_parser(flags)
+    run_parser = parser._run_subparser  # type: ignore[attr-defined]
+
+    all_flags = []
+    value_flags = []
+    _SKIP_ACTIONS = (argparse._HelpAction, _PassthroughAction)
+    _BOOL_ACTIONS = ('store_true', 'store_false', 'store_const')
+
+    for p in (parser, run_parser):
+        for action in p._actions:
+            if isinstance(action, _SKIP_ACTIONS):
+                continue
+            # Only podrun-specific flags (root.* or run.* dest)
+            dest = getattr(action, 'dest', '')
+            if not (dest.startswith('root.') or dest.startswith('run.')):
+                continue
+            for opt in action.option_strings:
+                all_flags.append(opt)
+                # Classify: value flag if it's not a boolean-style action
+                action_name = getattr(action, 'action', None)
+                if action_name is None:
+                    # Real Action subclass — check the class name
+                    cls_name = type(action).__name__
+                    if cls_name not in (
+                        '_StoreTrueAction',
+                        '_StoreFalseAction',
+                        '_StoreConstAction',
+                    ):
+                        value_flags.append(opt)
+                elif action_name not in _BOOL_ACTIONS:
+                    value_flags.append(opt)
+
+    return {
+        'flags_str': ' '.join(sorted(all_flags)),
+        'value_flags_str': ' '.join(sorted(value_flags)),
+        'subcmds_str': '',
+    }
+
+
+def _generate_bash_completion() -> str:
+    """Return a bash completion script that wraps podman's Cobra completions."""
+    cd = _completion_data()
+    flags_str = cd['flags_str']
+    value_flags_str = cd['value_flags_str']
+
+    return textwrap.dedent(f"""\
+        _podrun() {{
+            local cur="${{COMP_WORDS[COMP_CWORD]}}"
+            local podrun_flags="{flags_str}"
+            local podrun_value_flags="{value_flags_str}"
+
+            # Build filtered args for podman, stripping podrun-only flags
+            local args=()
+            local has_subcmd=false
+            local i=1
+            while [ $i -lt $COMP_CWORD ]; do
+                local word="${{COMP_WORDS[$i]}}"
+                local flag_name="${{word%%=*}}"
+                # Check if this is a podrun-only flag
+                local is_podrun=false
+                for pf in $podrun_flags; do
+                    if [ "$flag_name" = "$pf" ]; then
+                        is_podrun=true
+                        break
+                    fi
+                done
+                if $is_podrun; then
+                    # Skip value for podrun value flags (space-separated form)
+                    if [[ "$word" != *=* ]]; then
+                        for vf in $podrun_value_flags; do
+                            if [ "$word" = "$vf" ]; then
+                                i=$((i + 1))
+                                break
+                            fi
+                        done
+                    fi
+                else
+                    args+=("$word")
+                    # Check if this is a subcommand (first non-flag arg)
+                    if [[ "$word" != -* ]] && ! $has_subcmd; then
+                        has_subcmd=true
+                    fi
+                fi
+                i=$((i + 1))
+            done
+
+            # Inject 'run' if no subcommand detected
+            if ! $has_subcmd; then
+                args=("run" "${{args[@]}}")
+            fi
+
+            # Call podman __completeNoDesc
+            local completions
+            completions=$(podman __completeNoDesc "${{args[@]}}" "$cur" 2>/dev/null)
+
+            local directive=0
+            local results=()
+            while IFS= read -r line; do
+                if [[ "$line" == :* ]]; then
+                    directive="${{line#:}}"
+                else
+                    if [ -n "$line" ]; then
+                        results+=("$line")
+                    fi
+                fi
+            done <<< "$completions"
+
+            # Merge podrun flags when completing flags
+            if [[ "$cur" == -* ]]; then
+                for pf in $podrun_flags; do
+                    results+=("$pf")
+                done
+            fi
+
+            mapfile -t COMPREPLY < <(compgen -W "${{results[*]}}" -- "$cur")
+
+            # Handle Cobra directives
+            if (( (directive & 2) != 0 )); then
+                compopt -o nospace
+            fi
+            if (( (directive & 4) != 0 )) && [[ "$cur" != -* || ${{#COMPREPLY[@]}} -gt 0 ]]; then
+                compopt +o default
+            fi
+        }}
+        complete -o default -F _podrun podrun
+    """)
+
+
+def _generate_zsh_completion() -> str:
+    """Return a zsh completion script that wraps podman's Cobra completions."""
+    cd = _completion_data()
+    flags_str = cd['flags_str']
+    value_flags_str = cd['value_flags_str']
+
+    return textwrap.dedent(f"""\
+        #compdef podrun
+
+        _podrun() {{
+            local podrun_flags=({flags_str})
+            local podrun_value_flags=({value_flags_str})
+
+            # Build filtered args for podman, stripping podrun-only flags
+            local args=()
+            local has_subcmd=false
+            local i=2
+            while (( i < CURRENT )); do
+                local word="${{words[$i]}}"
+                local flag_name="${{word%%=*}}"
+                local is_podrun=false
+                for pf in "${{podrun_flags[@]}}"; do
+                    if [[ "$flag_name" = "$pf" ]]; then
+                        is_podrun=true
+                        break
+                    fi
+                done
+                if $is_podrun; then
+                    if [[ "$word" != *=* ]]; then
+                        for vf in "${{podrun_value_flags[@]}}"; do
+                            if [[ "$word" = "$vf" ]]; then
+                                (( i++ ))
+                                break
+                            fi
+                        done
+                    fi
+                else
+                    args+=("$word")
+                    if [[ "$word" != -* ]] && ! $has_subcmd; then
+                        has_subcmd=true
+                    fi
+                fi
+                (( i++ ))
+            done
+
+            if ! $has_subcmd; then
+                args=("run" "${{args[@]}}")
+            fi
+
+            local cur="${{words[$CURRENT]}}"
+            local completions
+            completions=$(podman __complete "${{args[@]}}" "$cur" 2>/dev/null)
+
+            local directive=0
+            local -a results
+            local -a descriptions
+            while IFS=$'\\t' read -r comp desc; do
+                if [[ "$comp" == :* ]]; then
+                    directive="${{comp#:}}"
+                else
+                    if [[ -n "$comp" ]]; then
+                        if [[ -n "$desc" ]]; then
+                            results+=("$comp")
+                            descriptions+=("$comp:$desc")
+                        else
+                            results+=("$comp")
+                            descriptions+=("$comp")
+                        fi
+                    fi
+                fi
+            done <<< "$completions"
+
+            # Merge podrun flags when completing flags
+            if [[ "$cur" == -* ]]; then
+                for pf in "${{podrun_flags[@]}}"; do
+                    results+=("$pf")
+                    descriptions+=("$pf:podrun option")
+                done
+            fi
+
+            _describe 'completions' descriptions
+
+            if (( (directive & 2) != 0 )); then
+                compstate[insert]=unambiguous
+            fi
+        }}
+
+        compdef _podrun podrun
+    """)
+
+
+def _generate_fish_completion() -> str:
+    """Return a fish completion script that wraps podman's Cobra completions."""
+    cd = _completion_data()
+    flags_str = cd['flags_str']
+    value_flags_str = cd['value_flags_str']
+
+    return textwrap.dedent(f"""\
+        function __podrun_complete
+            set -l cmdline (commandline -opc)
+            set -l cur (commandline -ct)
+
+            set -l podrun_flags {flags_str}
+            set -l podrun_value_flags {value_flags_str}
+
+            # Build filtered args for podman, stripping podrun-only flags
+            set -l args
+            set -l has_subcmd false
+            set -l skip_next false
+            for i in (seq 2 (count $cmdline))
+                if test "$skip_next" = true
+                    set skip_next false
+                    continue
+                end
+                set -l word $cmdline[$i]
+                set -l flag_name (string split -m1 '=' -- $word)[1]
+                set -l is_podrun false
+                for pf in $podrun_flags
+                    if test "$flag_name" = "$pf"
+                        set is_podrun true
+                        break
+                    end
+                end
+                if test "$is_podrun" = true
+                    if not string match -q '*=*' -- $word
+                        for vf in $podrun_value_flags
+                            if test "$word" = "$vf"
+                                set skip_next true
+                                break
+                            end
+                        end
+                    end
+                else
+                    set -a args $word
+                    if not string match -q '-*' -- $word; and test "$has_subcmd" = false
+                        set has_subcmd true
+                    end
+                end
+            end
+
+            if test "$has_subcmd" = false
+                set args run $args
+            end
+
+            # Call podman __complete
+            set -l completions (podman __complete $args "$cur" 2>/dev/null)
+            for line in $completions
+                if string match -qr '^:' -- $line
+                    continue
+                end
+                if test -n "$line"
+                    echo $line
+                end
+            end
+
+            # Merge podrun flags when completing flags
+            if string match -q '-*' -- $cur
+                for pf in $podrun_flags
+                    echo -e "$pf\\tpodrun option"
+                end
+            end
+        end
+
+        complete -c podrun -f -a '(__podrun_complete)'
+    """)
 
 
 def print_completion(shell: str) -> None:
-    """Print shell completion script and exit.
-
-    Stub for Phase 1.1.  Full completion scripts (bash/zsh/fish) will be
-    lifted from podrun1 in a later phase.
-    """
-    print(f'# TODO: {shell} completion for podrun — lift from podrun1')
+    """Print shell completion script and exit."""
+    generators = {
+        'bash': _generate_bash_completion,
+        'zsh': _generate_zsh_completion,
+        'fish': _generate_fish_completion,
+    }
+    print(generators[shell]())
     sys.exit(0)
 
 
@@ -2747,7 +3110,59 @@ def _fuse_overlayfs_fixup(ns, cmd):
 # ---------------------------------------------------------------------------
 
 
-def _handle_run(result, podman_path):
+def _exec_attach(result, ns, global_flags, podman_path):
+    """Handle the 'attach' action — exec into a running container."""
+    name = ns['run.name']
+    container_workdir, container_overlays = query_container_info(
+        name,
+        global_flags=global_flags,
+        podman_path=podman_path,
+    )
+    if 'user' not in container_overlays.split(','):
+        print(
+            f'Error: container {name!r} was not created with podrun user overlay.\n'
+            f'Cannot auto-attach: exec-entrypoint.sh is not present in the container.\n'
+            f'Use --auto-replace instead to replace the container, or remove it with:\n'
+            f'  podman rm {name}',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    cmd = (
+        [podman_path]
+        + global_flags
+        + build_podman_exec_args(
+            ns,
+            name,
+            container_workdir=container_workdir,
+            trailing_args=result.trailing_args,
+            explicit_command=result.explicit_command,
+        )
+    )
+    if ns.get('root.print_cmd'):
+        print(shlex.join(cmd))
+        sys.exit(0)
+    os.execvpe(podman_path, cmd, os.environ.copy())
+
+
+def _filter_conflicting_exports(ns):
+    """Remove exports whose container path is already mounted via -v."""
+    pt = ns.get('run.passthrough_args') or []
+    mount_dests = _volume_mount_destinations(pt)
+    filtered = []
+    for entry in ns['run.export']:
+        cp, _, _ = _parse_export(entry)
+        cp = re.sub(r'^~', f'/home/{UNAME}', cp)
+        if cp in mount_dests:
+            print(
+                f'Warning: export {entry!r} skipped — {cp} already mounted via -v',
+                file=sys.stderr,
+            )
+        else:
+            filtered.append(entry)
+    ns['run.export'] = filtered
+
+
+def _handle_run(result, podman_path):  # noqa: C901
     """Handle the ``run`` subcommand: state → entrypoints → overlays → exec.
 
     This is the main orchestration function.  ``resolve_config()`` and
@@ -2789,7 +3204,11 @@ def _handle_run(result, podman_path):
 
     # Container state management
     # For --print-cmd, allow prompts so the printed command reflects the user's choice.
-    if ns.get('root.print_cmd') and not ns.get('run.auto_attach') and not ns.get('run.auto_replace'):
+    if (
+        ns.get('root.print_cmd')
+        and not ns.get('run.auto_attach')
+        and not ns.get('run.auto_replace')
+    ):
         ns['run.auto_attach'] = None
         ns['run.auto_replace'] = None
     action = handle_container_state(ns, global_flags=global_flags, podman_path=podman_path)
@@ -2806,51 +3225,13 @@ def _handle_run(result, podman_path):
         action = 'run'
 
     if action == 'attach':
-        name = ns['run.name']
-        container_workdir, container_overlays = query_container_info(
-            name, global_flags=global_flags, podman_path=podman_path,
-        )
-        if 'user' not in container_overlays.split(','):
-            print(
-                f'Error: container {name!r} was not created with podrun user overlay.\n'
-                f'Cannot auto-attach: exec-entrypoint.sh is not present in the container.\n'
-                f'Use --auto-replace instead to replace the container, or remove it with:\n'
-                f'  podman rm {name}',
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        cmd = (
-            [podman_path]
-            + global_flags
-            + build_podman_exec_args(
-                ns, name, container_workdir=container_workdir,
-                trailing_args=result.trailing_args,
-                explicit_command=result.explicit_command,
-            )
-        )
-        if ns.get('root.print_cmd'):
-            print(shlex.join(cmd))
-            sys.exit(0)
-        os.execvpe(podman_path, cmd, os.environ.copy())
+        _exec_attach(result, ns, global_flags, podman_path)
 
     # action == 'run'
 
     # Filter exports that conflict with existing volume mounts
     if ns.get('run.user_overlay') and (ns.get('run.export') or []):
-        pt = ns.get('run.passthrough_args') or []
-        mount_dests = _volume_mount_destinations(pt)
-        filtered = []
-        for entry in ns['run.export']:
-            cp, _, _ = _parse_export(entry)
-            cp = re.sub(r'^~', f'/home/{UNAME}', cp)
-            if cp in mount_dests:
-                print(
-                    f'Warning: export {entry!r} skipped — {cp} already mounted via -v',
-                    file=sys.stderr,
-                )
-            else:
-                filtered.append(entry)
-        ns['run.export'] = filtered
+        _filter_conflicting_exports(ns)
 
     # Warn about missing subuid/subgid ranges
     if ns.get('run.user_overlay'):
@@ -2861,7 +3242,9 @@ def _handle_run(result, podman_path):
         store_path = pathlib.Path(ns['root.local_store']).resolve()
         graphroot = str(store_path / 'graphroot')
         runroot = _runroot_path(graphroot)
-        sock = _ensure_store_service(graphroot, runroot, store_dir=str(store_path), podman_path=podman_path)
+        sock = _ensure_store_service(
+            graphroot, runroot, store_dir=str(store_path), podman_path=podman_path
+        )
         ns['run.store_socket'] = sock
 
     # Build the full run command with overlay injection

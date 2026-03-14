@@ -8,7 +8,6 @@ _is_nested, and _handle_run store-service integration.
 import os
 import pathlib
 import signal
-import subprocess
 import threading
 
 import pytest
@@ -54,6 +53,7 @@ class TestStoreHash:
         graphroot = '/tmp/test-store/graphroot'
         h = _store_hash(graphroot)
         from podrun.podrun2 import _runroot_path, _PODRUN_STORES_DIR
+
         assert _runroot_path(graphroot) == f'{_PODRUN_STORES_DIR}/{h}'
 
 
@@ -68,6 +68,7 @@ class TestStoreSocketPath:
 
     def test_under_stores_dir(self):
         from podrun.podrun2 import _PODRUN_STORES_DIR
+
         assert _store_socket_path('/gr').startswith(_PODRUN_STORES_DIR)
 
     def test_unique_per_graphroot(self):
@@ -156,6 +157,7 @@ class TestWaitForSocket:
 
         def create_later():
             import time
+
             time.sleep(0.2)
             pathlib.Path(sock).touch()
 
@@ -259,7 +261,9 @@ class TestEnsureStoreService:
 
         monkeypatch.setattr(podrun2_mod, '_socket_is_alive', lambda s, p: True)
         popen_called = []
-        monkeypatch.setattr(podrun2_mod.subprocess, 'Popen', lambda cmd, **kw: popen_called.append(1))
+        monkeypatch.setattr(
+            podrun2_mod.subprocess, 'Popen', lambda cmd, **kw: popen_called.append(1)
+        )
 
         sock = podrun2_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
         assert sock == _store_socket_path(graphroot)
@@ -328,7 +332,9 @@ class TestEnsureStoreService:
 
         monkeypatch.setattr(podrun2_mod.subprocess, 'Popen', mock_popen)
 
-        podrun2_mod._ensure_store_service(graphroot, runroot, store_dir=store_dir, podman_path='/usr/bin/podman')
+        podrun2_mod._ensure_store_service(
+            graphroot, runroot, store_dir=store_dir, podman_path='/usr/bin/podman'
+        )
         env = popen_kwargs[0]['env']
         assert env['CONTAINERS_REGISTRIES_CONF'] == str(reg_conf)
 
@@ -343,26 +349,12 @@ class TestIsNestedHardened:
 
     def _real_is_nested(self):
         """Call the real _is_nested from the module source."""
-        # Re-import to get the actual function, not the monkeypatched lambda
-        import importlib
-        mod = importlib.import_module('podrun.podrun2')
-        # Access the real function from the module's __dict__ before monkeypatch
-        # We need the original — stored as _is_nested in the real module code
-        import types
-        source_code = (
-            'def _is_nested():\n'
-            '    import os\n'
-            '    from podrun.podrun2 import PODRUN_CONTAINER_HOST, PODRUN_SOCKET_PATH\n'
-            '    if os.environ.get("PODRUN_CONTAINER"):\n'
-            '        return True\n'
-            '    if os.environ.get("CONTAINER_HOST") == PODRUN_CONTAINER_HOST and os.path.exists(PODRUN_SOCKET_PATH):\n'
-            '        return True\n'
-            '    return False\n'
-        )
-        # Simpler: just inline the logic
+        # Inline the logic directly instead of going through the monkeypatched module
         if os.environ.get('PODRUN_CONTAINER'):
             return True
-        if os.environ.get('CONTAINER_HOST') == PODRUN_CONTAINER_HOST and os.path.exists(PODRUN_SOCKET_PATH):
+        if os.environ.get('CONTAINER_HOST') == PODRUN_CONTAINER_HOST and os.path.exists(
+            PODRUN_SOCKET_PATH
+        ):
             return True
         return False
 
@@ -450,11 +442,15 @@ class TestHandleRunStoreService:
             'root.print_cmd': True,
             'root.local_store': None,
         }
-        result = type('Result', (), {
-            'ns': ns,
-            'trailing_args': ['ubuntu:latest'],
-            'explicit_command': None,
-        })()
+        result = type(
+            'Result',
+            (),
+            {
+                'ns': ns,
+                'trailing_args': ['ubuntu:latest'],
+                'explicit_command': None,
+            },
+        )()
 
         # Stub out functions that would fail without real podman
         monkeypatch.setattr(podrun2_mod, 'handle_container_state', lambda ns, **kw: 'run')
@@ -491,7 +487,8 @@ class TestHandleRunStoreService:
 
         ensure_calls = []
         monkeypatch.setattr(
-            podrun2_mod, '_ensure_store_service',
+            podrun2_mod,
+            '_ensure_store_service',
             lambda *a, **kw: ensure_calls.append(1) or '/tmp/fake.sock',
         )
 
@@ -507,7 +504,8 @@ class TestHandleRunStoreService:
 
         ensure_calls = []
         monkeypatch.setattr(
-            podrun2_mod, '_ensure_store_service',
+            podrun2_mod,
+            '_ensure_store_service',
             lambda *a, **kw: ensure_calls.append(1) or '/tmp/fake.sock',
         )
 

@@ -1,6 +1,5 @@
 """Tests for Phase 2.4 — container state + command assembly."""
 
-import shutil
 import subprocess
 
 import pytest
@@ -11,7 +10,6 @@ from podrun.podrun2 import (
     PODRUN_ENTRYPOINT_PATH,
     PODRUN_EXEC_ENTRY_PATH,
     PODRUN_RC_PATH,
-    _OVERLAY_FIELDS,
     build_overlay_run_command,
     build_podman_exec_args,
     detect_container_state,
@@ -41,69 +39,129 @@ class TestDetectContainerState:
         assert detect_container_state(None) is None
 
     def test_running(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='running', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='running',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') == 'running'
 
     def test_exited(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='exited', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='exited',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') == 'stopped'
 
     def test_created(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='created', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='created',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') == 'stopped'
 
     def test_paused(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='paused', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='paused',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') == 'stopped'
 
     def test_dead(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='dead', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='dead',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') == 'stopped'
 
     def test_inspect_fails(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout='', stderr='Error',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout='',
+                stderr='Error',
+            ),
+        )
         assert detect_container_state('mycontainer') is None
 
     def test_unknown_status(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='removing', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='removing',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') is None
 
     def test_global_flags_in_command(self, monkeypatch):
         captured = {}
+
         def fake_run(cmd):
             captured['cmd'] = cmd
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='running', stderr='')
+
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run)
         detect_container_state('myc', global_flags=['--root=/tmp/root'])
         assert '--root=/tmp/root' in captured['cmd']
 
     def test_custom_podman_path(self, monkeypatch):
         captured = {}
+
         def fake_run(cmd):
             captured['cmd'] = cmd
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='running', stderr='')
+
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run)
         detect_container_state('myc', podman_path='/usr/local/bin/podman')
         assert '/usr/local/bin/podman' in captured['cmd']
 
     def test_whitespace_stripped(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='  running  \n', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='  running  \n',
+                stderr='',
+            ),
+        )
         assert detect_container_state('mycontainer') == 'running'
 
 
@@ -144,7 +202,9 @@ class TestHandleContainerState:
     def test_running_prompt_attach_no_replace_yes(self, monkeypatch):
         monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
         prompts = iter([False, True])
-        monkeypatch.setattr(podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: next(prompts))
+        monkeypatch.setattr(
+            podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: next(prompts)
+        )
         ns = {'run.name': 'myc'}
         assert handle_container_state(ns) == 'replace'
 
@@ -199,34 +259,57 @@ class TestHandleContainerState:
 class TestQueryContainerInfo:
     def test_extracts_workdir_and_overlays(self, monkeypatch):
         stdout = 'FOO=bar\nPODRUN_WORKDIR=/work\nPODRUN_OVERLAYS=user,host\nBAZ=qux\n'
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=stdout, stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=stdout,
+                stderr='',
+            ),
+        )
         workdir, overlays = query_container_info('myc')
         assert workdir == '/work'
         assert overlays == 'user,host'
 
     def test_missing_vars_return_empty(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='FOO=bar\n', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='FOO=bar\n',
+                stderr='',
+            ),
+        )
         workdir, overlays = query_container_info('myc')
         assert workdir == ''
         assert overlays == ''
 
     def test_inspect_fails(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout='', stderr='Error',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout='',
+                stderr='Error',
+            ),
+        )
         workdir, overlays = query_container_info('myc')
         assert workdir == ''
         assert overlays == ''
 
     def test_global_flags_in_command(self, monkeypatch):
         captured = {}
+
         def fake_run(cmd):
             captured['cmd'] = cmd
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run)
         query_container_info('myc', global_flags=['--root=/tmp/root'])
         assert '--root=/tmp/root' in captured['cmd']
@@ -234,9 +317,16 @@ class TestQueryContainerInfo:
     def test_workdir_with_equals(self, monkeypatch):
         """PODRUN_WORKDIR value may contain '='."""
         stdout = 'PODRUN_WORKDIR=/work=space\n'
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=stdout, stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=stdout,
+                stderr='',
+            ),
+        )
         workdir, _ = query_container_info('myc')
         assert workdir == '/work=space'
 
@@ -318,7 +408,8 @@ class TestBuildPodmanExecArgs:
     def test_explicit_command_priority(self):
         """explicit_command takes priority over trailing_args command."""
         args = build_podman_exec_args(
-            {}, 'myc',
+            {},
+            'myc',
             trailing_args=['alpine', 'echo', 'hi'],
             explicit_command=['bash'],
         )
@@ -437,7 +528,7 @@ class TestBuildOverlayRunCommand:
         cmd, _ = build_overlay_run_command(r)
         assert '--' in cmd
         sep_idx = cmd.index('--')
-        assert cmd[sep_idx + 1:] == ['echo', 'hi']
+        assert cmd[sep_idx + 1 :] == ['echo', 'hi']
 
     def test_privileged_drops_no_caps(self):
         r = self._parse_and_resolve(['run', '--user-overlay', '--privileged', 'alpine'])

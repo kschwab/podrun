@@ -1,9 +1,7 @@
 """Tests for Phase 2.1 — constants, utilities, and parsing helpers."""
 
 import os
-import pathlib
 import stat
-import textwrap
 
 import pytest
 
@@ -55,7 +53,12 @@ class TestConstants:
         assert os.path.isabs(PODRUN_TMP)
 
     def test_container_paths_are_absolute(self):
-        for p in (PODRUN_RC_PATH, PODRUN_ENTRYPOINT_PATH, PODRUN_EXEC_ENTRY_PATH, PODRUN_READY_PATH):
+        for p in (
+            PODRUN_RC_PATH,
+            PODRUN_ENTRYPOINT_PATH,
+            PODRUN_EXEC_ENTRY_PATH,
+            PODRUN_READY_PATH,
+        ):
             assert p.startswith('/'), f'{p} is not absolute'
 
     def test_bootstrap_caps_non_empty(self):
@@ -295,7 +298,7 @@ class TestVolumeMountDestinations:
         assert dests == {'/b', '/d'}
 
     def test_tilde_dest_expanded(self):
-        dests = _volume_mount_destinations([f'-v=/host:~/subdir'])
+        dests = _volume_mount_destinations(['-v=/host:~/subdir'])
         assert f'/home/{UNAME}/subdir' in dests
 
     def test_empty(self):
@@ -309,23 +312,23 @@ class TestVolumeMountDestinations:
 
 class TestExpandVolumeTilde:
     def test_source_tilde(self):
-        result = _expand_volume_tilde([f'-v=~/src:/dst'])
+        result = _expand_volume_tilde(['-v=~/src:/dst'])
         assert result == [f'-v={USER_HOME}/src:/dst']
 
     def test_dest_tilde(self):
-        result = _expand_volume_tilde([f'-v=/src:~/dst'])
+        result = _expand_volume_tilde(['-v=/src:~/dst'])
         assert result == [f'-v=/src:/home/{UNAME}/dst']
 
     def test_both_tildes(self):
-        result = _expand_volume_tilde([f'-v=~/src:~/dst'])
+        result = _expand_volume_tilde(['-v=~/src:~/dst'])
         assert result == [f'-v={USER_HOME}/src:/home/{UNAME}/dst']
 
     def test_long_form(self):
-        result = _expand_volume_tilde([f'--volume=~/src:/dst'])
+        result = _expand_volume_tilde(['--volume=~/src:/dst'])
         assert result == [f'--volume={USER_HOME}/src:/dst']
 
     def test_with_options(self):
-        result = _expand_volume_tilde([f'-v=~/src:~/dst:ro'])
+        result = _expand_volume_tilde(['-v=~/src:~/dst:ro'])
         assert result == [f'-v={USER_HOME}/src:/home/{UNAME}/dst:ro']
 
     def test_non_volume_unchanged(self):
@@ -337,7 +340,7 @@ class TestExpandVolumeTilde:
         assert result == ['-v=/a:/b']
 
     def test_single_part(self):
-        result = _expand_volume_tilde([f'-v=~/only'])
+        result = _expand_volume_tilde(['-v=~/only'])
         assert result == [f'-v={USER_HOME}/only']
 
 

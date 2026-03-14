@@ -15,7 +15,6 @@ from podrun.podrun2 import (
     PODRUN_RC_PATH,
     UID,
     UNAME,
-    USER_HOME,
     _DOTFILES_MOUNT,
     _OVERLAY_FIELDS,
     _dot_files_overlay_args,
@@ -198,6 +197,7 @@ class TestInteractiveOverlayArgs:
 class TestHostOverlayArgs:
     def test_hostname(self):
         import platform
+
         args = _host_overlay_args({}, [])
         hostname_args = [a for a in args if a.startswith('--hostname=')]
         assert len(hostname_args) == 1
@@ -309,8 +309,11 @@ class TestX11Args:
     def test_x11_with_socket(self, monkeypatch):
         monkeypatch.setattr(pathlib.Path, 'exists', lambda self: str(self) == '/tmp/.X11-unix')
         monkeypatch.setattr(
-            podrun2_mod, 'run_os_cmd',
-            lambda cmd: subprocess.CompletedProcess(args=cmd, returncode=0, stdout='/home/user/.Xauthority', stderr=''),
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='/home/user/.Xauthority', stderr=''
+            ),
         )
         args = _x11_args({})
         assert '--env=DISPLAY' in args
@@ -339,10 +342,12 @@ class TestPodmanRemoteArgs:
         monkeypatch.setattr(podrun2_mod, 'UID', 99999)
         # Patch to make the fallback path point to our temp file
         real_exists = pathlib.Path.exists
+
         def fake_exists(self):
             if 'podman.sock' in str(self) and '99999' in str(self):
                 return False
             return real_exists(self)
+
         monkeypatch.setattr(pathlib.Path, 'exists', fake_exists)
         args = _podman_remote_args({})
         # No store socket and no systemd socket → warning

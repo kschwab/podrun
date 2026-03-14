@@ -1,7 +1,6 @@
 """Tests for Phase 2.2 — entrypoint generation (run, rc, exec)."""
 
 import os
-import re
 import stat
 
 import pytest
@@ -10,8 +9,6 @@ import podrun.podrun2 as podrun2_mod
 from podrun.podrun2 import (
     BOOTSTRAP_CAPS,
     GID,
-    PODRUN_ENTRYPOINT_PATH,
-    PODRUN_EXEC_ENTRY_PATH,
     PODRUN_RC_PATH,
     PODRUN_READY_PATH,
     UID,
@@ -169,9 +166,13 @@ class TestGenerateRunEntrypoint:
         assert '# Export' not in content
 
     def test_export_strict_mode(self):
-        path = generate_run_entrypoint(_default_ns(**{
-            'run.export': ['/data:/host/data'],
-        }))
+        path = generate_run_entrypoint(
+            _default_ns(
+                **{
+                    'run.export': ['/data:/host/data'],
+                }
+            )
+        )
         with open(path) as f:
             content = f.read()
         assert '# Export (mount): /data' in content
@@ -179,21 +180,29 @@ class TestGenerateRunEntrypoint:
         assert 'rm -rf' in content
 
     def test_export_copy_only(self):
-        path = generate_run_entrypoint(_default_ns(**{
-            'run.export': ['/data:/host/data:0'],
-        }))
+        path = generate_run_entrypoint(
+            _default_ns(
+                **{
+                    'run.export': ['/data:/host/data:0'],
+                }
+            )
+        )
         with open(path) as f:
             content = f.read()
         assert '# Export (copy): /data' in content
         # copy-only should NOT have rm/symlink
-        lines = [l for l in content.split('\n') if '# Export' in l or 'rm -rf' in l]
+        lines = [ln for ln in content.split('\n') if '# Export' in ln or 'rm -rf' in ln]
         # There should be a copy export comment but no rm -rf for it
-        assert any('copy' in l for l in lines)
+        assert any('copy' in ln for ln in lines)
 
     def test_multiple_exports_sorted(self):
-        path = generate_run_entrypoint(_default_ns(**{
-            'run.export': ['/z:/host/z', '/a:/host/a'],
-        }))
+        path = generate_run_entrypoint(
+            _default_ns(
+                **{
+                    'run.export': ['/z:/host/z', '/a:/host/a'],
+                }
+            )
+        )
         with open(path) as f:
             content = f.read()
         idx_a = content.index('# Export (mount): /a')
@@ -242,12 +251,8 @@ class TestGenerateRcSh:
                     args=cmd, returncode=0, stdout='Test CPU', stderr=''
                 )
             if 'processor' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd, returncode=0, stdout='4', stderr=''
-                )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout='', stderr=''
-            )
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='4', stderr='')
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
 
         monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
 

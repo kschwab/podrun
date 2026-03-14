@@ -8,22 +8,18 @@ import shlex
 import shutil
 
 from podrun.podrun2 import (
-    PodmanFlags,
     _PODRUN_STORES_DIR,
     _apply_store,
     _default_store_dir,
     _resolve_store,
     _runroot_path,
     _scrape_podman_help,
-    _stop_store_service,
     _store_destroy,
     _store_init,
     _store_print_info,
-    _is_nested,
     build_passthrough_command,
     build_root_parser,
     build_run_command,
-    load_podman_flags,
     main,
     parse_args,
     print_completion,
@@ -1018,22 +1014,21 @@ class TestCompletion:
             print_completion('bash')
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        assert 'bash' in out
+        assert '_podrun' in out
 
     def test_completion_zsh_exits(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
             print_completion('zsh')
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        assert 'zsh' in out
+        assert '#compdef podrun' in out
 
     def test_completion_fish_exits(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
             print_completion('fish')
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        assert 'fish' in out
-
+        assert '__podrun_complete' in out
 
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1104,7 @@ class TestMain:
             main(['--completion', 'bash'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        assert 'bash' in out
+        assert '_podrun' in out
 
     def test_print_cmd_run(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -1238,14 +1233,14 @@ class TestPrintCmdOutput:
         assert cmd[0] == 'podman'
         assert 'run' in cmd
         img_idx = cmd.index('alpine')
-        assert cmd[img_idx + 1:] == ['bash', '-c', 'echo hi']
+        assert cmd[img_idx + 1 :] == ['bash', '-c', 'echo hi']
 
     def test_run_with_separator(self, capsys):
         cmd = self._cmd(['run', 'alpine', '--', 'bash', '-c', 'echo hi'], capsys)
         assert cmd[0] == 'podman'
         assert 'run' in cmd
         sep_idx = cmd.index('--')
-        assert cmd[sep_idx + 1:] == ['bash', '-c', 'echo hi']
+        assert cmd[sep_idx + 1 :] == ['bash', '-c', 'echo hi']
 
     # -- multiple -e flags ---------------------------------------------------
 
@@ -1272,7 +1267,8 @@ class TestPrintCmdOutput:
 
     def test_multiple_volume(self, capsys):
         cmd = self._cmd(
-            ['run', '-v', '/a:/b', '-v', '/c:/d', '-v', '/e:/f:ro', 'alpine'], capsys,
+            ['run', '-v', '/a:/b', '-v', '/c:/d', '-v', '/e:/f:ro', 'alpine'],
+            capsys,
         )
         assert cmd[0] == 'podman'
         assert 'run' in cmd
@@ -1286,7 +1282,8 @@ class TestPrintCmdOutput:
 
     def test_volume_long_form(self, capsys):
         cmd = self._cmd(
-            ['run', '--volume', '/a:/b', '--volume', '/c:/d', 'alpine'], capsys,
+            ['run', '--volume', '/a:/b', '--volume', '/c:/d', 'alpine'],
+            capsys,
         )
         assert cmd[0] == 'podman'
         assert 'run' in cmd
@@ -1300,12 +1297,23 @@ class TestPrintCmdOutput:
     # -- mixed env + volume + boolean flags ----------------------------------
 
     def test_env_volume_rm_privileged(self, capsys):
-        cmd = self._cmd([
-            'run', '--rm', '--privileged',
-            '-e', 'A=1', '-e', 'B=2',
-            '-v', '/host:/ctr', '-v', '/x:/y:ro',
-            'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                'run',
+                '--rm',
+                '--privileged',
+                '-e',
+                'A=1',
+                '-e',
+                'B=2',
+                '-v',
+                '/host:/ctr',
+                '-v',
+                '/x:/y:ro',
+                'alpine',
+            ],
+            capsys,
+        )
         run_idx = cmd.index('run')
         alpine_idx = cmd.index('alpine')
         # All flags between 'run' and image
@@ -1328,9 +1336,18 @@ class TestPrintCmdOutput:
         assert cmd.index('--name=myc') < cmd.index('alpine')
 
     def test_name_with_passthrough_flags(self, capsys):
-        cmd = self._cmd([
-            'run', '--name', 'myc', '--rm', '-e', 'A=1', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                'run',
+                '--name',
+                'myc',
+                '--rm',
+                '-e',
+                'A=1',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--name=myc' in cmd
         assert '--rm' in cmd
         assert '-e' in cmd
@@ -1351,9 +1368,18 @@ class TestPrintCmdOutput:
         assert cmd.index('--remote') < cmd.index('run')
 
     def test_multiple_global_flags(self, capsys):
-        cmd = self._cmd([
-            '--root', '/x', '--log-level', 'debug', '--remote', 'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--root',
+                '/x',
+                '--log-level',
+                'debug',
+                '--remote',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         run_idx = cmd.index('run')
         for tok in ('--root', '/x', '--log-level', 'debug', '--remote'):
             assert cmd.index(tok) < run_idx
@@ -1379,7 +1405,7 @@ class TestPrintCmdOutput:
         assert cmd[0] == 'podman'
         assert 'run' in cmd
         img_idx = cmd.index('alpine')
-        assert cmd[img_idx + 1:] == ['bash', '-c', 'echo hi']
+        assert cmd[img_idx + 1 :] == ['bash', '-c', 'echo hi']
         assert 'A=1' in cmd
 
     def test_flag_like_command_args(self, capsys):
@@ -1388,24 +1414,37 @@ class TestPrintCmdOutput:
         assert cmd[0] == 'podman'
         assert 'run' in cmd
         img_idx = cmd.index('alpine')
-        assert cmd[img_idx + 1:] == ['ls', '-la', '--color=auto']
+        assert cmd[img_idx + 1 :] == ['ls', '-la', '--color=auto']
 
     def test_double_dash_command_with_flags(self, capsys):
         """Explicit '--' separator still works."""
         cmd = self._cmd(['run', '-e', 'A=1', 'alpine', '--', 'bash', '-c', 'echo'], capsys)
         sep_idx = cmd.index('--')
-        assert cmd[sep_idx + 1:] == ['bash', '-c', 'echo']
+        assert cmd[sep_idx + 1 :] == ['bash', '-c', 'echo']
 
     # -- rich combinations ---------------------------------------------------
 
     def test_global_plus_run_flags_plus_env_volume(self, capsys):
-        cmd = self._cmd([
-            '--root', '/x',
-            'run', '--name', 'dev', '--rm',
-            '-e', 'FOO=bar', '-e', 'BAZ=qux',
-            '-v', '/a:/b', '-v', '/c:/d',
-            'ubuntu:22.04',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--root',
+                '/x',
+                'run',
+                '--name',
+                'dev',
+                '--rm',
+                '-e',
+                'FOO=bar',
+                '-e',
+                'BAZ=qux',
+                '-v',
+                '/a:/b',
+                '-v',
+                '/c:/d',
+                'ubuntu:22.04',
+            ],
+            capsys,
+        )
         run_idx = cmd.index('run')
         img_idx = cmd.index('ubuntu:22.04')
         # Global before run
@@ -1419,17 +1458,34 @@ class TestPrintCmdOutput:
 
     def test_full_realistic_command(self, capsys):
         """Realistic workspace-like invocation."""
-        cmd = self._cmd([
-            '--root', '/x', '--log-level', 'debug',
-            'run', '--name', 'workspace',
-            '--rm', '--privileged',
-            '-e', 'DISPLAY=:0', '-e', 'HOME=/home/user',
-            '-v', '/home/user:/home/user',
-            '-v', '/tmp/.X11-unix:/tmp/.X11-unix',
-            '--network', 'host',
-            '-w', '/home/user/project',
-            'dev-image:latest', 'bash',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--root',
+                '/x',
+                '--log-level',
+                'debug',
+                'run',
+                '--name',
+                'workspace',
+                '--rm',
+                '--privileged',
+                '-e',
+                'DISPLAY=:0',
+                '-e',
+                'HOME=/home/user',
+                '-v',
+                '/home/user:/home/user',
+                '-v',
+                '/tmp/.X11-unix:/tmp/.X11-unix',
+                '--network',
+                'host',
+                '-w',
+                '/home/user/project',
+                'dev-image:latest',
+                'bash',
+            ],
+            capsys,
+        )
         run_idx = cmd.index('run')
         img_idx = cmd.index('dev-image:latest')
         # Global flags before run
@@ -1458,47 +1514,83 @@ class TestPrintCmdOutput:
         assert cmd[img_idx + 1] == 'bash'
 
     def test_full_with_command_and_separator(self, capsys):
-        cmd = self._cmd([
-            '--root', '/x',
-            'run', '--name', 'myc', '--rm',
-            '-e', 'A=1', '-v', '/a:/b',
-            'alpine', '--', 'sh', '-c', 'echo done',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--root',
+                '/x',
+                'run',
+                '--name',
+                'myc',
+                '--rm',
+                '-e',
+                'A=1',
+                '-v',
+                '/a:/b',
+                'alpine',
+                '--',
+                'sh',
+                '-c',
+                'echo done',
+            ],
+            capsys,
+        )
         run_idx = cmd.index('run')
         sep_idx = cmd.index('--')
         img_idx = cmd.index('alpine')
         assert cmd.index('--root') < run_idx
         assert '--name=myc' in cmd
         assert run_idx < img_idx < sep_idx
-        assert cmd[sep_idx + 1:] == ['sh', '-c', 'echo done']
+        assert cmd[sep_idx + 1 :] == ['sh', '-c', 'echo done']
 
     def test_mount_flags(self, capsys):
-        cmd = self._cmd([
-            'run',
-            '--mount', 'type=bind,src=/a,dst=/b',
-            '--mount', 'type=tmpfs,dst=/tmp',
-            'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                'run',
+                '--mount',
+                'type=bind,src=/a,dst=/b',
+                '--mount',
+                'type=tmpfs,dst=/tmp',
+                'alpine',
+            ],
+            capsys,
+        )
         assert cmd.count('--mount') == 2
         assert 'type=bind,src=/a,dst=/b' in cmd
         assert 'type=tmpfs,dst=/tmp' in cmd
 
     def test_label_and_annotation(self, capsys):
-        cmd = self._cmd([
-            'run',
-            '-l', 'app=test', '-l', 'env=dev',
-            '--annotation', 'note=hello',
-            'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                'run',
+                '-l',
+                'app=test',
+                '-l',
+                'env=dev',
+                '--annotation',
+                'note=hello',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--label=app=test' in cmd
         assert '--label=env=dev' in cmd
         assert '--annotation' in cmd
         assert 'note=hello' in cmd
 
     def test_memory_cpus_user(self, capsys):
-        cmd = self._cmd([
-            'run', '-m', '512m', '--cpus', '2', '-u', '1000:1000', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                'run',
+                '-m',
+                '512m',
+                '--cpus',
+                '2',
+                '-u',
+                '1000:1000',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '-m' in cmd
         assert '512m' in cmd
         assert '--cpus' in cmd
@@ -1507,16 +1599,25 @@ class TestPrintCmdOutput:
         assert '1000:1000' in cmd
 
     def test_publish_and_network(self, capsys):
-        cmd = self._cmd([
-            'run', '-p', '8080:80', '-p', '443:443', '--network', 'bridge', 'nginx',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                'run',
+                '-p',
+                '8080:80',
+                '-p',
+                '443:443',
+                '--network',
+                'bridge',
+                'nginx',
+            ],
+            capsys,
+        )
         assert cmd.count('-p') == 2
         assert '8080:80' in cmd
         assert '443:443' in cmd
         assert '--network' in cmd
         assert 'bridge' in cmd
         assert 'nginx' in cmd
-
 
 
 # ---------------------------------------------------------------------------
@@ -1616,9 +1717,16 @@ class TestRootFlagCombinations:
         assert r.ns['root.config_script'] == ['/s.sh']
 
     def test_store_and_auto_init_and_store_info(self):
-        r = parse_args([
-            '--local-store', '/s', '--local-store-auto-init', '--local-store-info', 'run', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--local-store',
+                '/s',
+                '--local-store-auto-init',
+                '--local-store-info',
+                'run',
+                'alpine',
+            ]
+        )
         assert r.ns['root.local_store'] == '/s'
         assert r.ns['root.local_store_auto_init'] is True
         assert r.ns['root.local_store_info'] is True
@@ -1630,12 +1738,23 @@ class TestRootFlagCombinations:
         assert r.ns['root.local_store_ignore'] is True
 
     def test_all_root_flags_together(self):
-        r = parse_args([
-            '--print-cmd', '--config', '/c.json', '--config-script', '/s.sh',
-            '--no-devconfig', '--local-store', '/s', '--local-store-ignore',
-            '--local-store-auto-init', '--local-store-info',
-            'run', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--print-cmd',
+                '--config',
+                '/c.json',
+                '--config-script',
+                '/s.sh',
+                '--no-devconfig',
+                '--local-store',
+                '/s',
+                '--local-store-ignore',
+                '--local-store-auto-init',
+                '--local-store-info',
+                'run',
+                'alpine',
+            ]
+        )
         assert r.ns['root.print_cmd'] is True
         assert r.ns['root.config'] == '/c.json'
         assert r.ns['root.config_script'] == ['/s.sh']
@@ -1665,9 +1784,17 @@ class TestRootAndRunCombinations:
         assert r.ns['run.workspace'] is True
 
     def test_store_before_run_with_name_and_adhoc(self):
-        r = parse_args([
-            '--local-store', '/s', 'run', '--name', 'myc', '--adhoc', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--local-store',
+                '/s',
+                'run',
+                '--name',
+                'myc',
+                '--adhoc',
+                'alpine',
+            ]
+        )
         assert r.ns['root.local_store'] == '/s'
         assert r.ns['run.name'] == 'myc'
         assert r.ns['run.adhoc'] is True
@@ -1678,17 +1805,33 @@ class TestRootAndRunCombinations:
         assert r.ns['run.shell'] == '/bin/zsh'
 
     def test_config_script_before_run_with_export(self):
-        r = parse_args([
-            '--config-script', '/s.sh', 'run', '--export', '/a:/b', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--config-script',
+                '/s.sh',
+                'run',
+                '--export',
+                '/a:/b',
+                'alpine',
+            ]
+        )
         assert r.ns['root.config_script'] == ['/s.sh']
         assert r.ns['run.export'] == ['/a:/b']
 
     def test_print_cmd_with_multiple_run_flags(self):
-        r = parse_args([
-            '--print-cmd', 'run', '--workspace', '--name', 'myc',
-            '--shell', '/bin/zsh', '--login', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--print-cmd',
+                'run',
+                '--workspace',
+                '--name',
+                'myc',
+                '--shell',
+                '/bin/zsh',
+                '--login',
+                'alpine',
+            ]
+        )
         assert r.ns['root.print_cmd'] is True
         assert r.ns['run.workspace'] is True
         assert r.ns['run.name'] == 'myc'
@@ -1696,13 +1839,27 @@ class TestRootAndRunCombinations:
         assert r.ns['run.login'] is True
 
     def test_multiple_root_flags_with_multiple_run_flags(self):
-        r = parse_args([
-            '--print-cmd', '--config', '/c.json', '--no-devconfig',
-            '--local-store', '/s', '--local-store-auto-init',
-            'run', '--host-overlay', '--name', 'myc', '--x11',
-            '--export', '/a:/b', '--export', '/c:/d',
-            'alpine',
-        ])
+        r = parse_args(
+            [
+                '--print-cmd',
+                '--config',
+                '/c.json',
+                '--no-devconfig',
+                '--local-store',
+                '/s',
+                '--local-store-auto-init',
+                'run',
+                '--host-overlay',
+                '--name',
+                'myc',
+                '--x11',
+                '--export',
+                '/a:/b',
+                '--export',
+                '/c:/d',
+                'alpine',
+            ]
+        )
         assert r.ns['root.print_cmd'] is True
         assert r.ns['root.config'] == '/c.json'
         assert r.ns['root.no_devconfig'] is True
@@ -1732,10 +1889,17 @@ class TestRunFlagCombinations:
         assert r.ns['run.interactive_overlay'] is True
 
     def test_overlay_hierarchy_all(self):
-        r = parse_args([
-            'run', '--user-overlay', '--host-overlay', '--interactive-overlay',
-            '--workspace', '--adhoc', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--user-overlay',
+                '--host-overlay',
+                '--interactive-overlay',
+                '--workspace',
+                '--adhoc',
+                'alpine',
+            ]
+        )
         assert r.ns['run.user_overlay'] is True
         assert r.ns['run.host_overlay'] is True
         assert r.ns['run.interactive_overlay'] is True
@@ -1777,18 +1941,33 @@ class TestRunFlagCombinations:
         assert r.ns['run.auto_replace'] is True
 
     def test_fuse_overlayfs_with_overlay_flags(self):
-        r = parse_args([
-            'run', '--fuse-overlayfs', '--host-overlay', '--interactive-overlay', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--fuse-overlayfs',
+                '--host-overlay',
+                '--interactive-overlay',
+                'alpine',
+            ]
+        )
         assert r.ns['run.fuse_overlayfs'] is True
         assert r.ns['run.host_overlay'] is True
         assert r.ns['run.interactive_overlay'] is True
 
     def test_export_with_workspace_and_name(self):
-        r = parse_args([
-            'run', '--workspace', '--name', 'myc',
-            '--export', '/src:/dst', '--export', '/a:/b:0', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--workspace',
+                '--name',
+                'myc',
+                '--export',
+                '/src:/dst',
+                '--export',
+                '/a:/b:0',
+                'alpine',
+            ]
+        )
         assert r.ns['run.workspace'] is True
         assert r.ns['run.name'] == 'myc'
         assert r.ns['run.export'] == ['/src:/dst', '/a:/b:0']
@@ -1799,22 +1978,48 @@ class TestRunFlagCombinations:
         assert r.ns['run.workspace'] is True
 
     def test_prompt_banner_with_shell_and_login(self):
-        r = parse_args([
-            'run', '--prompt-banner', 'DEV', '--shell', '/bin/zsh', '--login', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--prompt-banner',
+                'DEV',
+                '--shell',
+                '/bin/zsh',
+                '--login',
+                'alpine',
+            ]
+        )
         assert r.ns['run.prompt_banner'] == 'DEV'
         assert r.ns['run.shell'] == '/bin/zsh'
         assert r.ns['run.login'] is True
 
     def test_all_run_flags_together(self):
-        r = parse_args([
-            'run', '--name', 'full', '--user-overlay', '--host-overlay',
-            '--interactive-overlay', '--workspace', '--adhoc',
-            '--x11', '--podman-remote', '--shell', '/bin/zsh', '--login',
-            '--prompt-banner', 'ALL', '--auto-attach', '--auto-replace',
-            '--export', '/a:/b', '--fuse-overlayfs', '--print-overlays',
-            'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--name',
+                'full',
+                '--user-overlay',
+                '--host-overlay',
+                '--interactive-overlay',
+                '--workspace',
+                '--adhoc',
+                '--x11',
+                '--podman-remote',
+                '--shell',
+                '/bin/zsh',
+                '--login',
+                '--prompt-banner',
+                'ALL',
+                '--auto-attach',
+                '--auto-replace',
+                '--export',
+                '/a:/b',
+                '--fuse-overlayfs',
+                '--print-overlays',
+                'alpine',
+            ]
+        )
         assert r.ns['run.name'] == 'full'
         assert r.ns['run.user_overlay'] is True
         assert r.ns['run.host_overlay'] is True
@@ -1857,19 +2062,36 @@ class TestPodmanPassthroughWithRunFlags:
         assert '--privileged' in pt
 
     def test_multiple_env_with_name_and_overlay(self):
-        r = parse_args([
-            'run', '--name', 'myc', '--host-overlay',
-            '-e', 'A=1', '-e', 'B=2', '-e', 'C=3', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--name',
+                'myc',
+                '--host-overlay',
+                '-e',
+                'A=1',
+                '-e',
+                'B=2',
+                '-e',
+                'C=3',
+                'alpine',
+            ]
+        )
         assert r.ns['run.name'] == 'myc'
         assert r.ns['run.host_overlay'] is True
         pt = r.ns.get('run.passthrough_args') or []
         assert pt == ['-e', 'A=1', '-e', 'B=2', '-e', 'C=3']
 
     def test_mount_with_user_overlay(self):
-        r = parse_args([
-            'run', '--user-overlay', '--mount', 'type=bind,src=/a,dst=/b', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--user-overlay',
+                '--mount',
+                'type=bind,src=/a,dst=/b',
+                'alpine',
+            ]
+        )
         assert r.ns['run.user_overlay'] is True
         pt = r.ns.get('run.passthrough_args') or []
         assert '--mount' in pt
@@ -1897,12 +2119,25 @@ class TestPodmanPassthroughWithRunFlags:
         assert 'host' in pt
 
     def test_boolean_and_value_podman_flags_with_all_overlays(self):
-        r = parse_args([
-            'run', '--workspace', '--fuse-overlayfs',
-            '--rm', '--privileged', '-e', 'A=1', '-v', '/x:/y',
-            '--network', 'host', '--hostname', 'dev',
-            'alpine', 'bash',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--workspace',
+                '--fuse-overlayfs',
+                '--rm',
+                '--privileged',
+                '-e',
+                'A=1',
+                '-v',
+                '/x:/y',
+                '--network',
+                'host',
+                '--hostname',
+                'dev',
+                'alpine',
+                'bash',
+            ]
+        )
         assert r.ns['run.workspace'] is True
         assert r.ns['run.fuse_overlayfs'] is True
         pt = r.ns.get('run.passthrough_args') or []
@@ -1920,9 +2155,18 @@ class TestPodmanPassthroughWithRunFlags:
         assert 'bash' in r.trailing_args
 
     def test_memory_and_cpus_with_name(self):
-        r = parse_args([
-            'run', '--name', 'limited', '-m', '512m', '--cpus', '2', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--name',
+                'limited',
+                '-m',
+                '512m',
+                '--cpus',
+                '2',
+                'alpine',
+            ]
+        )
         assert r.ns['run.name'] == 'limited'
         pt = r.ns.get('run.passthrough_args') or []
         assert '-m' in pt
@@ -1931,10 +2175,18 @@ class TestPodmanPassthroughWithRunFlags:
         assert '2' in pt
 
     def test_label_and_annotation_with_export(self):
-        r = parse_args([
-            'run', '--export', '/a:/b',
-            '-l', 'app=test', '--annotation', 'key=val', 'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--export',
+                '/a:/b',
+                '-l',
+                'app=test',
+                '--annotation',
+                'key=val',
+                'alpine',
+            ]
+        )
         assert r.ns['run.export'] == ['/a:/b']
         assert r.ns['run.label'] == ['app=test']
         pt = r.ns.get('run.passthrough_args') or []
@@ -1955,10 +2207,19 @@ class TestGlobalPodmanWithRunCombinations:
         assert r.ns['run.workspace'] is True
 
     def test_root_and_log_level_with_run_flags(self):
-        r = parse_args([
-            '--root', '/x', '--log-level', 'debug',
-            'run', '--host-overlay', '--name', 'myc', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--root',
+                '/x',
+                '--log-level',
+                'debug',
+                'run',
+                '--host-overlay',
+                '--name',
+                'myc',
+                'alpine',
+            ]
+        )
         pga = r.ns.get('podman_global_args') or []
         assert '--root' in pga
         assert '/x' in pga
@@ -1976,22 +2237,42 @@ class TestGlobalPodmanWithRunCombinations:
         assert '--rm' in pt
 
     def test_storage_opt_with_run_and_name(self):
-        r = parse_args([
-            '--storage-opt', 'ignore_chown_errors=true',
-            'run', '--name', 'myc', 'alpine',
-        ])
+        r = parse_args(
+            [
+                '--storage-opt',
+                'ignore_chown_errors=true',
+                'run',
+                '--name',
+                'myc',
+                'alpine',
+            ]
+        )
         pga = r.ns.get('podman_global_args') or []
         assert '--storage-opt' in pga
         assert 'ignore_chown_errors=true' in pga
         assert r.ns['run.name'] == 'myc'
 
     def test_multiple_global_flags_with_run_podman_and_podrun_flags(self):
-        r = parse_args([
-            '--root', '/x', '--log-level', 'debug', '--remote',
-            'run', '--workspace', '--name', 'dev',
-            '-e', 'A=1', '-v', '/a:/b', '--rm',
-            'alpine', 'bash',
-        ])
+        r = parse_args(
+            [
+                '--root',
+                '/x',
+                '--log-level',
+                'debug',
+                '--remote',
+                'run',
+                '--workspace',
+                '--name',
+                'dev',
+                '-e',
+                'A=1',
+                '-v',
+                '/a:/b',
+                '--rm',
+                'alpine',
+                'bash',
+            ]
+        )
         pga = r.ns.get('podman_global_args') or []
         assert '--root' in pga
         assert '--log-level' in pga
@@ -2023,17 +2304,44 @@ class TestGlobalPodmanWithRunCombinations:
 class TestFullStackCombinations:
     def test_everything_together(self):
         """All layers: root flags + podman global + run podrun + run podman + image + cmd."""
-        r = parse_args([
-            '--print-cmd', '--config', '/c.json', '--no-devconfig',
-            '--local-store', '/s', '--local-store-auto-init',
-            '--root', '/x', '--log-level', 'debug',
-            'run', '--workspace', '--name', 'full',
-            '--shell', '/bin/zsh', '--login', '--x11',
-            '--export', '/a:/b', '--fuse-overlayfs',
-            '-e', 'FOO=bar', '-v', '/host:/ctr', '--rm', '--privileged',
-            '--network', 'host',
-            'myimage:latest', 'bash', '-c', 'echo hi',
-        ])
+        r = parse_args(
+            [
+                '--print-cmd',
+                '--config',
+                '/c.json',
+                '--no-devconfig',
+                '--local-store',
+                '/s',
+                '--local-store-auto-init',
+                '--root',
+                '/x',
+                '--log-level',
+                'debug',
+                'run',
+                '--workspace',
+                '--name',
+                'full',
+                '--shell',
+                '/bin/zsh',
+                '--login',
+                '--x11',
+                '--export',
+                '/a:/b',
+                '--fuse-overlayfs',
+                '-e',
+                'FOO=bar',
+                '-v',
+                '/host:/ctr',
+                '--rm',
+                '--privileged',
+                '--network',
+                'host',
+                'myimage:latest',
+                'bash',
+                '-c',
+                'echo hi',
+            ]
+        )
         # Root flags
         assert r.ns['root.print_cmd'] is True
         assert r.ns['root.config'] == '/c.json'
@@ -2070,13 +2378,27 @@ class TestFullStackCombinations:
 
     def test_everything_with_separator(self):
         """Full stack with explicit command after '--'."""
-        r = parse_args([
-            '--print-cmd', '--local-store', '/s',
-            '--root', '/x',
-            'run', '--adhoc', '--name', 'myc',
-            '-e', 'A=1', '--rm',
-            'alpine', '--', 'sh', '-c', 'echo done',
-        ])
+        r = parse_args(
+            [
+                '--print-cmd',
+                '--local-store',
+                '/s',
+                '--root',
+                '/x',
+                'run',
+                '--adhoc',
+                '--name',
+                'myc',
+                '-e',
+                'A=1',
+                '--rm',
+                'alpine',
+                '--',
+                'sh',
+                '-c',
+                'echo done',
+            ]
+        )
         assert r.ns['root.print_cmd'] is True
         assert r.ns['root.local_store'] == '/s'
         pga = r.ns.get('podman_global_args') or []
@@ -2091,12 +2413,26 @@ class TestFullStackCombinations:
 
     def test_build_run_command_full_stack(self):
         """build_run_command produces correct ordering with all flag types."""
-        r = parse_args([
-            '--root', '/x', '--log-level', 'debug',
-            'run', '--name', 'myc',
-            '-e', 'A=1', '-v', '/a:/b', '--rm',
-            'alpine', '--', 'echo', 'hi',
-        ])
+        r = parse_args(
+            [
+                '--root',
+                '/x',
+                '--log-level',
+                'debug',
+                'run',
+                '--name',
+                'myc',
+                '-e',
+                'A=1',
+                '-v',
+                '/a:/b',
+                '--rm',
+                'alpine',
+                '--',
+                'echo',
+                'hi',
+            ]
+        )
         cmd = build_run_command(r, 'podman')
         # podman + global args before 'run'
         run_idx = cmd.index('run')
@@ -2114,14 +2450,25 @@ class TestFullStackCombinations:
         assert 'alpine' in cmd
         # Explicit command after '--'
         sep_idx = cmd.index('--')
-        assert cmd[sep_idx + 1:] == ['echo', 'hi']
+        assert cmd[sep_idx + 1 :] == ['echo', 'hi']
 
     def test_build_run_command_boolean_and_value_flags(self):
-        r = parse_args([
-            'run', '--name', 'myc', '--rm', '--privileged',
-            '-e', 'A=1', '-v', '/a:/b', '-m', '512m',
-            'alpine',
-        ])
+        r = parse_args(
+            [
+                'run',
+                '--name',
+                'myc',
+                '--rm',
+                '--privileged',
+                '-e',
+                'A=1',
+                '-v',
+                '/a:/b',
+                '-m',
+                '512m',
+                'alpine',
+            ]
+        )
         cmd = build_run_command(r, 'podman')
         assert '--name=myc' in cmd
         assert '--rm' in cmd
@@ -2137,11 +2484,23 @@ class TestFullStackCombinations:
     def test_print_cmd_main_full_stack(self, capsys):
         """main() with --print-cmd outputs correct full command."""
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', '--root', '/x',
-                'run', '--name', 'myc', '-e', 'A=1', '--rm',
-                'alpine', '--', 'echo', 'hi',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--root',
+                    '/x',
+                    'run',
+                    '--name',
+                    'myc',
+                    '-e',
+                    'A=1',
+                    '--rm',
+                    'alpine',
+                    '--',
+                    'echo',
+                    'hi',
+                ]
+            )
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert '--root' in out
@@ -2215,7 +2574,7 @@ class TestRunrootPath:
         """Path is _PODRUN_STORES_DIR/<12-char hex hash>."""
         result = _runroot_path('/some/graphroot')
         assert result.startswith(_PODRUN_STORES_DIR + '/')
-        suffix = result[len(_PODRUN_STORES_DIR) + 1:]
+        suffix = result[len(_PODRUN_STORES_DIR) + 1 :]
         assert len(suffix) == 12
         assert all(c in '0123456789abcdef' for c in suffix)
 
@@ -2538,10 +2897,17 @@ class TestStoreCommandIntegration:
 
     def test_run_explicit_storage_driver(self, init_store, capsys):
         """--storage-driver passed as podman global flag is respected."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--storage-driver', 'vfs',
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--storage-driver',
+                'vfs',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         # --storage-driver vfs appears once (from passthrough), not duplicated by store
         assert cmd.count('--storage-driver') == 1
         idx = cmd.index('--storage-driver')
@@ -2549,10 +2915,19 @@ class TestStoreCommandIntegration:
 
     def test_run_store_with_name_and_passthrough(self, init_store, capsys):
         """Store flags + named flags + passthrough all appear correctly."""
-        cmd = self._cmd([
-            '--local-store', init_store,
-            'run', '--name', 'myc', '-e', 'A=1', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                'run',
+                '--name',
+                'myc',
+                '-e',
+                'A=1',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--root' in cmd
         assert '--name=myc' in cmd
         assert '-e' in cmd
@@ -2597,10 +2972,16 @@ class TestStoreCommandIntegration:
 
     def test_passthrough_explicit_storage_driver(self, init_store, capsys):
         """--storage-driver as podman global flag flows to passthrough subcommands."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--storage-driver', 'vfs',
-            'ps',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--storage-driver',
+                'vfs',
+                'ps',
+            ],
+            capsys,
+        )
         assert cmd.count('--storage-driver') == 1
         idx = cmd.index('--storage-driver')
         assert cmd[idx + 1] == 'vfs'
@@ -2609,10 +2990,16 @@ class TestStoreCommandIntegration:
 
     def test_ignore_run(self, init_store, capsys):
         """--local-store-ignore → no store flags in run command."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--local-store-ignore',
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--local-store-ignore',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--root' not in cmd
         assert '--runroot' not in cmd
         assert '--storage-driver' not in cmd
@@ -2622,20 +3009,33 @@ class TestStoreCommandIntegration:
 
     def test_ignore_passthrough(self, init_store, capsys):
         """--local-store-ignore → no store flags in passthrough command."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--local-store-ignore',
-            'ps', '-a',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--local-store-ignore',
+                'ps',
+                '-a',
+            ],
+            capsys,
+        )
         assert '--root' not in cmd
         assert '--runroot' not in cmd
         assert '--storage-driver' not in cmd
 
     def test_ignore_with_other_global_flags(self, init_store, capsys):
         """--local-store-ignore doesn't suppress non-store global flags."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--local-store-ignore', '--remote',
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--local-store-ignore',
+                '--remote',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--root' not in cmd
         assert '--remote' in cmd
 
@@ -2655,10 +3055,15 @@ class TestStoreCommandIntegration:
 
     def test_nonexistent_store_no_flags(self, tmp_path, capsys):
         """Store path that doesn't exist → no store flags."""
-        cmd = self._cmd([
-            '--local-store', str(tmp_path / 'nonexistent'),
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                str(tmp_path / 'nonexistent'),
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--root' not in cmd
 
     # -- --local-store-auto-init --------------------------------------------
@@ -2666,10 +3071,16 @@ class TestStoreCommandIntegration:
     def test_auto_init_run(self, tmp_path, capsys):
         """Auto-init creates store and injects flags into run command."""
         store_dir = str(tmp_path / 'new-store')
-        cmd = self._cmd([
-            '--local-store', store_dir, '--local-store-auto-init',
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                store_dir,
+                '--local-store-auto-init',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--root' in cmd
         assert '--runroot' in cmd
         assert '--storage-driver' in cmd
@@ -2679,21 +3090,33 @@ class TestStoreCommandIntegration:
     def test_auto_init_passthrough(self, tmp_path, capsys):
         """Auto-init creates store and injects flags into passthrough command."""
         store_dir = str(tmp_path / 'new-store')
-        cmd = self._cmd([
-            '--local-store', store_dir, '--local-store-auto-init',
-            'ps',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                store_dir,
+                '--local-store-auto-init',
+                'ps',
+            ],
+            capsys,
+        )
         assert '--root' in cmd
         assert (tmp_path / 'new-store' / 'graphroot').is_dir()
 
     def test_auto_init_explicit_storage_driver(self, tmp_path, capsys):
         """Auto-init with explicit --storage-driver flows through."""
         store_dir = str(tmp_path / 'new-store')
-        cmd = self._cmd([
-            '--local-store', store_dir, '--local-store-auto-init',
-            '--storage-driver', 'vfs',
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                store_dir,
+                '--local-store-auto-init',
+                '--storage-driver',
+                'vfs',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         assert cmd.count('--storage-driver') == 1
         idx = cmd.index('--storage-driver')
         assert cmd[idx + 1] == 'vfs'
@@ -2716,20 +3139,32 @@ class TestStoreCommandIntegration:
 
     def test_store_and_remote_run(self, init_store, capsys):
         """Store flags + --remote both appear before 'run'."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--remote',
-            'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--remote',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         run_idx = cmd.index('run')
         assert cmd.index('--root') < run_idx
         assert cmd.index('--remote') < run_idx
 
     def test_store_and_log_level_passthrough(self, init_store, capsys):
         """Store flags + --log-level both appear before subcommand."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--log-level', 'debug',
-            'ps',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--log-level',
+                'debug',
+                'ps',
+            ],
+            capsys,
+        )
         ps_idx = cmd.index('ps')
         assert cmd.index('--root') < ps_idx
         assert cmd.index('--log-level') < ps_idx
@@ -2739,10 +3174,17 @@ class TestStoreCommandIntegration:
     def test_conflict_root(self, init_store, capsys):
         """--root + active store → error exit."""
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', '--local-store', init_store,
-                '--root', '/other', 'run', 'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--local-store',
+                    init_store,
+                    '--root',
+                    '/other',
+                    'run',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert 'conflicts' in err
@@ -2751,10 +3193,17 @@ class TestStoreCommandIntegration:
     def test_conflict_runroot(self, init_store, capsys):
         """--runroot + active store → error exit."""
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', '--local-store', init_store,
-                '--runroot', '/other', 'run', 'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--local-store',
+                    init_store,
+                    '--runroot',
+                    '/other',
+                    'run',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert 'conflicts' in err
@@ -2762,10 +3211,17 @@ class TestStoreCommandIntegration:
     def test_storage_driver_respected_with_store(self, init_store, capsys):
         """--storage-driver + active store → driver respected, no conflict."""
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', '--local-store', init_store,
-                '--storage-driver', 'vfs', 'run', 'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--local-store',
+                    init_store,
+                    '--storage-driver',
+                    'vfs',
+                    'run',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 0
         cmd = capsys.readouterr().out.strip().split()
         assert cmd.count('--storage-driver') == 1
@@ -2775,18 +3231,32 @@ class TestStoreCommandIntegration:
     def test_conflict_root_passthrough(self, init_store, capsys):
         """--root + active store → error exit (passthrough subcommand too)."""
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', '--local-store', init_store,
-                '--root', '/other', 'ps',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--local-store',
+                    init_store,
+                    '--root',
+                    '/other',
+                    'ps',
+                ]
+            )
         assert exc_info.value.code == 1
 
     def test_no_conflict_when_ignore(self, init_store, capsys):
         """--local-store-ignore prevents conflict even with --root."""
-        cmd = self._cmd([
-            '--local-store', init_store, '--local-store-ignore',
-            '--root', '/other', 'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                init_store,
+                '--local-store-ignore',
+                '--root',
+                '/other',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         # --root passes through as normal podman flag
         assert '--root' in cmd
         assert '/other' in cmd
@@ -2795,10 +3265,17 @@ class TestStoreCommandIntegration:
 
     def test_no_conflict_when_uninitialized(self, uninit_store, capsys):
         """Uninitialized store + --root → no conflict (store not active)."""
-        cmd = self._cmd([
-            '--local-store', uninit_store,
-            '--root', '/other', 'run', 'alpine',
-        ], capsys)
+        cmd = self._cmd(
+            [
+                '--local-store',
+                uninit_store,
+                '--root',
+                '/other',
+                'run',
+                'alpine',
+            ],
+            capsys,
+        )
         assert '--root' in cmd
         assert '/other' in cmd
 
@@ -2847,7 +3324,9 @@ class TestStoreCommandIntegration:
         monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
         ns = {'root.local_store': init_store}
         _apply_store(ns, 'podman')
-        assert 'podman_global_args' not in ns or '--root' not in (ns.get('podman_global_args') or [])
+        assert 'podman_global_args' not in ns or '--root' not in (
+            ns.get('podman_global_args') or []
+        )
 
     def test_nested_store_info(self, init_store, capsys, monkeypatch):
         """Nested + --local-store-info → disabled message."""
@@ -2910,7 +3389,8 @@ class TestStoreDestroy:
         parent = pathlib.Path(_PODRUN_STORES_DIR)
         # Only test parent cleanup if no other stores exist
         if parent.exists() and not any(
-            p for p in parent.iterdir()
+            p
+            for p in parent.iterdir()
             if str(p) != str(pathlib.Path(store_dir).resolve() / 'runroot')
         ):
             _store_destroy(store_dir, 'podman')
@@ -3072,13 +3552,17 @@ class TestStoreDestroyIntegration:
         _store_init(store_dir)
         monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd',
-                '--local-store', store_dir,
-                '--local-store-destroy',
-                '--local-store-auto-init',
-                'run', 'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--local-store',
+                    store_dir,
+                    '--local-store-destroy',
+                    '--local-store-auto-init',
+                    'run',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 0
         tokens = shlex.split(capsys.readouterr().out)
         assert '--root' in tokens
@@ -3093,12 +3577,16 @@ class TestStoreDestroyIntegration:
         _store_init(store_dir)
         monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd',
-                '--local-store', store_dir,
-                '--local-store-destroy',
-                'run', 'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    '--local-store',
+                    store_dir,
+                    '--local-store-destroy',
+                    'run',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 0
         tokens = shlex.split(capsys.readouterr().out)
         assert '--root' not in tokens
@@ -3111,11 +3599,14 @@ class TestStoreDestroyIntegration:
         _store_init(store_dir)
         monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--local-store', store_dir,
-                '--local-store-destroy',
-                '--local-store-info',
-            ])
+            main(
+                [
+                    '--local-store',
+                    store_dir,
+                    '--local-store-destroy',
+                    '--local-store-info',
+                ]
+            )
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         # After destroy, info should show no store configured or not initialized
@@ -3127,12 +3618,15 @@ class TestStoreDestroyIntegration:
         _store_init(store_dir)
         monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--local-store', store_dir,
-                '--local-store-destroy',
-                '--local-store-auto-init',
-                '--local-store-info',
-            ])
+            main(
+                [
+                    '--local-store',
+                    store_dir,
+                    '--local-store-destroy',
+                    '--local-store-auto-init',
+                    '--local-store-info',
+                ]
+            )
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert 'Local store:' in out

@@ -1,6 +1,5 @@
 """Tests for Phase 2.5 — main orchestration + execution."""
 
-import os
 import shlex
 import subprocess
 
@@ -11,11 +10,8 @@ from podrun.podrun2 import (
     UNAME,
     _default_podman_path,
     _fuse_overlayfs_fixup,
-    _handle_run,
     _warn_missing_subids,
     main,
-    parse_args,
-    resolve_config,
 )
 
 
@@ -46,10 +42,12 @@ class TestDefaultPodmanPath:
         monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
         monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
         original_which = podrun2_mod.shutil.which
+
         def fake_which(name):
             if name == 'podman-remote':
                 return '/usr/bin/podman-remote'
             return original_which(name)
+
         monkeypatch.setattr(podrun2_mod.shutil, 'which', fake_which)
         assert _default_podman_path() == '/usr/bin/podman-remote'
 
@@ -120,12 +118,14 @@ class TestWarnMissingSubids:
         subgid.write_text(f'{UNAME}:100000:65536\n')
         # Patch the file paths
         original_open = open
+
         def patched_open(path, *a, **kw):
             if path == '/etc/subuid':
                 return original_open(str(subuid), *a, **kw)
             if path == '/etc/subgid':
                 return original_open(str(subgid), *a, **kw)
             return original_open(path, *a, **kw)
+
         monkeypatch.setattr('builtins.open', patched_open)
         _warn_missing_subids()
         assert 'Note:' not in capsys.readouterr().err
@@ -136,12 +136,14 @@ class TestWarnMissingSubids:
         subuid.write_text('otheruser:100000:65536\n')
         subgid.write_text('otheruser:100000:65536\n')
         original_open = open
+
         def patched_open(path, *a, **kw):
             if path == '/etc/subuid':
                 return original_open(str(subuid), *a, **kw)
             if path == '/etc/subgid':
                 return original_open(str(subgid), *a, **kw)
             return original_open(path, *a, **kw)
+
         monkeypatch.setattr('builtins.open', patched_open)
         _warn_missing_subids()
         err = capsys.readouterr().err
@@ -153,6 +155,7 @@ class TestWarnMissingSubids:
             if path in ('/etc/subuid', '/etc/subgid'):
                 raise FileNotFoundError(path)
             return open(path, *a, **kw)
+
         monkeypatch.setattr('builtins.open', patched_open)
         _warn_missing_subids()
         err = capsys.readouterr().err
@@ -161,6 +164,7 @@ class TestWarnMissingSubids:
     def test_no_crash_on_exception(self, monkeypatch):
         def patched_open(path, *a, **kw):
             raise PermissionError('denied')
+
         monkeypatch.setattr('builtins.open', patched_open)
         _warn_missing_subids()  # should not raise
 
@@ -172,7 +176,11 @@ class TestWarnMissingSubids:
 
 class TestFuseOverlayfsFixup:
     def test_injects_storage_opt(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None)
+        monkeypatch.setattr(
+            podrun2_mod.shutil,
+            'which',
+            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
+        )
         ns = {}
         cmd = ['-v=/a:/b']
         _fuse_overlayfs_fixup(ns, cmd)
@@ -181,7 +189,11 @@ class TestFuseOverlayfsFixup:
         assert 'overlay.mount_program=/usr/bin/fuse-overlayfs' in gf
 
     def test_converts_overlay_to_ro_for_files(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None)
+        monkeypatch.setattr(
+            podrun2_mod.shutil,
+            'which',
+            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
+        )
         f = tmp_path / 'file.txt'
         f.write_text('hi')
         ns = {}
@@ -190,7 +202,11 @@ class TestFuseOverlayfsFixup:
         assert result == [f'-v={f}:/container/file.txt:ro']
 
     def test_preserves_overlay_for_directories(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None)
+        monkeypatch.setattr(
+            podrun2_mod.shutil,
+            'which',
+            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
+        )
         d = tmp_path / 'dir'
         d.mkdir()
         ns = {}
@@ -199,7 +215,11 @@ class TestFuseOverlayfsFixup:
         assert result == [f'-v={d}:/container/dir:O']
 
     def test_non_volume_args_unchanged(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None)
+        monkeypatch.setattr(
+            podrun2_mod.shutil,
+            'which',
+            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
+        )
         ns = {}
         cmd = ['--rm', '-e', 'FOO=bar', '-it']
         result = _fuse_overlayfs_fixup(ns, cmd)
@@ -212,7 +232,11 @@ class TestFuseOverlayfsFixup:
             _fuse_overlayfs_fixup(ns, [])
 
     def test_appends_to_existing_global_args(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None)
+        monkeypatch.setattr(
+            podrun2_mod.shutil,
+            'which',
+            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
+        )
         ns = {'podman_global_args': ['--root', '/x']}
         _fuse_overlayfs_fixup(ns, [])
         gf = ns['podman_global_args']
@@ -232,9 +256,16 @@ class TestHandleRunViaPrintCmd:
     def _tmp_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
         # Suppress stale file cleanup
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            ),
+        )
 
     def _run(self, argv, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -288,7 +319,7 @@ class TestHandleRunViaPrintCmd:
     def test_with_separator_command(self, capsys):
         cmd = self._run(['run', 'alpine', '--', 'bash', '-c', 'echo hi'], capsys)
         sep_idx = cmd.index('--')
-        assert cmd[sep_idx + 1:] == ['bash', '-c', 'echo hi']
+        assert cmd[sep_idx + 1 :] == ['bash', '-c', 'echo hi']
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +376,9 @@ class TestHandleRunContainerState:
     def test_attach_prints_exec(self, monkeypatch, capsys):
         """When attaching, --print-cmd should show exec command."""
         monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
-        monkeypatch.setattr(podrun2_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host'))
+        monkeypatch.setattr(
+            podrun2_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
+        )
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--workspace', 'alpine'])
         assert exc_info.value.code == 0
@@ -380,29 +413,47 @@ class TestExportConflictFiltering:
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='', stderr='',
-        ))
+        monkeypatch.setattr(
+            podrun2_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            ),
+        )
 
     def test_conflicting_export_skipped(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', 'run', '--workspace',
-                '-v', '/host:/data',
-                '--export', '/data:/host/export',
-                'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    'run',
+                    '--workspace',
+                    '-v',
+                    '/host:/data',
+                    '--export',
+                    '/data:/host/export',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 0
         err = capsys.readouterr().err
         assert 'skipped' in err
 
     def test_non_conflicting_export_preserved(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                '--print-cmd', 'run', '--workspace',
-                '--export', '/unique:/host/export',
-                'alpine',
-            ])
+            main(
+                [
+                    '--print-cmd',
+                    'run',
+                    '--workspace',
+                    '--export',
+                    '/unique:/host/export',
+                    'alpine',
+                ]
+            )
         assert exc_info.value.code == 0
         cmd = shlex.split(capsys.readouterr().out)
         assert any('exports' in a for a in cmd)
@@ -439,9 +490,11 @@ class TestMainPodmanPath:
     def test_uses_default_podman_path(self, monkeypatch, capsys):
         """main() should use _default_podman_path() for podman resolution."""
         called = {}
+
         def fake_default():
             called['yes'] = True
             return podrun2_mod.shutil.which('podman')
+
         monkeypatch.setattr(podrun2_mod, '_default_podman_path', fake_default)
         with pytest.raises(SystemExit):
             main(['--version'])

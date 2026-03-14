@@ -29,7 +29,7 @@ class TestCompletionData:
         for f in [
             '--print-cmd',
             '--dry-run',
-            '--config',
+            '--devconfig',
             '--no-devconfig',
             '--completion',
             '--local-store',
@@ -97,7 +97,7 @@ class TestCompletionData:
         cd = _completion_data()
         vflags = cd['value_flags_str'].split()
         for f in [
-            '--config',
+            '--devconfig',
             '--config-script',
             '--name',
             '--shell',
@@ -318,6 +318,11 @@ class TestPrintCompletion:
 
 
 class TestMainCompletion:
+    @pytest.fixture(autouse=True)
+    def _clear_nested(self, monkeypatch):
+        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
+        monkeypatch.delenv('CONTAINER_HOST', raising=False)
+
     def test_main_completion_bash(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
             main(['--completion', 'bash'])

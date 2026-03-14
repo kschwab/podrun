@@ -20,6 +20,7 @@ from podrun.podrun import (
     build_passthrough_command,
     build_root_parser,
     build_run_command,
+    load_podman_flags,
     main,
     parse_args,
     print_completion,
@@ -239,7 +240,7 @@ class TestBuildRootParser:
         assert ns['root.print_cmd'] is True
 
     def test_config_flag(self):
-        ns, _ = self._parse(['--config', '/path/to/config.json'])
+        ns, _ = self._parse(['--devconfig', '/path/to/config.json'])
         assert ns['root.config'] == '/path/to/config.json'
 
     def test_no_devconfig_flag(self):
@@ -530,8 +531,8 @@ class TestEqualsFormRootFlags:
         ns, unknowns = parser.parse_known_args(args)
         return vars(ns), unknowns
 
-    def test_config_equals(self):
-        ns, _ = self._parse(['--config=/path/to/config.json'])
+    def test_devconfig_equals(self):
+        ns, _ = self._parse(['--devconfig=/path/to/config.json'])
         assert ns['root.config'] == '/path/to/config.json'
 
     def test_config_script_equals(self):
@@ -873,8 +874,8 @@ class TestParseArgs:
         assert r.ns['subcommand'] == 'run'
 
     def test_config_flag_before_subcommand(self):
-        """--config VALUE before subcommand."""
-        r = parse_args(['--config', '/path/to/config.json', 'run', 'alpine'])
+        """--devconfig VALUE before subcommand."""
+        r = parse_args(['--devconfig', '/path/to/config.json', 'run', 'alpine'])
         assert r.ns['root.config'] == '/path/to/config.json'
         assert r.ns['subcommand'] == 'run'
 
@@ -1697,7 +1698,7 @@ class TestBuildRunCommand:
 
 class TestRootFlagCombinations:
     def test_print_cmd_and_config(self):
-        r = parse_args(['--print-cmd', '--config', '/c.json', 'run', 'alpine'])
+        r = parse_args(['--print-cmd', '--devconfig', '/c.json', 'run', 'alpine'])
         assert r.ns['root.print_cmd'] is True
         assert r.ns['root.config'] == '/c.json'
 
@@ -1707,12 +1708,12 @@ class TestRootFlagCombinations:
         assert r.ns['root.no_devconfig'] is True
 
     def test_config_and_no_devconfig(self):
-        r = parse_args(['--config', '/c.json', '--no-devconfig', 'run', 'alpine'])
+        r = parse_args(['--devconfig', '/c.json', '--no-devconfig', 'run', 'alpine'])
         assert r.ns['root.config'] == '/c.json'
         assert r.ns['root.no_devconfig'] is True
 
     def test_config_and_config_script(self):
-        r = parse_args(['--config', '/c.json', '--config-script', '/s.sh', 'run', 'alpine'])
+        r = parse_args(['--devconfig', '/c.json', '--config-script', '/s.sh', 'run', 'alpine'])
         assert r.ns['root.config'] == '/c.json'
         assert r.ns['root.config_script'] == ['/s.sh']
 
@@ -1741,7 +1742,7 @@ class TestRootFlagCombinations:
         r = parse_args(
             [
                 '--print-cmd',
-                '--config',
+                '--devconfig',
                 '/c.json',
                 '--config-script',
                 '/s.sh',
@@ -1773,7 +1774,7 @@ class TestRootFlagCombinations:
 
 class TestRootAndRunCombinations:
     def test_config_before_run_with_overlay(self):
-        r = parse_args(['--config', '/c.json', 'run', '--host-overlay', 'alpine'])
+        r = parse_args(['--devconfig', '/c.json', 'run', '--host-overlay', 'alpine'])
         assert r.ns['root.config'] == '/c.json'
         assert r.ns['run.host_overlay'] is True
         assert 'alpine' in r.trailing_args
@@ -1842,7 +1843,7 @@ class TestRootAndRunCombinations:
         r = parse_args(
             [
                 '--print-cmd',
-                '--config',
+                '--devconfig',
                 '/c.json',
                 '--no-devconfig',
                 '--local-store',
@@ -2193,6 +2194,37 @@ class TestPodmanPassthroughWithRunFlags:
         assert '--annotation' in pt
         assert 'key=val' in pt
 
+    def test_devconfig_does_not_capture_podman_config(self):
+        """Podrun's --devconfig is separate from podman's --config (no conflict)."""
+        flags = load_podman_flags()
+        if '--config' not in flags.global_value_flags:
+            pytest.skip('podman version does not have --config global flag')
+        r = parse_args(['--config', '/etc/containers/containers.conf', 'run', 'alpine'])
+        assert r.ns.get('root.config') is None  # podrun's --devconfig not set
+        pga = r.ns.get('podman_global_args') or []
+        assert '--config' in pga
+        assert '/etc/containers/containers.conf' in pga
+
+    def test_devconfig_coexists_with_podman_config(self):
+        """Podman --config and podrun --devconfig coexist without conflict."""
+        flags = load_podman_flags()
+        if '--config' not in flags.global_value_flags:
+            pytest.skip('podman version does not have --config global flag')
+        r = parse_args(
+            [
+                '--config',
+                '/etc/containers/containers.conf',
+                '--devconfig',
+                '/path/to/dc.json',
+                'run',
+                'alpine',
+            ]
+        )
+        assert r.ns['root.config'] == '/path/to/dc.json'
+        pga = r.ns.get('podman_global_args') or []
+        assert '--config' in pga
+        assert '/etc/containers/containers.conf' in pga
+
 
 # ---------------------------------------------------------------------------
 # TestGlobalPodmanWithRunCombinations — podman global + run flags
@@ -2307,7 +2339,7 @@ class TestFullStackCombinations:
         r = parse_args(
             [
                 '--print-cmd',
-                '--config',
+                '--devconfig',
                 '/c.json',
                 '--no-devconfig',
                 '--local-store',

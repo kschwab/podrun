@@ -161,6 +161,22 @@ class TestUserOverlayArgs:
         assert len(export_vols) == 1
         assert os.path.isdir(host_dir)  # makedirs called
 
+    def test_flags_cache_mounted(self, tmp_path, monkeypatch):
+        """Flags cache dir is bind-mounted into the container when it exists."""
+        cache_dir = tmp_path / 'cache' / 'podrun'
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache_dir))
+        args, _ = self._call()
+        assert f'-v={cache_dir}:{cache_dir}:ro' in args
+
+    def test_flags_cache_not_mounted_when_missing(self, tmp_path, monkeypatch):
+        """Flags cache mount is skipped when the directory doesn't exist."""
+        cache_dir = tmp_path / 'cache' / 'podrun'  # not created
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache_dir))
+        args, _ = self._call()
+        cache_vols = [a for a in args if 'cache' in a and 'podrun' in a]
+        assert len(cache_vols) == 0
+
 
 # ---------------------------------------------------------------------------
 # _interactive_overlay_args

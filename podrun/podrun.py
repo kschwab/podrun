@@ -54,7 +54,7 @@ Phase 2.8: Linting + coverage — ruff, mypy, shellcheck, vulture, pytest-cov.
            threshold enforced at 90%.
 """
 
-__version__ = '1.0.0'
+__version__ = '1.0.1'
 __title__ = 'podrun'
 __uri__ = 'https://github.com/kschwab/podrun'
 __author__ = 'Kyle Schwab'
@@ -135,6 +135,11 @@ _PODRUN_HANDLED_ROOT_FLAGS = frozenset({'--version', '-v'})
 # Podrun run flags that overlap with podman run value flags and are handled
 # by the run parser directly (skip registering as passthrough).
 _PODRUN_HANDLED_RUN_FLAGS = frozenset({'--name', '--label', '-l'})
+
+# Docker-compat aliases that podman accepts but omits from ``podman --help``.
+# These are registered as passthrough subparsers so argparse doesn't reject them.
+# See: https://docs.podman.io/en/latest/markdown/podman-buildx.1.html
+_DOCKER_COMPAT_SUBCOMMANDS = frozenset({'buildx'})
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +402,7 @@ def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]
 
     # Config scripts must not emit meta-controls that govern config resolution
     # itself — that would create circular or ambiguous resolution order.
-    _FORBIDDEN = {'--config', '--config-script', '--no-devconfig'}
+    _FORBIDDEN = {'--devconfig', '--config-script', '--no-devconfig'}
     found = _FORBIDDEN.intersection(tokens)
     if found:
         print(
@@ -548,30 +553,6 @@ def _passthrough_has_short_flag(pt, char):
             if char in a[1:]:
                 return True
     return False
-
-
-def _extract_label_value(pt, label_key):
-    """Extract a label value from passthrough args.
-
-    Searches for ``-l key=value``, ``--label=key=value``, etc.
-    Returns the value, or ``None`` if not found.
-    """
-    prefix = f'{label_key}='
-    i = 0
-    while i < len(pt):
-        arg = pt[i]
-        if arg.startswith(('--label=', '-l=')):
-            val = arg.split('=', 1)[1]
-            if val.startswith(prefix):
-                return val[len(prefix) :]
-        elif arg in ('-l', '--label') and i + 1 < len(pt):
-            val = pt[i + 1]
-            if val.startswith(prefix):
-                return val[len(prefix) :]
-            i += 2
-            continue
-        i += 1
-    return None
 
 
 def _extract_passthrough_entrypoint(pt):
@@ -879,7 +860,7 @@ def generate_rc_sh(ns: dict) -> str:
 
     Reads from the *ns* dict: ``run.prompt_banner``.
     """
-    prompt_banner = ns.get('run.prompt_banner') or 'podrun'
+    prompt_banner = ns.get('run.prompt_banner') or ns.get('run.image') or 'podrun'
     cpu_name = run_os_cmd(
         "grep -m 1 'model name[[:space:]]*:' /proc/cpuinfo"
         " | cut -d ' ' -f 3- | sed 's/(R)/\u00ae/g; s/(TM)/\u2122/g;'"
@@ -1081,6 +1062,10 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
     args.append(f'-v={rc_path}:{PODRUN_RC_PATH}:ro')
     args.append(f'-v={exec_entry_path}:{PODRUN_EXEC_ENTRY_PATH}:ro')
     args.append(f'--env=ENV={PODRUN_RC_PATH}')
+    # Mount flags cache so nested podrun can parse CLI without re-scraping
+    host_cache_dir = _flags_cache_dir()
+    if os.path.isdir(host_cache_dir):
+        args.append(f'-v={host_cache_dir}:{host_cache_dir}:ro')
     for entry in ns.get('run.export') or []:
         container_path, host_path, _ = _parse_export(entry)
         abs_host = os.path.abspath(host_path)
@@ -1898,18 +1883,29 @@ def _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns):
     if ns.get('run.dot_files_overlay'):
         ns['run.user_overlay'] = True
 
+    # workspaceFolder: top-level devcontainer field (not customizations.podrun)
+    if not ns.get('run.workspace_folder'):
+        dc_workspace = dc.get('workspaceFolder')
+        if dc_workspace:
+            ns['run.workspace_folder'] = dc_workspace
+
+    # remoteEnv: top-level devcontainer field (not customizations.podrun)
+    dc_remote_env = dc.get('remoteEnv')
+    if dc_remote_env:
+        ns['run.remote_env'] = dc_remote_env
+
     # Image/command resolution: CLI trailing > devcontainer image
     dc_image = dc.get('image')
     if not result.trailing_args and dc_image:
         result.trailing_args = [dc_image]
 
-    # Exports append: dc + script + cli
+    # Exports append: dc + script + cli, with tilde expansion
     dc_exports = podrun_cfg.get('exports', [])
     script_exports = script_ns.get('run.export') or []
     cli_exports = ns.get('run.export') or []
     combined_exports = dc_exports + script_exports + cli_exports
     if combined_exports:
-        ns['run.export'] = combined_exports
+        ns['run.export'] = _expand_export_tilde(combined_exports)
 
 
 def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
@@ -1961,10 +1957,56 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
     if ns.get('subcommand') == 'run':
         _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns)
 
-    # 10. Attach context for Phase 2
-    result._devcontainer = dc  # type: ignore[attr-defined]
-    result._podrun_cfg = podrun_cfg  # type: ignore[attr-defined]
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Boolean flag normalization
+# ---------------------------------------------------------------------------
+
+_BOOL_TRUE = frozenset({'true', '1'})
+_BOOL_FALSE = frozenset({'false', '0'})
+_BOOL_VALUES = _BOOL_TRUE | _BOOL_FALSE
+
+
+def _normalize_bool_flags(argv: List[str], bool_flags: frozenset) -> List[str]:
+    """Normalize boolean flag value forms for argparse compatibility.
+
+    Podman boolean flags accept ``--flag=true``, ``--flag=false``,
+    ``--flag true``, and ``--flag false``.  Argparse registers them with
+    ``nargs=0`` which rejects explicit values.  This normalizes:
+
+    - ``--flag=true`` / ``--flag true``  → ``--flag``
+    - ``--flag=false`` / ``--flag false`` → removed
+
+    For short flags (``-x``), only the equals form (``-x=true``) is handled;
+    the space form is too ambiguous (``-d true`` — is ``true`` the image?).
+    """
+    result: List[str] = []
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if '=' in arg:
+            name, _, value = arg.partition('=')
+            if name in bool_flags:
+                if value.lower() in _BOOL_TRUE:
+                    result.append(name)
+                elif value.lower() in _BOOL_FALSE:
+                    pass  # Remove the flag entirely
+                else:
+                    result.append(arg)  # Unknown value, pass through as-is
+                continue
+        if arg in bool_flags and arg.startswith('--'):
+            # Space form: ``--flag true`` / ``--flag false``
+            if i + 1 < len(argv) and argv[i + 1].lower() in _BOOL_VALUES:
+                if argv[i + 1].lower() in _BOOL_TRUE:
+                    result.append(arg)
+                # else: false — skip both flag and value
+                skip_next = True
+                continue
+        result.append(arg)
     return result
 
 
@@ -2026,7 +2068,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         help='Print the podman command instead of executing it',
     )
     opts.add_argument(
-        '--config',
+        '--devconfig',
         dest='root.config',
         metavar='PATH',
         help='Explicit path to devcontainer.json',
@@ -2124,8 +2166,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         )
 
     # -- Subparsers for routing -----------------------------------------------
-    subs = parser.add_subparsers(dest='subcommand', title='Available Commands')
-    subs.required = False  # Allow no subcommand (for --version, --help, etc.)
+    subs = parser.add_subparsers(dest='subcommand', title='Available Commands', required=False)
 
     # Real subparsers for podrun commands (full flag parsing)
     run_parser = _build_run_subparser(subs, flags.run_value_flags, flags.run_boolean_flags)
@@ -2133,6 +2174,10 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
     # Empty subparsers for podman passthrough commands
     for subcmd in sorted(flags.subcommands - {'run'}):
         subs.add_parser(subcmd, add_help=False)
+
+    # Docker-compat aliases that podman accepts but omits from ``podman --help``
+    for alias in sorted(_DOCKER_COMPAT_SUBCOMMANDS - flags.subcommands):
+        subs.add_parser(alias, add_help=False)
 
     # Stash for help/completion access
     parser._run_subparser = run_parser  # type: ignore[attr-defined]
@@ -2364,6 +2409,16 @@ def parse_args(argv: List[str], flags=None) -> ParseResult:
         flag_section, explicit_command = argv[:idx], argv[idx + 1 :]
     else:
         flag_section, explicit_command = argv, []
+
+    # Resolve flags early so we can normalize boolean flag forms before parsing.
+    if flags is None:
+        flags = load_podman_flags()
+
+    # Normalize --bool=true/false and --bool true/false before argparse sees
+    # them.  Argparse registers boolean flags with nargs=0 which rejects the
+    # explicit-value forms that podman/Docker accept.
+    all_bool_flags = flags.global_boolean_flags | flags.run_boolean_flags
+    flag_section = _normalize_bool_flags(flag_section, all_bool_flags)
 
     # Single-pass parse: root parser handles global flags + subcommand routing;
     # real subparsers (run/store) handle subcommand-specific flags.
@@ -3243,6 +3298,10 @@ def _handle_run(result, podman_path):  # noqa: C901
 
     # Set run.image for _env_args (image ref parsing for PODRUN_IMG_* env vars)
     ns['run.image'] = result.trailing_args[0]
+
+    # Default prompt banner to image name (matches old_podrun.py fallback chain)
+    if not ns.get('run.prompt_banner'):
+        ns['run.prompt_banner'] = ns['run.image']
 
     # Set workspace defaults for _host_overlay_args
     if ns.get('run.host_overlay'):

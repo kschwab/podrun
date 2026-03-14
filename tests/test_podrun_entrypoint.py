@@ -272,14 +272,31 @@ class TestGenerateRcSh:
             content = f.read()
         assert 'PODRUN_STTY_INIT' in content
 
-    def test_default_prompt_banner(self):
+    def test_default_prompt_banner_no_image(self):
+        """With no prompt_banner and no image, falls back to 'podrun'."""
         path = generate_rc_sh(_default_ns())
         with open(path) as f:
             content = f.read()
         assert '_prompt_banner="podrun"' in content
 
+    def test_default_prompt_banner_from_image(self):
+        """With no prompt_banner set, falls back to image name."""
+        path = generate_rc_sh(_default_ns(**{'run.image': 'alpine:3.18'}))
+        with open(path) as f:
+            content = f.read()
+        assert '_prompt_banner="alpine:3.18"' in content
+
     def test_custom_prompt_banner(self):
         path = generate_rc_sh(_default_ns(**{'run.prompt_banner': 'myproject'}))
+        with open(path) as f:
+            content = f.read()
+        assert '_prompt_banner="myproject"' in content
+
+    def test_custom_prompt_banner_overrides_image(self):
+        """Explicit prompt_banner takes priority over image name."""
+        path = generate_rc_sh(
+            _default_ns(**{'run.prompt_banner': 'myproject', 'run.image': 'alpine:3.18'})
+        )
         with open(path) as f:
             content = f.read()
         assert '_prompt_banner="myproject"' in content

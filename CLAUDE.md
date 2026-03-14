@@ -62,7 +62,7 @@
 ensuring every value flag parses correctly in both `--flag=value` and
 `--flag value` forms. Coverage includes:
 
-- **Root/global:** `--config=`, `--config-script=`, `--completion=`,
+- **Root/global:** `--devconfig=`, `--config-script=`, `--completion=`,
   `--log-level=`, `--storage-opt=`
 - **Run (podrun):** `--name=`, `--shell=`, `--prompt-banner=`, `--export=`,
   `--label=`, `-l=`
@@ -101,7 +101,7 @@ Foundation layer. All pure functions, no side effects, immediately testable.
 | `_parse_export()` | Lines 295-308 | Export spec parsing (`SRC:DST[:0]`) |
 | `_parse_image_ref()` | Lines 2699-2723 | Image ref splitting for `PODRUN_IMG*` env vars |
 | Passthrough introspection | `_passthrough_has_flag`, `_passthrough_has_exact`, `_passthrough_has_short_flag` (lines 2725-2743) | Pure string checks on arg lists |
-| Passthrough extraction | `_extract_label_value`, `_extract_passthrough_entrypoint`, `_volume_mount_destinations` (lines 2744-2809) | Extract/remove flags from passthrough |
+| Passthrough extraction | `_extract_passthrough_entrypoint`, `_volume_mount_destinations` (lines 2744-2809) | Extract/remove flags from passthrough |
 | Tilde expansion | `_expand_volume_tilde`, `_expand_export_tilde` (lines 1953-1996) | `~/` -> `$HOME/` in volumes and exports |
 | `_write_sha_file()` | Lines 2298-2313 | Idempotent SHA-named script writer under `PODRUN_TMP` |
 | `yes_no_prompt()` | Lines 320-336 | Interactive Y/N prompting for lifecycle decisions |
@@ -172,7 +172,7 @@ Final integration into `main()`. Tests: `tests/test_podrun_main.py` (40 tests).
 | `_is_nested()` | replaces `is_podman_remote()` | ✓ Single source of truth for nested-execution detection via `PODRUN_CONTAINER` env var |
 | `_default_podman_path()` | Lines 237-245 | ✓ `PODRUN_PODMAN_PATH` env var → nested podman-remote → podman fallback |
 | `_warn_missing_subids()` | Lines 1416-1439 | ✓ subuid/subgid check |
-| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files, storage-opt injection (TODO: space-form fix in Phase 2.10) |
+| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files (equals + space form), storage-opt injection |
 | `_handle_run()` | Lines 3103-3226 | ✓ state → entrypoints → overlays → exec |
 | `main()` updated | — | ✓ Nested guard via `_is_nested()`, `_default_podman_path()`, routes to `_handle_run()` |
 | `_volume_mount_destinations()` | — | ✓ Fixed space-form volume parsing (`-v /host:/ctr`) |
@@ -183,8 +183,6 @@ Key decisions:
 - `_handle_run()` orchestrates: image extraction → container state → export conflict filtering → subid warning → overlay build → fuse-overlayfs fixup → stale cleanup → exec
 - `_volume_mount_destinations()` handles both equals form (`-v=/host:/ctr`) and space form (`-v /host:/ctr`) from `_PassthroughAction`
 - `TestPrintCmdOutput` tests updated to use structural assertions (not exact equality) since `_handle_run` injects PODRUN_* env vars
-- `_fuse_overlayfs_fixup()` has a TODO for Phase 2.10: its `:O`→`:ro` conversion only handles equals form, same space-form bug class as `_expand_volume_tilde` and `_volume_mount_destinations`
-
 Depends on 2.1-2.4.
 
 #### Phase 2.6: Store Service Lifecycle ✓
@@ -238,14 +236,14 @@ Ruff, mypy, shellcheck, vulture, and pytest-cov enforcement.
 | `TestRuff` (2 tests) | `ruff check` + `ruff format --check` on `podrun/podrun.py` and `tests/` |
 | `TestMypy` (1 test) | `mypy podrun/podrun.py` — type annotations added for all errors |
 | `TestShellcheck` (5 tests) | run-entrypoint, rc.sh, exec-entrypoint at `--severity=warning`; bash/zsh completions |
-| `TestVulture` (1 test) | Dead code detection with `podrun_whitelist.py` for downstream-phase symbols |
+| `TestVulture` (1 test) | Dead code detection on `podrun/podrun.py` |
 | Coverage threshold | Enforced via `--cov-fail-under=95` in `pyproject.toml` addopts (no dedicated test) |
 
 Key decisions:
 - **Ruff fixes**: 26 auto-fixed (F401 unused imports, F541 extraneous f-prefixes), 8 manual (C901 `# noqa: C901` on 4 orchestration functions, E741 `l`→`ln` rename, F841 dead code removal)
 - **Mypy fixes**: `Optional` for defaulting-to-None params, `# type: ignore[attr-defined]` for private argparse attributes (`_run_subparser`, `_subparsers._group_actions`), `# type: ignore[union-attr]` for `_subparsers` access, type annotations on untyped variables
 - **Shellcheck**: `--severity=warning` for entrypoint scripts (fixed `uid=$(id -u)` → `uid="$(id -u)"` SC2046); `--severity=error` for zsh completion (zsh-specific constructs trigger false positive warnings in bash mode); fish completion skipped (shellcheck doesn't support fish)
-- **Vulture whitelist**: `podrun_whitelist.py` suppresses `_extract_label_value`, `_expand_export_tilde` (used in downstream phases), `required`/`_devcontainer`/`_podrun_cfg` (dynamic attributes)
+- **Vulture**: dead code detection on `podrun/podrun.py`; `podrun_whitelist.py` removed (no longer needed after dead code cleanup)
 - **Coverage**: `--cov-fail-under=95` in `pyproject.toml` addopts; threshold at 95% (current ~96%)
 
 #### Phase 2.9: Rename podrun2 → podrun ✓
@@ -257,7 +255,6 @@ Renamed `podrun/podrun2.py` → `podrun/podrun.py`, merged `tests2/` → `tests/
 |---|---|
 | `podrun/podrun2.py` → `podrun/podrun.py` | Module renamed; old podrun1 `podrun/podrun.py` deleted |
 | `tests2/*.py` → `tests/test_podrun_*.py` | All 10 test files + conftest moved and renamed |
-| `podrun2_whitelist.py` → `podrun_whitelist.py` | Vulture whitelist renamed; internal references updated |
 | All imports updated | `podrun.podrun2` → `podrun.podrun`, `podrun2_mod` → `podrun_mod` |
 | `test_podrun_lint.py` paths updated | `_TARGETS`, mypy, vulture, coverage all point to new paths |
 | `live_tests_reference/test_live.py` | Old live tests preserved for reference; pending Phase 3 rewrite |
@@ -276,10 +273,6 @@ dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
 `.gitconfig`) need to be writable in the container, so they require a
 host->container copy mechanism (similar to exports but reversed direction).
 Options: entrypoint copy block from staging mount, or a new staging pattern.
-
-Also: fix `_fuse_overlayfs_fixup()` space-form volume parsing (`:O`→`:ro` only
-handles `-v=src:dst:O`, not `-v src:dst:O` from `_PassthroughAction`). Same
-class of bug already fixed in `_expand_volume_tilde` and `_volume_mount_destinations`.
 
 ### Phase 3 — Live Testing + Bug Fixes
 

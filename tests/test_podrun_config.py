@@ -154,7 +154,7 @@ class TestParseConfigTokens:
 
     def test_rejects_config(self):
         with pytest.raises(SystemExit):
-            parse_config_tokens(['--config', '/path/to/dc.json', '--name', 'test'])
+            parse_config_tokens(['--devconfig', '/path/to/dc.json', '--name', 'test'])
 
     def test_rejects_config_script(self):
         with pytest.raises(SystemExit):
@@ -771,6 +771,62 @@ class TestResolveConfig:
         assert exports.index('/dc:/dc') < exports.index('/script:/script')
         assert exports.index('/script:/script') < exports.index('/cli:/cli')
 
+    def test_exports_tilde_expanded(self, monkeypatch, tmp_project):
+        """Tilde in export specs is expanded during resolve_config."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'exports': ['~/.aws:.config/.aws']}},
+                }
+            )
+        )
+        r = self._resolve(
+            ['run', '--export', '~/.ssh:.config/.ssh', 'alpine'],
+            monkeypatch,
+            dc_json_path=dc_file,
+        )
+        exports = r.ns.get('run.export') or []
+        # Container paths should be expanded from ~ to /home/<user>
+        assert any(e.startswith(f'/home/{podrun_mod.UNAME}/.aws:') for e in exports)
+        assert any(e.startswith(f'/home/{podrun_mod.UNAME}/.ssh:') for e in exports)
+        # No unexpanded tildes should remain in container paths
+        assert not any(e.startswith('~/') for e in exports)
+
+    def test_workspace_folder_from_devcontainer(self, monkeypatch, tmp_project):
+        """Top-level workspaceFolder from devcontainer.json is picked up."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'workspaceFolder': '/workspace'}))
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns['run.workspace_folder'] == '/workspace'
+
+    def test_workspace_folder_default_without_devcontainer(self, monkeypatch):
+        """Without devcontainer.json, workspace_folder stays unset (default applied later)."""
+        r = self._resolve(['--no-devconfig', 'run', 'alpine'], monkeypatch)
+        # resolve_config doesn't set the /app default; _handle_run does
+        assert r.ns.get('run.workspace_folder') is None
+
+    def test_remote_env_from_devcontainer(self, monkeypatch, tmp_project):
+        """Top-level remoteEnv from devcontainer.json is picked up."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'remoteEnv': {'FOO': 'bar', 'BAZ': 'qux'},
+                }
+            )
+        )
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns['run.remote_env'] == {'FOO': 'bar', 'BAZ': 'qux'}
+
     def test_store_not_autodiscovered_in_resolve_config(self, monkeypatch):
         """Store auto-discovery is handled by _resolve_store, not resolve_config."""
         r = self._resolve(
@@ -897,15 +953,6 @@ class TestResolveConfig:
         cli_idx = pt.index('CLI=1')
         assert cap_idx < script_idx
         assert script_idx < cli_idx
-
-    def test_context_attached(self, monkeypatch):
-        """resolve_config attaches context objects to result."""
-        r = self._resolve(
-            ['--no-devconfig', 'run', 'alpine'],
-            monkeypatch,
-        )
-        assert hasattr(r, '_devcontainer')
-        assert hasattr(r, '_podrun_cfg')
 
     def test_build_run_command_with_labels(self, monkeypatch):
         """Labels from run.label are forwarded in build_run_command."""

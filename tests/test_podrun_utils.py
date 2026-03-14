@@ -19,7 +19,6 @@ from podrun.podrun import (
     _OVERLAY_FIELDS,
     _expand_export_tilde,
     _expand_volume_tilde,
-    _extract_label_value,
     _extract_passthrough_entrypoint,
     _parse_export,
     _parse_image_ref,
@@ -218,45 +217,6 @@ class TestPassthroughHasShortFlag:
 
     def test_ignores_long_flags(self):
         assert not _passthrough_has_short_flag(['--interactive'], 'i')
-
-
-class TestExtractLabelValue:
-    def test_equals_form(self):
-        pt = ['--label=mykey=myval']
-        assert _extract_label_value(pt, 'mykey') == 'myval'
-
-    def test_space_form(self):
-        pt = ['--label', 'mykey=myval']
-        assert _extract_label_value(pt, 'mykey') == 'myval'
-
-    def test_short_flag_equals(self):
-        pt = ['-l=mykey=myval']
-        assert _extract_label_value(pt, 'mykey') == 'myval'
-
-    def test_short_flag_space(self):
-        pt = ['-l', 'mykey=myval']
-        assert _extract_label_value(pt, 'mykey') == 'myval'
-
-    def test_not_found(self):
-        pt = ['--label=other=val']
-        assert _extract_label_value(pt, 'mykey') is None
-
-    def test_empty(self):
-        assert _extract_label_value([], 'key') is None
-
-    def test_multiple_labels_returns_first(self):
-        pt = ['--label=k=first', '--label=k=second']
-        # Walks forward; first match wins because the loop doesn't break
-        assert _extract_label_value(pt, 'k') == 'first'
-
-    def test_space_form_non_matching(self):
-        """Space-form label with wrong key skips pair correctly."""
-        pt = ['--label', 'other=val', '--label', 'target=found']
-        assert _extract_label_value(pt, 'target') == 'found'
-
-    def test_short_space_form_non_matching(self):
-        pt = ['-l', 'other=val', '-l', 'target=hit']
-        assert _extract_label_value(pt, 'target') == 'hit'
 
 
 class TestExtractPassthroughEntrypoint:

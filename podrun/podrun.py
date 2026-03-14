@@ -1084,7 +1084,15 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
     for entry in ns.get('run.export') or []:
         container_path, host_path, _ = _parse_export(entry)
         abs_host = os.path.abspath(host_path)
-        os.makedirs(abs_host, exist_ok=True)
+        try:
+            os.makedirs(abs_host, exist_ok=True)
+        except PermissionError:
+            print(
+                f'Error: cannot create export directory {abs_host}\n'
+                f'  Permission denied for export {entry!r}.',
+                file=sys.stderr,
+            )
+            sys.exit(1)
         staging_hash = hashlib.sha256(container_path.encode()).hexdigest()[:12]
         args.append(f'-v={abs_host}:/.podrun/exports/{staging_hash}')
     return args, caps_to_drop
@@ -1528,11 +1536,28 @@ def _store_init(store_dir: str) -> None:
     """Create a project-local podrun store (graphroot + runroot symlink)."""
     store_path = pathlib.Path(store_dir).resolve()
     graphroot = store_path / 'graphroot'
-    graphroot.mkdir(parents=True, exist_ok=True)
+    try:
+        graphroot.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print(
+            f'Error: cannot create local store at {store_path}\n'
+            f'  Permission denied creating {graphroot}\n'
+            f'  Check directory permissions or use --local-store-ignore to skip.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Runroot under /tmp (deterministic, short path)
     runroot_target = _runroot_path(str(graphroot))
-    pathlib.Path(runroot_target).mkdir(parents=True, exist_ok=True)
+    try:
+        pathlib.Path(runroot_target).mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print(
+            f'Error: cannot create runroot at {runroot_target}\n'
+            f'  Permission denied. Check /tmp permissions.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Symlink store_dir/runroot → /tmp/podrun-stores/<hash>/
     runroot_link = store_path / 'runroot'
@@ -1702,7 +1727,15 @@ def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], di
 
     graphroot_str = str(graphroot)
     runroot = _runroot_path(graphroot_str)
-    pathlib.Path(runroot).mkdir(parents=True, exist_ok=True)
+    try:
+        pathlib.Path(runroot).mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print(
+            f'Error: cannot create runroot at {runroot}\n'
+            f'  Permission denied. Check /tmp permissions.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Conflict check: error if podman_global_args already has --root/--runroot
     pga = ns.get('podman_global_args') or []
@@ -3066,17 +3099,16 @@ def print_completion(shell: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fuse_overlayfs_fixup(ns, cmd):
+def _fuse_overlayfs_fixup(ns):
     """Apply fuse-overlayfs storage-opt and convert :O to :ro for files.
 
-    Returns the updated *cmd* list, and mutates ``ns['podman_global_args']``
-    to inject ``--storage-opt overlay.mount_program=<path>``.
+    Mutates ``ns['podman_global_args']`` to inject
+    ``--storage-opt overlay.mount_program=<path>`` and converts ``:O`` to
+    ``:ro`` for file-type volume mounts in ``ns['run.passthrough_args']``.
 
-    .. todo:: Phase 2.8 — the :O→:ro conversion only handles the equals form
-       (``-v=src:dst:O``).  ``_PassthroughAction`` stores value flags in
-       space-separated form (``['-v', 'src:dst:O']``), which this misses.
-       Same class of bug fixed in ``_expand_volume_tilde`` and
-       ``_volume_mount_destinations``.  Evaluate and fix in Phase 2.8.
+    Must be called **before** ``build_overlay_run_command()`` so that the
+    storage-opt is included in the built command and the ``:O`` conversion
+    applies to passthrough args before overlay args are prepended.
     """
     fuse_path = shutil.which('fuse-overlayfs')
     if not fuse_path:
@@ -3090,19 +3122,36 @@ def _fuse_overlayfs_fixup(ns, cmd):
     ns['podman_global_args'] = existing + ['--storage-opt', f'overlay.mount_program={fuse_path}']
 
     # fuse-overlayfs cannot overlay single files — only directories.
-    # Convert :O to :ro for file-type volume mounts.
-    converted = []
-    for arg in cmd:
-        m = re.match(r'^(-v=|--volume=)(.+)$', arg)
-        if not m:
-            converted.append(arg)
+    # Convert :O to :ro for file-type volume mounts in passthrough args.
+    # Handles both equals form (-v=/host:ctr:O) and space form (-v /host:ctr:O).
+    pt = ns.get('run.passthrough_args') or []
+    result = []
+    skip = False
+    for i, arg in enumerate(pt):
+        if skip:
+            skip = False
             continue
-        prefix, spec = m.group(1), m.group(2)
-        parts = spec.split(':')
-        if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
-            parts[-1] = 'ro'
-        converted.append(prefix + ':'.join(parts))
-    return converted
+        # Equals form: -v=/host/file:/ctr:O or --volume=/host/file:/ctr:O
+        m = re.match(r'^(-v=|--volume=)(.+)$', arg)
+        if m:
+            prefix, spec = m.group(1), m.group(2)
+            parts = spec.split(':')
+            if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
+                parts[-1] = 'ro'
+            result.append(prefix + ':'.join(parts))
+            continue
+        # Space form: -v /host/file:/ctr:O or --volume /host/file:/ctr:O
+        if arg in ('-v', '--volume') and i + 1 < len(pt):
+            spec = pt[i + 1]
+            parts = spec.split(':')
+            if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
+                parts[-1] = 'ro'
+                result.append(arg)
+                result.append(':'.join(parts))
+                skip = True
+                continue
+        result.append(arg)
+    ns['run.passthrough_args'] = result
 
 
 # ---------------------------------------------------------------------------
@@ -3247,14 +3296,14 @@ def _handle_run(result, podman_path):  # noqa: C901
         )
         ns['run.store_socket'] = sock
 
+    # Fuse-overlayfs fixup — must run before build_overlay_run_command so
+    # --storage-opt is already in podman_global_args when the command is built,
+    # and :O→:ro conversion applies to passthrough args (not the final cmd).
+    if ns.get('run.fuse_overlayfs'):
+        _fuse_overlayfs_fixup(ns)
+
     # Build the full run command with overlay injection
     cmd, _caps_to_drop = build_overlay_run_command(result, podman_path)
-
-    # Fuse-overlayfs fixup
-    if ns.get('run.fuse_overlayfs'):
-        cmd = _fuse_overlayfs_fixup(ns, cmd)
-        # Rebuild command since global args may have changed
-        cmd, _caps_to_drop = build_overlay_run_command(result, podman_path)
 
     # Clean stale files (>48h) from previous configs
     if ns.get('run.user_overlay'):

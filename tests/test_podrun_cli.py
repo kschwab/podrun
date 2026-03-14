@@ -288,7 +288,7 @@ class TestBuildRootParser:
 
     def test_store_destroy_default_false(self):
         ns, _ = self._parse([])
-        assert ns['root.local_store_destroy'] is False
+        assert ns['root.local_store_destroy'] is None
 
     def test_podman_global_value_flags_consumed(self):
         """Podman global value flags are consumed into podman_global_args."""
@@ -313,16 +313,16 @@ class TestBuildRootParser:
 
     def test_defaults(self):
         ns, _ = self._parse([])
-        assert ns['root.print_cmd'] is False
+        assert ns['root.print_cmd'] is None
         assert ns['root.config'] is None
-        assert ns['root.no_devconfig'] is False
+        assert ns['root.no_devconfig'] is None
         assert ns['root.config_script'] is None
         assert ns['root.completion'] is None
-        assert ns['root.version'] is False
+        assert ns['root.version'] is None
         assert ns['root.local_store'] is None
-        assert ns['root.local_store_ignore'] is False
-        assert ns['root.local_store_auto_init'] is False
-        assert ns['root.local_store_info'] is False
+        assert ns['root.local_store_ignore'] is None
+        assert ns['root.local_store_auto_init'] is None
+        assert ns['root.local_store_info'] is None
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +454,7 @@ class TestBuildRunParser:
         assert ns['run.interactive_overlay'] is None
         assert ns['run.workspace'] is None
         assert ns['run.adhoc'] is None
-        assert ns['run.print_overlays'] is False
+        assert ns['run.print_overlays'] is None
         assert ns['run.x11'] is None
         assert ns['run.podman_remote'] is None
         assert ns['run.shell'] is None
@@ -2658,6 +2658,20 @@ class TestStoreInit:
         _store_init(store_dir)
         assert (tmp_path / 'store' / 'graphroot').is_dir()
         assert (tmp_path / 'store' / 'runroot').is_symlink()
+
+    def test_permission_denied_graphroot(self, tmp_path, capsys):
+        """_store_init exits gracefully on permission error."""
+        parent = tmp_path / 'readonly'
+        parent.mkdir()
+        parent.chmod(0o444)
+        try:
+            store_dir = str(parent / 'store')
+            with pytest.raises(SystemExit):
+                _store_init(store_dir)
+            err = capsys.readouterr().err
+            assert 'Permission denied' in err
+        finally:
+            parent.chmod(0o755)
 
 
 # ---------------------------------------------------------------------------

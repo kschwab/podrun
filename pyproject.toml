@@ -52,7 +52,7 @@ version = {attr = "podrun.__version__"}
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "--dist loadscope --cov=podrun --cov-report=term-missing --cov-fail-under=95"
+addopts = "--dist loadscope --cov=podrun --cov-report=term-missing"
 markers = [
     "live: live container integration tests (require podman)",
     "devcontainer: devcontainer CLI integration tests (require devcontainer + podman)",

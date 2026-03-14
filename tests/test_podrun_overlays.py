@@ -204,6 +204,14 @@ class TestInteractiveOverlayArgs:
         args = _interactive_overlay_args({}, [])
         assert '--detach-keys=ctrl-q,ctrl-q' in args
 
+    def test_init(self):
+        args = _interactive_overlay_args({}, [])
+        assert '--init' in args
+
+    def test_init_skipped_if_present(self):
+        args = _interactive_overlay_args({}, ['--init'])
+        assert args.count('--init') == 0
+
 
 # ---------------------------------------------------------------------------
 # _host_overlay_args
@@ -236,37 +244,54 @@ class TestHostOverlayArgs:
         args = _host_overlay_args({}, [])
         assert '--security-opt=seccomp=unconfined' in args
 
-    def test_init(self):
+    def test_no_init(self):
+        """--init is in interactive overlay, not host overlay."""
         args = _host_overlay_args({}, [])
-        assert '--init' in args
+        assert '--init' not in args
 
-    def test_workspace_volume(self):
-        ns = {'run.workspace_folder': '/app', 'run.workspace_mount_src': '/host/project'}
+    def test_workspace_volume_auto(self):
+        """No -w in passthrough → auto -v= and -w= from dc.workspace_folder."""
+        ns = {'dc.workspace_folder': '/app'}
         args = _host_overlay_args(ns, [])
-        assert '-v=/host/project:/app' in args
+        cwd = str(pathlib.Path.cwd())
+        assert f'-v={cwd}:/app' in args
+        assert '-w=/app' in args
 
-    def test_workdir(self):
-        ns = {'run.workspace_folder': '/work'}
-        args = _host_overlay_args(ns, [])
-        assert '-w=/work' in args
-
-    def test_workdir_not_added_if_present(self):
+    def test_workspace_skipped_when_w_in_passthrough(self):
+        """-w already in passthrough → no auto mount or -w."""
         args = _host_overlay_args({}, ['-w=/custom'])
-        workdir_args = [a for a in args if a.startswith('-w=')]
-        assert len(workdir_args) == 0
+        assert not any(a.startswith('-w=') for a in args)
+        assert not any(a.startswith('-v=') and '/app' in a for a in args)
+
+    def test_workspace_skipped_when_workdir_in_passthrough(self):
+        """--workdir already in passthrough → no auto mount or -w."""
+        args = _host_overlay_args({}, ['--workdir=/custom'])
+        assert not any(a.startswith('-w=') for a in args)
+        assert not any(a.startswith('-v=') and '/app' in a for a in args)
 
     def test_term_env(self):
         args = _host_overlay_args({}, [])
         assert '--env=TERM=xterm-256color' in args
 
     def test_default_workspace_folder(self):
+        """No dc.workspace_folder → defaults to /app."""
         args = _host_overlay_args({}, [])
-        assert any('/app' in a for a in args)
+        assert '-w=/app' in args
+        cwd = str(pathlib.Path.cwd())
+        assert f'-v={cwd}:/app' in args
 
     def test_localtime_mount(self):
         args = _host_overlay_args({}, [])
         if os.path.exists('/etc/localtime'):
             assert '-v=/etc/localtime:/etc/localtime:ro' in args
+
+    def test_auto_mount_skipped_if_target_already_mounted(self):
+        """Target already mounted in passthrough → skip auto -v= but still add -w=."""
+        ns = {'dc.workspace_folder': '/app'}
+        pt = ['--mount=source=/host,target=/app,type=bind']
+        args = _host_overlay_args(ns, pt)
+        assert not any(a.startswith('-v=') and '/app' in a for a in args)
+        assert '-w=/app' in args
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +429,7 @@ class TestEnvArgs:
         assert 'dotfiles' in overlay_arg
 
     def test_workdir_env(self):
-        ns = {'run.host_overlay': True, 'run.workspace_folder': '/work'}
+        ns = {'run.host_overlay': True, 'dc.workspace_folder': '/work'}
         args = _env_args(ns)
         assert '--env=PODRUN_WORKDIR=/work' in args
 

@@ -273,6 +273,26 @@ class TestVolumeMountDestinations:
     def test_empty(self):
         assert _volume_mount_destinations([]) == set()
 
+    def test_mount_equals_form(self):
+        dests = _volume_mount_destinations(['--mount=source=/host,target=/ctr,type=bind'])
+        assert '/ctr' in dests
+
+    def test_mount_space_form(self):
+        dests = _volume_mount_destinations(['--mount', 'source=/host,target=/ctr,type=bind'])
+        assert '/ctr' in dests
+
+    def test_mount_dst_alias(self):
+        dests = _volume_mount_destinations(['--mount=type=volume,src=myvol,dst=/data'])
+        assert '/data' in dests
+
+    def test_mount_destination_alias(self):
+        dests = _volume_mount_destinations(['--mount=type=bind,source=/a,destination=/b'])
+        assert '/b' in dests
+
+    def test_mount_and_volume_combined(self):
+        dests = _volume_mount_destinations(['-v=/a:/b', '--mount=source=/c,target=/d,type=bind'])
+        assert dests == {'/b', '/d'}
+
 
 # ---------------------------------------------------------------------------
 # Tilde expansion

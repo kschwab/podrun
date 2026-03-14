@@ -577,29 +577,47 @@ def _extract_passthrough_entrypoint(pt):
     return alt_entrypoint, filtered
 
 
+def _mount_target(mount_spec: str) -> Optional[str]:
+    """Extract the container target path from a ``--mount`` spec string."""
+    parts = dict(p.split('=', 1) for p in mount_spec.split(',') if '=' in p)
+    for key in ('target', 'dst', 'destination'):
+        if key in parts:
+            return parts[key]
+    return None
+
+
+def _arg_mount_target(args: list, i: int) -> Tuple[Optional[str], int]:
+    """Return ``(target, width)`` for the mount/volume arg at index *i*.
+
+    *width* is 1 for equals form (``--mount=...``), 2 for space form
+    (``--mount spec``).  Returns ``(None, 1)`` for non-mount args.
+    """
+    arg = args[i]
+    mount_m = re.match(r'^--mount=(.*)', arg)
+    if mount_m:
+        return _mount_target(mount_m.group(1)), 1
+    if arg == '--mount' and i + 1 < len(args):
+        return _mount_target(args[i + 1]), 2
+    vol_m = re.match(r'^(-v|--volume)=(.*)', arg)
+    if vol_m:
+        parts = vol_m.group(2).split(':')
+        return (parts[1] if len(parts) >= 2 else None), 1
+    if arg in ('-v', '--volume') and i + 1 < len(args):
+        parts = args[i + 1].split(':')
+        return (parts[1] if len(parts) >= 2 else None), 2
+    return None, 1
+
+
 def _volume_mount_destinations(*arg_lists) -> set:
-    """Extract container destination paths from -v/--volume args across all arg lists."""
+    """Extract container destination paths from -v/--volume/--mount args across all arg lists."""
     dests = set()
     for args in arg_lists:
         i = 0
         while i < len(args):
-            arg = args[i]
-            # Equals form: -v=/host:/container or --volume=/host:/container
-            m = re.match(r'^(-v|--volume)=(.*)', arg)
-            if m:
-                vol_spec = m.group(2)
-            # Space form: -v /host:/container or --volume /host:/container
-            elif arg in ('-v', '--volume') and i + 1 < len(args):
-                vol_spec = args[i + 1]
-                i += 1
-            else:
-                i += 1
-                continue
-            parts = vol_spec.split(':')
-            if len(parts) >= 2:
-                dest = re.sub(r'^~', f'/home/{UNAME}', parts[1])
-                dests.add(dest)
-            i += 1
+            target, width = _arg_mount_target(args, i)
+            if target:
+                dests.add(re.sub(r'^~', f'/home/{UNAME}', target))
+            i += width
     return dests
 
 
@@ -1089,13 +1107,13 @@ def _interactive_overlay_args(ns, pt):
     if not (_passthrough_has_short_flag(pt, 'i') or _passthrough_has_short_flag(pt, 't')):
         args.append('-it')
     args.append('--detach-keys=ctrl-q,ctrl-q')
+    if not _passthrough_has_exact(pt, '--init'):
+        args.append('--init')
     return args
 
 
 def _host_overlay_args(ns, pt):
     """Build args for --host-overlay: overlay host system context onto container."""
-    workspace_folder = ns.get('run.workspace_folder') or '/app'
-    workspace_mount_src = ns.get('run.workspace_mount_src') or str(pathlib.Path.cwd())
     args = []
     if not _passthrough_has_flag(pt, '--hostname'):
         args.append(f'--hostname={platform.node()}')
@@ -1103,10 +1121,12 @@ def _host_overlay_args(ns, pt):
         args.append('--network=host')
     if not _passthrough_has_exact(pt, '--security-opt=seccomp=unconfined'):
         args.append('--security-opt=seccomp=unconfined')
-    if not _passthrough_has_exact(pt, '--init'):
-        args.append('--init')
-    args.append(f'-v={workspace_mount_src}:{workspace_folder}')
+    # Auto workspace: only when -w is not already in passthrough (from dc_run_args
+    # or devcontainer CLI).  When -w is present, the workspace is already configured.
     if not _passthrough_has_flag(pt, '-w') and not _passthrough_has_flag(pt, '--workdir'):
+        workspace_folder = ns.get('dc.workspace_folder') or '/app'
+        if workspace_folder not in _volume_mount_destinations(pt):
+            args.append(f'-v={pathlib.Path.cwd()}:{workspace_folder}')
         args.append(f'-w={workspace_folder}')
     if not _passthrough_has_exact(pt, '--env=TERM=xterm-256color'):
         args.append('--env=TERM=xterm-256color')
@@ -1170,12 +1190,12 @@ def _env_args(ns):
     # and _default_podman_path() to detect re-entry.
     args.append('--env=PODRUN_CONTAINER=1')
 
-    overlays = [name for ns_key, name in _OVERLAY_FIELDS if ns.get(ns_key)]
+    overlays = sorted([name for ns_key, name in _OVERLAY_FIELDS if ns.get(ns_key)])
     overlay_str = ','.join(overlays) if overlays else 'none'
     args.append(f'--env=PODRUN_OVERLAYS={overlay_str}')
 
     if ns.get('run.host_overlay'):
-        workspace_folder = ns.get('run.workspace_folder') or '/app'
+        workspace_folder = ns.get('dc.workspace_folder') or '/app'
         args.append(f'--env=PODRUN_WORKDIR={workspace_folder}')
     if ns.get('run.shell'):
         args.append(f'--env=PODRUN_SHELL={ns["run.shell"]}')
@@ -1359,30 +1379,48 @@ def extract_podrun_config(devcontainer: dict) -> dict:
     return devcontainer.get('customizations', {}).get('podrun', {})  # type: ignore[no-any-return]
 
 
-def devcontainer_run_args(devcontainer: dict) -> list:
-    """Convert devcontainer.json top-level fields to podman run args."""
+def devcontainer_run_args(dc: dict, ns: dict) -> list:
+    """Convert devcontainer.json top-level fields to podman run args.
+
+    Returns ``[]`` when the devcontainer CLI is driving
+    (``ns['internal.dc_from_cli']``), since it already emitted these args.
+    """
+    if ns.get('internal.dc_from_cli'):
+        return []
+
     args: list = []
 
-    for mount in devcontainer.get('mounts', []):
+    for mount in dc.get('mounts', []):
         if isinstance(mount, dict):
             parts = ','.join(f'{k}={v}' for k, v in mount.items())
             args.append(f'--mount={parts}')
         else:
             args.append(f'--mount={mount}')
 
-    for cap in devcontainer.get('capAdd', []):
+    for cap in dc.get('capAdd', []):
         args.append(f'--cap-add={cap}')
 
-    for opt in devcontainer.get('securityOpt', []):
+    for opt in dc.get('securityOpt', []):
         args.append(f'--security-opt={opt}')
 
-    if devcontainer.get('privileged', False):
+    if dc.get('privileged', False):
         args.append('--privileged')
 
-    if devcontainer.get('init', False):
+    if dc.get('init', False):
         args.append('--init')
 
-    args.extend(devcontainer.get('runArgs', []))
+    for key, val in dc.get('containerEnv', {}).items():
+        args.append(f'--env={key}={val}')
+
+    workspace_mount = dc.get('workspaceMount')
+    if workspace_mount:
+        args.append(f'--mount={workspace_mount}')
+
+    workspace_folder = dc.get('workspaceFolder')
+    if workspace_folder:
+        args.append(f'-w={workspace_folder}')
+
+    args.extend(dc.get('runArgs', []))
 
     return args
 
@@ -1810,6 +1848,15 @@ _RUN_CONFIG_MAP = {
     'dotFilesOverlay': 'run.dot_files_overlay',
 }
 
+# Top-level devcontainer.json fields → ns['dc.*'] keys.
+# These are resolved in resolve_config after variable expansion.
+_DC_CONFIG_MAP = {
+    'workspaceMount': 'dc.workspace_mount',
+    'workspaceFolder': 'dc.workspace_folder',
+    'remoteEnv': 'dc.remote_env',
+    'image': 'dc.image',
+}
+
 
 def _devcontainer_to_ns(podrun_cfg: dict) -> dict:
     """Convert customizations.podrun to namespace-keyed dict (non-None only)."""
@@ -1825,20 +1872,148 @@ def _devcontainer_to_ns(podrun_cfg: dict) -> dict:
     return result
 
 
+def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> None:
+    """Expand devcontainer variables and resolve fields to ``ns['dc.*']``.
+
+    No-op when *dc* is empty.  Performs variable expansion on *dc* in-place,
+    then maps top-level devcontainer.json fields to ``ns['dc.*']`` keys via
+    ``_DC_CONFIG_MAP``.  ``dc.workspace_folder`` gets special handling:
+    workspaceMount target takes priority over the workspaceFolder field.
+    """
+    if not dc:
+        return
+
+    # Variable expansion
+    if dc_path:
+        project_dir = _devcontainer_project_dir(dc_path)
+        # First pass: expand workspaceFolder (it can reference localWorkspaceFolder vars)
+        var_context = {
+            'localWorkspaceFolder': project_dir or '',
+            'containerWorkspaceFolder': '',
+        }
+        if 'workspaceFolder' in dc:
+            dc['workspaceFolder'] = _expand_devcontainer_vars(dc['workspaceFolder'], var_context)
+        # Second pass: use resolved containerWorkspaceFolder for remaining fields
+        var_context['containerWorkspaceFolder'] = dc.get('workspaceFolder', '')
+        for field in ('workspaceMount', 'mounts', 'runArgs', 'containerEnv', 'remoteEnv'):
+            if field in dc:
+                dc[field] = _expand_devcontainer_vars(dc[field], var_context)
+
+    # Map dc fields to ns['dc.*']
+    for dc_key, ns_key in _DC_CONFIG_MAP.items():
+        val = dc.get(dc_key)
+        if val is not None:
+            ns[ns_key] = val
+
+    # workspace_folder override: workspaceMount target takes priority
+    ws_mount = dc.get('workspaceMount')
+    if ws_mount and '=' in ws_mount:
+        parts = dict(p.split('=', 1) for p in ws_mount.split(',') if '=' in p)
+        target = parts.get('target', '')
+        if target:
+            ns['dc.workspace_folder'] = target
+
+
+# ---------------------------------------------------------------------------
+# Devcontainer variable expansion
+# ---------------------------------------------------------------------------
+
+_DC_VAR_RE = re.compile(r'\$\{([^}]+)\}')
+
+
+def _devcontainer_project_dir(dc_path) -> Optional[str]:
+    """Derive the project root directory from a devcontainer.json path.
+
+    Returns None if *dc_path* is None.
+    """
+    if dc_path is None:
+        return None
+    p = pathlib.Path(dc_path)
+    if not p.is_file():
+        return str(p)
+    # Walk up looking for .devcontainer parent dir
+    for parent in (p.parent, p.parent.parent):
+        if parent.name == '.devcontainer':
+            return str(parent.parent)
+    # .devcontainer.json shorthand: file is at project root
+    if p.name == '.devcontainer.json':
+        return str(p.parent)
+    # Explicit path: use parent directory
+    return str(p.parent)
+
+
+def _expand_devcontainer_vars(value, context: dict):  # noqa: C901
+    """Expand devcontainer.json variables in a string value.
+
+    Recursively walks dicts and lists.  Non-string/dict/list values are
+    returned unchanged.
+
+    Context keys:
+
+    * ``localWorkspaceFolder``     — host path containing devcontainer.json
+    * ``containerWorkspaceFolder`` — container path (workspaceFolder value)
+    """
+    if isinstance(value, str):
+
+        def _replace(m):
+            expr = m.group(1)
+            if expr == 'localWorkspaceFolder':
+                return context.get('localWorkspaceFolder', '')
+            if expr == 'localWorkspaceFolderBasename':
+                lwf = context.get('localWorkspaceFolder', '')
+                return os.path.basename(lwf) if lwf else ''
+            if expr == 'containerWorkspaceFolder':
+                return context.get('containerWorkspaceFolder', '')
+            if expr == 'containerWorkspaceFolderBasename':
+                cwf = context.get('containerWorkspaceFolder', '')
+                return os.path.basename(cwf) if cwf else ''
+            if expr.startswith('localEnv:'):
+                rest = expr[len('localEnv:') :]
+                if ':' in rest:
+                    var, default = rest.split(':', 1)
+                    return os.environ.get(var, default)
+                return os.environ.get(rest, '')
+            if expr.startswith('containerEnv:'):
+                # Container env vars are only available at runtime; leave as-is
+                return m.group(0)
+            if expr == 'devcontainerId':
+                lwf = context.get('localWorkspaceFolder', '')
+                return hashlib.sha256(lwf.encode()).hexdigest()[:16]
+            # Unknown variable — leave as-is
+            return m.group(0)
+
+        return _DC_VAR_RE.sub(_replace, value)
+    if isinstance(value, dict):
+        return {k: _expand_devcontainer_vars(v, context) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_devcontainer_vars(item, context) for item in value]
+    return value
+
+
 def _load_devcontainer(ns) -> Tuple[dict, dict]:
-    """Load devcontainer.json and extract podrun config.
+    """Load devcontainer.json, expand variables, and resolve to ``ns['dc.*']``.
 
     Returns ``(dc, podrun_cfg)``.  When ``root.no_devconfig`` is set or no
-    devcontainer.json is found, both are empty dicts.
+    devcontainer.json is found, both are empty dicts and ns is unchanged.
+
+    When the devcontainer CLI is driving (detected via the
+    ``devcontainer.config_file`` label), ``ns['internal.dc_from_cli']`` is set
+    to ``True``.  The dc dict is still fully parsed and ``dc.*`` namespace
+    fields are populated (for internal use like ``PODRUN_WORKDIR``).  Callers
+    that emit podman args from dc fields must check this flag to avoid
+    duplicating args the CLI already passed in.
     """
     if ns.get('root.no_devconfig'):
         return {}, {}
 
-    # Check for label-based dc selection
+    # Check for label-based dc selection (devcontainer CLI passes this label)
     label_config_path = None
     for lbl in ns.get('run.label') or []:
-        if lbl.startswith('devcontainer.config_file='):
-            label_config_path = lbl.split('=', 1)[1]
+        key, _, value = lbl.partition('=')
+        if key == 'devcontainer.config_file':
+            label_config_path = value
+            # Mark that devcontainer CLI is driving
+            ns['internal.dc_from_cli'] = True
 
     if ns.get('root.config'):
         dc_path = ns['root.config']
@@ -1848,6 +2023,9 @@ def _load_devcontainer(ns) -> Tuple[dict, dict]:
         dc_path = find_devcontainer_json()
 
     dc = parse_devcontainer_json(dc_path) if dc_path is not None else {}
+    dc_path_str = str(dc_path) if dc_path is not None else None
+    _resolve_dc_fields(dc, ns, dc_path_str)
+
     podrun_cfg = extract_podrun_config(dc)
     return dc, podrun_cfg
 
@@ -1869,8 +2047,12 @@ def _collect_script_config(ns, podrun_cfg, flags) -> Tuple[dict, list]:
     return parse_config_tokens(script_tokens, flags)
 
 
-def _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns):
-    """Apply run-subcommand-specific merges: overlays, image fallback, exports."""
+def _apply_run_specifics(ns, result, podrun_cfg, script_ns):
+    """Apply run-subcommand-specific merges: overlays, image fallback, exports.
+
+    All dc top-level fields are already resolved to ``ns['dc.*']`` by
+    ``resolve_config`` before this function is called.
+    """
     # Overlay implication chain: adhoc→workspace→host+interactive→user
     #                           dot_files→user
     if ns.get('run.adhoc'):
@@ -1883,19 +2065,13 @@ def _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns):
     if ns.get('run.dot_files_overlay'):
         ns['run.user_overlay'] = True
 
-    # workspaceFolder: top-level devcontainer field (not customizations.podrun)
-    if not ns.get('run.workspace_folder'):
-        dc_workspace = dc.get('workspaceFolder')
-        if dc_workspace:
-            ns['run.workspace_folder'] = dc_workspace
-
-    # remoteEnv: top-level devcontainer field (not customizations.podrun)
-    dc_remote_env = dc.get('remoteEnv')
+    # remoteEnv: resolved from dc in resolve_config → ns['dc.remote_env']
+    dc_remote_env = ns.get('dc.remote_env')
     if dc_remote_env:
         ns['run.remote_env'] = dc_remote_env
 
     # Image/command resolution: CLI trailing > devcontainer image
-    dc_image = dc.get('image')
+    dc_image = ns.get('dc.image')
     if not result.trailing_args and dc_image:
         result.trailing_args = [dc_image]
 
@@ -1922,7 +2098,7 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
 
     ns = result.ns
 
-    # 1–3. Load devcontainer.json + extract customizations.podrun
+    # 1–3. Load devcontainer.json, expand variables, resolve to ns['dc.*']
     dc, podrun_cfg = _load_devcontainer(ns)
 
     # 4–5. Determine and execute config scripts
@@ -1930,7 +2106,7 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
 
     # 6. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
     dc_ns = _devcontainer_to_ns(podrun_cfg)
-    dc_run_args = devcontainer_run_args(dc)
+    dc_run_args = devcontainer_run_args(dc, ns)
 
     # 7. Merge scalars — _first(cli_ns, script_ns, dc_ns) per key
     all_keys = set()
@@ -1955,7 +2131,7 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
 
     # 9. Handle run specifics
     if ns.get('subcommand') == 'run':
-        _apply_run_specifics(ns, result, dc, podrun_cfg, script_ns)
+        _apply_run_specifics(ns, result, podrun_cfg, script_ns)
 
     return result
 
@@ -3305,10 +3481,8 @@ def _handle_run(result, podman_path):  # noqa: C901
 
     # Set workspace defaults for _host_overlay_args
     if ns.get('run.host_overlay'):
-        if not ns.get('run.workspace_folder'):
-            ns['run.workspace_folder'] = '/app'
-        if not ns.get('run.workspace_mount_src'):
-            ns['run.workspace_mount_src'] = os.getcwd()
+        if not ns.get('dc.workspace_folder'):
+            ns['dc.workspace_folder'] = '/app'
 
     # Container state management
     # For --print-cmd, allow prompts so the printed command reflects the user's choice.

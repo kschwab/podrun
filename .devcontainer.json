@@ -1,17 +1,18 @@
 {
     "image": "ssd-docker-dev-virtual.artifactorygslb.micron.com/plato/future:40.2",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/podrun,type=bind",
     "workspaceFolder": "/podrun",
     "remoteEnv": {
         "CLAUDE_CONFIG_DIR": "/podrun/.claude/config"
     },
     "customizations": {
         "podrun": {
-            "adhoc": true,
+            "hostOverlay": true,
             "login": true,
             "autoAttach": true,
             "podmanRemote": true,
             "exports": ["~/.aws:.claude/config/.aws"],
-            "localStoreAutoInit": true,
+            "localStoreIgnore": true,
             "fuseOverlayfs": true,
             "shell": "bash"
         }

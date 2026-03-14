@@ -4,7 +4,9 @@ import subprocess
 import pytest
 
 from podrun.podrun import (
+    _devcontainer_project_dir,
     _devcontainer_to_ns,
+    _expand_devcontainer_vars,
     _strip_jsonc,
     build_run_command,
     devcontainer_run_args,
@@ -347,48 +349,48 @@ class TestExtractPodrunConfig:
 class TestDevcontainerRunArgs:
     def test_mounts_string(self):
         dc = {'mounts': ['type=bind,src=/a,dst=/b']}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--mount=type=bind,src=/a,dst=/b' in args
 
     def test_mounts_dict(self):
         dc = {'mounts': [{'type': 'bind', 'src': '/a', 'dst': '/b'}]}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--mount=type=bind,src=/a,dst=/b' in args
 
     def test_cap_add(self):
         dc = {'capAdd': ['SYS_PTRACE', 'NET_ADMIN']}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--cap-add=SYS_PTRACE' in args
         assert '--cap-add=NET_ADMIN' in args
 
     def test_security_opt(self):
         dc = {'securityOpt': ['seccomp=unconfined']}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--security-opt=seccomp=unconfined' in args
 
     def test_privileged(self):
         dc = {'privileged': True}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--privileged' in args
 
     def test_privileged_false(self):
         dc = {'privileged': False}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--privileged' not in args
 
     def test_init(self):
         dc = {'init': True}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--init' in args
 
     def test_run_args(self):
         dc = {'runArgs': ['--rm', '--network=host']}
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert '--rm' in args
         assert '--network=host' in args
 
     def test_empty(self):
-        assert devcontainer_run_args({}) == []
+        assert devcontainer_run_args({}, {}) == []
 
     def test_combined(self):
         dc = {
@@ -398,13 +400,24 @@ class TestDevcontainerRunArgs:
             'init': True,
             'runArgs': ['--rm'],
         }
-        args = devcontainer_run_args(dc)
+        args = devcontainer_run_args(dc, {})
         assert len(args) == 5
         assert '--mount=type=bind,src=/a,dst=/b' in args
         assert '--cap-add=SYS_PTRACE' in args
         assert '--privileged' in args
         assert '--init' in args
         assert '--rm' in args
+
+    def test_dc_from_cli_returns_empty(self):
+        """When devcontainer CLI is driving, no args are emitted."""
+        dc = {
+            'mounts': ['type=bind,src=/a,dst=/b'],
+            'capAdd': ['SYS_PTRACE'],
+            'workspaceMount': 'source=/host,target=/app,type=bind',
+            'workspaceFolder': '/app',
+        }
+        ns = {'internal.dc_from_cli': True}
+        assert devcontainer_run_args(dc, ns) == []
 
 
 # ---------------------------------------------------------------------------
@@ -803,13 +816,13 @@ class TestResolveConfig:
         dc_file = dc_dir / 'devcontainer.json'
         dc_file.write_text(json.dumps({'image': 'alpine', 'workspaceFolder': '/workspace'}))
         r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
-        assert r.ns['run.workspace_folder'] == '/workspace'
+        assert r.ns['dc.workspace_folder'] == '/workspace'
 
     def test_workspace_folder_default_without_devcontainer(self, monkeypatch):
         """Without devcontainer.json, workspace_folder stays unset (default applied later)."""
         r = self._resolve(['--no-devconfig', 'run', 'alpine'], monkeypatch)
         # resolve_config doesn't set the /app default; _handle_run does
-        assert r.ns.get('run.workspace_folder') is None
+        assert r.ns.get('dc.workspace_folder') is None
 
     def test_remote_env_from_devcontainer(self, monkeypatch, tmp_project):
         """Top-level remoteEnv from devcontainer.json is picked up."""
@@ -1438,3 +1451,430 @@ class TestIntegrationPipeline:
         assert mount_idx < dc_script_idx
         assert dc_script_idx < cli_script_idx
         assert cli_script_idx < cli_var_idx
+
+
+# ---------------------------------------------------------------------------
+# TestExpandDevcontainerVars — variable expansion
+# ---------------------------------------------------------------------------
+
+
+class TestExpandDevcontainerVars:
+    def test_expand_local_workspace_folder(self):
+        ctx = {'localWorkspaceFolder': '/home/user/project', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${localWorkspaceFolder}/src', ctx)
+        assert result == '/home/user/project/src'
+
+    def test_expand_local_workspace_folder_basename(self):
+        ctx = {'localWorkspaceFolder': '/home/user/project', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${localWorkspaceFolderBasename}', ctx)
+        assert result == 'project'
+
+    def test_expand_container_workspace_folder(self):
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': '/workspaces/myproj'}
+        result = _expand_devcontainer_vars('${containerWorkspaceFolder}', ctx)
+        assert result == '/workspaces/myproj'
+
+    def test_expand_container_workspace_folder_basename(self):
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': '/workspaces/myproj'}
+        result = _expand_devcontainer_vars('${containerWorkspaceFolderBasename}', ctx)
+        assert result == 'myproj'
+
+    def test_expand_local_env(self, monkeypatch):
+        monkeypatch.setenv('PODRUN_TEST_VAR_XYZ', 'hello')
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${localEnv:PODRUN_TEST_VAR_XYZ}', ctx)
+        assert result == 'hello'
+
+    def test_expand_local_env_default(self, monkeypatch):
+        monkeypatch.delenv('PODRUN_MISSING_VAR_XYZ', raising=False)
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${localEnv:PODRUN_MISSING_VAR_XYZ:fallback}', ctx)
+        assert result == 'fallback'
+
+    def test_expand_local_env_missing_no_default(self, monkeypatch):
+        monkeypatch.delenv('PODRUN_MISSING_VAR_XYZ', raising=False)
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${localEnv:PODRUN_MISSING_VAR_XYZ}', ctx)
+        assert result == ''
+
+    def test_expand_container_env_passthrough(self):
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${containerEnv:PATH}', ctx)
+        assert result == '${containerEnv:PATH}'
+
+    def test_expand_devcontainer_id(self):
+        ctx = {'localWorkspaceFolder': '/home/user/project', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${devcontainerId}', ctx)
+        import hashlib
+
+        expected = hashlib.sha256(b'/home/user/project').hexdigest()[:16]
+        assert result == expected
+
+    def test_expand_nested_in_dict(self):
+        ctx = {'localWorkspaceFolder': '/proj', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars({'key': '${localWorkspaceFolder}/dir'}, ctx)
+        assert result == {'key': '/proj/dir'}
+
+    def test_expand_nested_in_list(self):
+        ctx = {'localWorkspaceFolder': '/proj', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars(['${localWorkspaceFolder}/a', 'plain'], ctx)
+        assert result == ['/proj/a', 'plain']
+
+    def test_expand_no_vars(self):
+        ctx = {'localWorkspaceFolder': '/proj', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('no variables here', ctx)
+        assert result == 'no variables here'
+
+    def test_expand_non_string(self):
+        ctx = {'localWorkspaceFolder': '/proj', 'containerWorkspaceFolder': ''}
+        assert _expand_devcontainer_vars(42, ctx) == 42
+        assert _expand_devcontainer_vars(True, ctx) is True
+        assert _expand_devcontainer_vars(None, ctx) is None
+
+    def test_expand_unknown_var_left_as_is(self):
+        ctx = {'localWorkspaceFolder': '', 'containerWorkspaceFolder': ''}
+        result = _expand_devcontainer_vars('${unknownVar}', ctx)
+        assert result == '${unknownVar}'
+
+
+# ---------------------------------------------------------------------------
+# TestDevcontainerProjectDir
+# ---------------------------------------------------------------------------
+
+
+class TestDevcontainerProjectDir:
+    def test_standard_location(self, tmp_path):
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text('{}')
+        assert _devcontainer_project_dir(str(dc_file)) == str(tmp_path)
+
+    def test_named_config(self, tmp_path):
+        dc_dir = tmp_path / '.devcontainer' / 'myconfig'
+        dc_dir.mkdir(parents=True)
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text('{}')
+        assert _devcontainer_project_dir(str(dc_file)) == str(tmp_path)
+
+    def test_shorthand(self, tmp_path):
+        dc_file = tmp_path / '.devcontainer.json'
+        dc_file.write_text('{}')
+        assert _devcontainer_project_dir(str(dc_file)) == str(tmp_path)
+
+    def test_explicit_path(self, tmp_path):
+        dc_file = tmp_path / 'custom.json'
+        dc_file.write_text('{}')
+        assert _devcontainer_project_dir(str(dc_file)) == str(tmp_path)
+
+    def test_none(self):
+        assert _devcontainer_project_dir(None) is None
+
+
+# ---------------------------------------------------------------------------
+# TestWorkspaceMount — workspaceMount parsing
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceMount:
+    def _resolve(self, argv, monkeypatch, dc=None, dc_json_path=None):
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
+        )
+        if dc is not None:
+            monkeypatch.setattr(podrun_mod, 'parse_devcontainer_json', lambda path: dc)
+        result = parse_args(argv)
+        return resolve_config(result)
+
+    def test_workspace_mount_parsed(self, monkeypatch, tmp_project):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'workspaceMount': 'source=/host/proj,target=/workspace,type=bind',
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_mount') == 'source=/host/proj,target=/workspace,type=bind'
+        assert r.ns.get('dc.workspace_folder') == '/workspace'
+
+    def test_workspace_mount_empty_disables(self, monkeypatch, tmp_project):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'workspaceMount': ''}))
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_mount') == ''
+
+    def test_workspace_mount_variables_expanded(self, monkeypatch, tmp_project):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'workspaceMount': (
+                        'source=${localWorkspaceFolder},target=/workspace,type=bind'
+                    ),
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        mount = r.ns.get('dc.workspace_mount') or ''
+        assert '${' not in mount
+        assert f'source={tmp_project}' in mount
+
+    def test_workspace_folder_fallback(self, monkeypatch, tmp_project):
+        """No workspaceMount → existing workspaceFolder behavior."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'workspaceFolder': '/myworkspace'}))
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/myworkspace'
+        assert r.ns.get('dc.workspace_mount') is None
+
+    def test_workspace_mount_target_overrides_workspace_folder(self, monkeypatch, tmp_project):
+        """workspaceMount target takes priority over workspaceFolder."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'workspaceFolder': '/ignored',
+                    'workspaceMount': 'source=/host,target=/from-mount,type=bind',
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/from-mount'
+
+    def test_workspace_mount_no_target_falls_through(self, monkeypatch, tmp_project):
+        """workspaceMount without target= falls through to workspaceFolder."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'workspaceFolder': '/from-folder',
+                    'workspaceMount': 'source=/host,type=bind',
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        # No target in workspaceMount → workspaceFolder wins
+        assert r.ns.get('dc.workspace_folder') == '/from-folder'
+
+
+# ---------------------------------------------------------------------------
+# TestDevcontainerRunArgsContainerEnv — containerEnv support
+# ---------------------------------------------------------------------------
+
+
+class TestDevcontainerRunArgsContainerEnv:
+    def test_container_env(self):
+        dc = {'containerEnv': {'FOO': 'bar', 'BAZ': 'qux'}}
+        args = devcontainer_run_args(dc, {})
+        assert '--env=FOO=bar' in args
+        assert '--env=BAZ=qux' in args
+
+    def test_container_env_empty(self):
+        dc = {'containerEnv': {}}
+        args = devcontainer_run_args(dc, {})
+        assert not any(a.startswith('--env=') for a in args)
+
+    def test_container_env_absent(self):
+        dc = {}
+        args = devcontainer_run_args(dc, {})
+        assert not any(a.startswith('--env=') for a in args)
+
+
+# ---------------------------------------------------------------------------
+# TestDevcontainerCliDetection — skip dc→args when devcontainer CLI drives
+# ---------------------------------------------------------------------------
+
+
+class TestDevcontainerCliDetection:
+    def _resolve(self, argv, monkeypatch, dc=None, dc_json_path=None):
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
+        )
+        if dc is not None:
+            monkeypatch.setattr(podrun_mod, 'parse_devcontainer_json', lambda path: dc)
+        result = parse_args(argv)
+        return resolve_config(result)
+
+    def test_dc_run_args_skipped_with_label(self, monkeypatch, tmp_project):
+        """When devcontainer CLI drives, dc fields are NOT re-emitted as podman args."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc = {
+            'image': 'alpine',
+            'workspaceMount': 'source=/host,target=/app,type=bind',
+            'workspaceFolder': '/app',
+            'capAdd': ['SYS_PTRACE'],
+        }
+        dc_file.write_text(json.dumps(dc))
+        # Simulate devcontainer CLI: passes mount + label in passthrough
+        r = self._resolve(
+            [
+                'run',
+                '-l',
+                f'devcontainer.config_file={dc_file}',
+                '--mount=source=/host,target=/app,type=bind',
+                '-w=/app',
+                '--cap-add=SYS_PTRACE',
+                'alpine',
+            ],
+            monkeypatch,
+        )
+        pt = r.ns['run.passthrough_args']
+        # Only ONE mount to /app (from CLI passthrough), not duplicated by dc
+        from podrun.podrun import _volume_mount_destinations
+
+        dests = _volume_mount_destinations(pt)
+        assert '/app' in dests
+        mount_count = 0
+        i = 0
+        while i < len(pt):
+            if pt[i].startswith('--mount=') and '/app' in pt[i]:
+                mount_count += 1
+            elif pt[i] == '--mount' and i + 1 < len(pt) and '/app' in pt[i + 1]:
+                mount_count += 1
+                i += 1
+            i += 1
+        assert mount_count == 1
+
+    def test_dc_run_args_emitted_without_label(self, monkeypatch, tmp_project):
+        """When podrun drives directly, dc fields ARE emitted as podman args."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc = {
+            'image': 'alpine',
+            'workspaceMount': 'source=/host,target=/app,type=bind',
+            'workspaceFolder': '/app',
+        }
+        dc_file.write_text(json.dumps(dc))
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        pt = r.ns['run.passthrough_args']
+        assert any('--mount=' in a and '/app' in a for a in pt)
+        assert any(a == '-w=/app' for a in pt)
+
+    def test_podrun_cfg_preserved_with_label(self, monkeypatch, tmp_project):
+        """When devcontainer CLI drives, podrun_cfg is still available."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc = {
+            'image': 'alpine',
+            'customizations': {'podrun': {'userOverlay': True, 'exports': ['~/.ssh:.ssh']}},
+        }
+        dc_file.write_text(json.dumps(dc))
+        r = self._resolve(
+            ['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'],
+            monkeypatch,
+        )
+        # Overlay config from customizations.podrun should be applied
+        assert r.ns.get('run.user_overlay') is True
+
+    def test_dc_namespace_set_with_label(self, monkeypatch, tmp_project):
+        """When devcontainer CLI drives, dc.* namespace values are still populated."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc = {
+            'image': 'alpine',
+            'workspaceFolder': '/workspace',
+            'remoteEnv': {'FOO': 'bar'},
+        }
+        dc_file.write_text(json.dumps(dc))
+        r = self._resolve(
+            ['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'],
+            monkeypatch,
+        )
+        # dc.* fields are populated for internal use (PODRUN_WORKDIR, etc.)
+        assert r.ns.get('dc.workspace_folder') == '/workspace'
+        assert r.ns.get('dc.remote_env') == {'FOO': 'bar'}
+        # But the internal flag is set to suppress arg emission
+        assert r.ns.get('internal.dc_from_cli') is True
+
+
+# ---------------------------------------------------------------------------
+# TestVariableExpansionIntegration — end-to-end with resolve_config
+# ---------------------------------------------------------------------------
+
+
+class TestVariableExpansionIntegration:
+    def _resolve(self, argv, monkeypatch, dc_json_path=None):
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
+        )
+        result = parse_args(argv)
+        return resolve_config(result)
+
+    def test_workspace_folder_with_basename_var(self, monkeypatch, tmp_project):
+        """workspaceFolder using ${localWorkspaceFolderBasename} is expanded."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'workspaceFolder': '/workspaces/${localWorkspaceFolderBasename}',
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        expected = f'/workspaces/{tmp_project.name}'
+        assert r.ns.get('dc.workspace_folder') == expected
+
+    def test_mounts_variable_expanded(self, monkeypatch, tmp_project):
+        """Variables in mounts array are expanded."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'mounts': ['type=bind,src=${localWorkspaceFolder}/data,dst=/data'],
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        pt = r.ns.get('run.passthrough_args') or []
+        expected_mount = f'--mount=type=bind,src={tmp_project}/data,dst=/data'
+        assert expected_mount in pt
+
+    def test_remote_env_variable_expanded(self, monkeypatch, tmp_project):
+        """Variables in remoteEnv are expanded."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'remoteEnv': {'PROJECT': '${localWorkspaceFolder}'},
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns['run.remote_env'] == {'PROJECT': str(tmp_project)}
+
+    def test_no_devconfig_skips_expansion(self, monkeypatch):
+        """--no-devconfig produces no variable expansion errors."""
+        r = self._resolve(['--no-devconfig', 'run', 'alpine'], monkeypatch)
+        assert r.ns.get('dc.workspace_folder') is None

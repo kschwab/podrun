@@ -6,8 +6,8 @@ import subprocess
 
 import pytest
 
-import podrun.podrun2 as podrun2_mod
-from podrun.podrun2 import (
+import podrun.podrun as podrun_mod
+from podrun.podrun import (
     BOOTSTRAP_CAPS,
     GID,
     PODRUN_ENTRYPOINT_PATH,
@@ -36,9 +36,9 @@ from podrun.podrun2 import (
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
+    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
+    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ class TestComputeCapsToDrop:
 class TestUserOverlayArgs:
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
 
     def _call(self, ns=None, pt=None):
         ns = ns or {}
@@ -260,7 +260,7 @@ class TestHostOverlayArgs:
 
 class TestDotFilesOverlayArgs:
     def test_mounts_existing_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
         # Create a dotfile
         (tmp_path / '.vimrc').write_text('set nocp')
         args = _dot_files_overlay_args({}, [])
@@ -269,26 +269,26 @@ class TestDotFilesOverlayArgs:
         assert ':ro' in vimrc_args[0]
 
     def test_skips_missing_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
         # No dotfiles exist
         args = _dot_files_overlay_args({}, [])
         assert args == []
 
     def test_mounts_directory(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
         (tmp_path / '.emacs.d').mkdir()
         args = _dot_files_overlay_args({}, [])
         emacs_args = [a for a in args if '.emacs.d' in a]
         assert len(emacs_args) == 1
 
     def test_only_known_dotfiles(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
         (tmp_path / '.random_config').write_text('x')
         args = _dot_files_overlay_args({}, [])
         assert args == []
 
     def test_all_dotfiles_present(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
         for name in _DOTFILES_MOUNT:
             (tmp_path / name).write_text('x')
         args = _dot_files_overlay_args({}, [])
@@ -309,7 +309,7 @@ class TestX11Args:
     def test_x11_with_socket(self, monkeypatch):
         monkeypatch.setattr(pathlib.Path, 'exists', lambda self: str(self) == '/tmp/.X11-unix')
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout='/home/user/.Xauthority', stderr=''
@@ -333,13 +333,13 @@ class TestPodmanRemoteArgs:
         sock.touch()
         ns = {'run.store_socket': str(sock)}
         args = _podman_remote_args(ns)
-        assert f'-v={sock}:{podrun2_mod.PODRUN_SOCKET_PATH}' in args
-        assert f'--env=CONTAINER_HOST={podrun2_mod.PODRUN_CONTAINER_HOST}' in args
+        assert f'-v={sock}:{podrun_mod.PODRUN_SOCKET_PATH}' in args
+        assert f'--env=CONTAINER_HOST={podrun_mod.PODRUN_CONTAINER_HOST}' in args
 
     def test_fallback_systemd_socket(self, tmp_path, monkeypatch):
         sock = tmp_path / 'podman.sock'
         sock.touch()
-        monkeypatch.setattr(podrun2_mod, 'UID', 99999)
+        monkeypatch.setattr(podrun_mod, 'UID', 99999)
         # Patch to make the fallback path point to our temp file
         real_exists = pathlib.Path.exists
 
@@ -521,7 +521,7 @@ class TestDotFilesOverlayCLI:
 class TestEntrypointCapsToDrop:
     @pytest.fixture(autouse=True)
     def _tmp(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
 
     def test_default_caps(self):
         path = generate_run_entrypoint({})

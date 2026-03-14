@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from podrun.podrun2 import (
+from podrun.podrun import (
     _devcontainer_to_ns,
     _strip_jsonc,
     build_run_command,
@@ -17,7 +17,7 @@ from podrun.podrun2 import (
     run_config_scripts,
 )
 
-import podrun.podrun2 as podrun2_mod
+import podrun.podrun as podrun_mod
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ import podrun.podrun2 as podrun2_mod
 
 @pytest.fixture
 def mock_run_os_cmd(monkeypatch):
-    """Monkeypatch podrun2.run_os_cmd and return a controller."""
+    """Monkeypatch podrun.run_os_cmd and return a controller."""
 
     class Controller:
         def __init__(self):
@@ -60,7 +60,7 @@ def mock_run_os_cmd(monkeypatch):
             return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
 
     ctrl = Controller()
-    monkeypatch.setattr(podrun2_mod, 'run_os_cmd', ctrl)
+    monkeypatch.setattr(podrun_mod, 'run_os_cmd', ctrl)
     return ctrl
 
 
@@ -442,14 +442,14 @@ class TestResolveConfig:
     def _resolve(self, argv, monkeypatch, dc=None, dc_json_path=None, script_stdout=None):
         """Helper to parse + resolve with controlled config sources."""
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'find_devcontainer_json',
             lambda start_dir=None: dc_json_path,
         )
 
         if script_stdout is not None:
             monkeypatch.setattr(
-                podrun2_mod,
+                podrun_mod,
                 'run_os_cmd',
                 lambda cmd: subprocess.CompletedProcess(
                     args='', returncode=0, stdout=script_stdout
@@ -457,7 +457,7 @@ class TestResolveConfig:
             )
 
         if dc is not None:
-            monkeypatch.setattr(podrun2_mod, 'parse_devcontainer_json', lambda path: dc)
+            monkeypatch.setattr(podrun_mod, 'parse_devcontainer_json', lambda path: dc)
 
         result = parse_args(argv)
         return resolve_config(result)
@@ -531,8 +531,8 @@ class TestResolveConfig:
                 return subprocess.CompletedProcess(args='', returncode=0, stdout='--rm')
             return subprocess.CompletedProcess(args='', returncode=0, stdout='--name from-script')
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
-        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
         r = parse_args(
             [
@@ -595,10 +595,10 @@ class TestResolveConfig:
                 return subprocess.CompletedProcess(args='', returncode=0, stdout='--workspace')
             return subprocess.CompletedProcess(args='', returncode=0, stdout='--shell /bin/zsh')
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
-        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
         monkeypatch.setattr(
-            podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
+            podrun_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
         )
 
         r = parse_args(['run'])
@@ -645,10 +645,10 @@ class TestResolveConfig:
                 stdout=outputs.get(len(calls), ''),
             )
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
-        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
         monkeypatch.setattr(
-            podrun2_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
+            podrun_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
         )
 
         r = parse_args(
@@ -765,7 +765,7 @@ class TestResolveConfig:
                 }
             )
         )
-        monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
         r = parse_args(
             [
@@ -922,7 +922,7 @@ class TestIntegrationPipeline:
                             run_os_cmd calls, or None for no mocking.
         """
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'find_devcontainer_json',
             lambda start_dir=None: dc_file,
         )
@@ -940,7 +940,7 @@ class TestIntegrationPipeline:
                     )
                 return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
 
-            monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
+            monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
 
         r = parse_args(argv)
         r = resolve_config(r)

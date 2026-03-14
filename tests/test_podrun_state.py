@@ -4,8 +4,8 @@ import subprocess
 
 import pytest
 
-import podrun.podrun2 as podrun2_mod
-from podrun.podrun2 import (
+import podrun.podrun as podrun_mod
+from podrun.podrun import (
     BOOTSTRAP_CAPS,
     PODRUN_ENTRYPOINT_PATH,
     PODRUN_EXEC_ENTRY_PATH,
@@ -23,9 +23,9 @@ from podrun.podrun2 import (
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
+    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
+    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ class TestDetectContainerState:
 
     def test_running(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -53,7 +53,7 @@ class TestDetectContainerState:
 
     def test_exited(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -66,7 +66,7 @@ class TestDetectContainerState:
 
     def test_created(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -79,7 +79,7 @@ class TestDetectContainerState:
 
     def test_paused(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -92,7 +92,7 @@ class TestDetectContainerState:
 
     def test_dead(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -105,7 +105,7 @@ class TestDetectContainerState:
 
     def test_inspect_fails(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -118,7 +118,7 @@ class TestDetectContainerState:
 
     def test_unknown_status(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -136,7 +136,7 @@ class TestDetectContainerState:
             captured['cmd'] = cmd
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='running', stderr='')
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run)
         detect_container_state('myc', global_flags=['--root=/tmp/root'])
         assert '--root=/tmp/root' in captured['cmd']
 
@@ -147,13 +147,13 @@ class TestDetectContainerState:
             captured['cmd'] = cmd
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='running', stderr='')
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run)
         detect_container_state('myc', podman_path='/usr/local/bin/podman')
         assert '/usr/local/bin/podman' in captured['cmd']
 
     def test_whitespace_stripped(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -175,78 +175,78 @@ class TestHandleContainerState:
         assert handle_container_state({}) == 'run'
 
     def test_container_not_found_returns_run(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: None)
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: None)
         assert handle_container_state({'run.name': 'myc'}) == 'run'
 
     def test_running_auto_attach(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_attach': True}
         assert handle_container_state(ns) == 'attach'
 
     def test_running_auto_replace(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_replace': True}
         assert handle_container_state(ns) == 'replace'
 
     def test_running_both_false_returns_none(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_attach': False, 'run.auto_replace': False}
         assert handle_container_state(ns) is None
 
     def test_running_prompt_attach_yes(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
-        monkeypatch.setattr(podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
         ns = {'run.name': 'myc'}
         assert handle_container_state(ns) == 'attach'
 
     def test_running_prompt_attach_no_replace_yes(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         prompts = iter([False, True])
         monkeypatch.setattr(
-            podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: next(prompts)
+            podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: next(prompts)
         )
         ns = {'run.name': 'myc'}
         assert handle_container_state(ns) == 'replace'
 
     def test_running_prompt_both_no(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
-        monkeypatch.setattr(podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
         ns = {'run.name': 'myc'}
         assert handle_container_state(ns) is None
 
     def test_stopped_auto_attach_warns(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         # auto_attach=True but stopped → warn, then check auto_replace
         ns = {'run.name': 'myc', 'run.auto_attach': True, 'run.auto_replace': True}
         assert handle_container_state(ns) == 'replace'
         assert 'Cannot auto-attach' in capsys.readouterr().err
 
     def test_stopped_auto_replace(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         ns = {'run.name': 'myc', 'run.auto_replace': True}
         assert handle_container_state(ns) == 'replace'
 
     def test_stopped_both_false_non_interactive(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr('sys.stdin', type('F', (), {'isatty': lambda self: False})())
         ns = {'run.name': 'myc', 'run.auto_attach': False, 'run.auto_replace': False}
         assert handle_container_state(ns) is None
 
     def test_stopped_prompt_replace_yes(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
-        monkeypatch.setattr(podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
         ns = {'run.name': 'myc'}
         assert handle_container_state(ns) == 'replace'
 
     def test_stopped_prompt_replace_no(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
-        monkeypatch.setattr(podrun2_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
         ns = {'run.name': 'myc'}
         assert handle_container_state(ns) is None
 
     def test_auto_attach_priority_over_auto_replace(self, monkeypatch):
         """When both auto_attach and auto_replace are True and running, attach wins."""
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_attach': True, 'run.auto_replace': True}
         assert handle_container_state(ns) == 'attach'
 
@@ -260,7 +260,7 @@ class TestQueryContainerInfo:
     def test_extracts_workdir_and_overlays(self, monkeypatch):
         stdout = 'FOO=bar\nPODRUN_WORKDIR=/work\nPODRUN_OVERLAYS=user,host\nBAZ=qux\n'
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -275,7 +275,7 @@ class TestQueryContainerInfo:
 
     def test_missing_vars_return_empty(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -290,7 +290,7 @@ class TestQueryContainerInfo:
 
     def test_inspect_fails(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -310,7 +310,7 @@ class TestQueryContainerInfo:
             captured['cmd'] = cmd
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run)
         query_container_info('myc', global_flags=['--root=/tmp/root'])
         assert '--root=/tmp/root' in captured['cmd']
 
@@ -318,7 +318,7 @@ class TestQueryContainerInfo:
         """PODRUN_WORKDIR value may contain '='."""
         stdout = 'PODRUN_WORKDIR=/work=space\n'
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -434,7 +434,7 @@ class TestBuildPodmanExecArgs:
 class TestBuildOverlayRunCommand:
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
 
     def _parse_and_resolve(self, argv):
         r = parse_args(argv)
@@ -541,7 +541,7 @@ class TestBuildOverlayRunCommand:
         assert 'CAP_CHOWN' not in caps
 
     def test_dotfiles_overlay(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
         (tmp_path / '.vimrc').write_text('set nocp')
         r = self._parse_and_resolve(['run', '--dotfiles', 'alpine'])
         cmd, _ = build_overlay_run_command(r)

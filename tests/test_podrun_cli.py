@@ -7,7 +7,7 @@ import pathlib
 import shlex
 import shutil
 
-from podrun.podrun2 import (
+from podrun.podrun import (
     _PODRUN_STORES_DIR,
     _apply_store,
     _default_store_dir,
@@ -28,7 +28,7 @@ from podrun.podrun2 import (
     run_os_cmd,
 )
 
-import podrun.podrun2 as podrun2_mod
+import podrun.podrun as podrun_mod
 
 
 # ---------------------------------------------------------------------------
@@ -43,16 +43,16 @@ def _isolate_from_filesystem(monkeypatch):
     Also force _is_nested=False so store tests behave consistently
     regardless of the test environment (this container runs inside podrun).
     """
-    monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
+    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
+    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
     # Clear nested podrun guard env var (we're running inside a podrun container)
     monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
 
 
 @pytest.fixture
 def mock_run_os_cmd(monkeypatch):
-    """Monkeypatch podrun2.run_os_cmd and return a controller.
+    """Monkeypatch podrun.run_os_cmd and return a controller.
 
     Only used for tests that need to simulate podman failure or control
     exact output.  Most tests use real podman.
@@ -89,7 +89,7 @@ def mock_run_os_cmd(monkeypatch):
             return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
 
     ctrl = Controller()
-    monkeypatch.setattr(podrun2_mod, 'run_os_cmd', ctrl)
+    monkeypatch.setattr(podrun_mod, 'run_os_cmd', ctrl)
     return ctrl
 
 
@@ -1115,7 +1115,7 @@ class TestMain:
         assert 'alpine' in out
 
     def test_print_cmd_passthrough(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun2_mod.os, 'execvpe', lambda *a: None)
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', lambda *a: None)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'ps', '-a'])
         assert exc_info.value.code == 0
@@ -1130,7 +1130,7 @@ class TestMain:
             calls.append(a)
             raise SystemExit(0)
 
-        monkeypatch.setattr(podrun2_mod.os, 'execvpe', fake_execvpe)
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', fake_execvpe)
         with pytest.raises(SystemExit):
             main(['ps', '-a'])
         assert len(calls) == 1
@@ -1172,7 +1172,7 @@ class TestMain:
 
     def test_print_cmd_passthrough_with_remote(self, monkeypatch, capsys):
         """--remote should appear before the subcommand in passthrough output."""
-        monkeypatch.setattr(podrun2_mod.os, 'execvpe', lambda *a: None)
+        monkeypatch.setattr(podrun_mod.os, 'execvpe', lambda *a: None)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', '--remote', 'ps', '-a'])
         assert exc_info.value.code == 0
@@ -1211,7 +1211,7 @@ class TestPrintCmdOutput:
         import shlex as _shlex
 
         if monkeypatch:
-            monkeypatch.setattr(podrun2_mod.os, 'execvpe', lambda *a: None)
+            monkeypatch.setattr(podrun_mod.os, 'execvpe', lambda *a: None)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd'] + argv)
         assert exc_info.value.code == 0
@@ -2704,7 +2704,7 @@ class TestResolveStore:
 
     def test_no_store_no_project_root(self, monkeypatch):
         """No explicit store and _default_store_dir returns None → empty."""
-        monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
+        monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
         ns = {}
         flags, env = _resolve_store(ns)
         assert flags == []
@@ -2798,7 +2798,7 @@ class TestResolveStore:
         """_default_store_dir returns a path with graphroot → flags produced."""
         store_dir = str(tmp_path / '.devcontainer' / '.podrun' / 'store')
         pathlib.Path(store_dir, 'graphroot').mkdir(parents=True)
-        monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: store_dir)
+        monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: store_dir)
         ns = {}
         flags, _ = _resolve_store(ns)
         assert len(flags) == 6
@@ -2808,7 +2808,7 @@ class TestResolveStore:
         """_default_store_dir returns a path without graphroot → empty."""
         store_dir = str(tmp_path / '.devcontainer' / '.podrun' / 'store')
         pathlib.Path(store_dir).mkdir(parents=True)
-        monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: store_dir)
+        monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: store_dir)
         ns = {}
         flags, _ = _resolve_store(ns)
         assert flags == []
@@ -2832,7 +2832,7 @@ class TestApplyStore:
 
     def test_no_flags_no_change(self, monkeypatch):
         """No store resolved → podman_global_args untouched."""
-        monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
+        monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
         ns = {'podman_global_args': ['--remote']}
         _apply_store(ns)
         assert ns['podman_global_args'] == ['--remote']
@@ -2847,7 +2847,7 @@ class TestApplyStore:
 
     def test_ignore_no_flags(self, init_store, monkeypatch):
         """--local-store-ignore → no store flags even with valid store."""
-        monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
+        monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
         ns = {
             'root.local_store': init_store,
             'root.local_store_ignore': True,
@@ -3321,7 +3321,7 @@ class TestStoreCommandIntegration:
 
     def test_nested_no_store_flags(self, init_store, monkeypatch):
         """Nested (inside podrun container) → _apply_store skips store flags."""
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         ns = {'root.local_store': init_store}
         _apply_store(ns, 'podman')
         assert 'podman_global_args' not in ns or '--root' not in (
@@ -3330,7 +3330,7 @@ class TestStoreCommandIntegration:
 
     def test_nested_store_info(self, init_store, capsys, monkeypatch):
         """Nested + --local-store-info → disabled message."""
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         ns = {'root.local_store': init_store, 'root.local_store_info': True}
         with pytest.raises(SystemExit) as exc_info:
             _apply_store(ns, 'podman')
@@ -3516,7 +3516,7 @@ class TestStoreDestroyIntegration:
         """Destroy initialized store with no subcommand → exits 0."""
         store_dir = str(tmp_path / 'store')
         _store_init(store_dir)
-        monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
+        monkeypatch.setattr(podrun_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
             main(['--local-store', store_dir, '--local-store-destroy'])
         assert exc_info.value.code == 0
@@ -3530,14 +3530,14 @@ class TestStoreDestroyIntegration:
     def test_store_destroy_nonexistent_dir(self, tmp_path, capsys, monkeypatch):
         """Store dir doesn't exist on disk → no error, exits 0."""
         store_dir = str(tmp_path / 'nonexistent')
-        monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
+        monkeypatch.setattr(podrun_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
             main(['--local-store', store_dir, '--local-store-destroy'])
         assert exc_info.value.code == 0
 
     def test_store_destroy_nested_error(self, capsys, monkeypatch):
         """Nested (inside podrun) + --local-store-destroy → exits 1 with error."""
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         ns = {'root.local_store_destroy': True}
         with pytest.raises(SystemExit) as exc_info:
             _apply_store(ns, 'podman')
@@ -3550,7 +3550,7 @@ class TestStoreDestroyIntegration:
         """Destroy + auto-init + run → store recreated, flags injected in command."""
         store_dir = str(tmp_path / 'store')
         _store_init(store_dir)
-        monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
+        monkeypatch.setattr(podrun_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
             main(
                 [
@@ -3575,7 +3575,7 @@ class TestStoreDestroyIntegration:
         """Destroy + run without auto-init → no store flags in command."""
         store_dir = str(tmp_path / 'store')
         _store_init(store_dir)
-        monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
+        monkeypatch.setattr(podrun_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
             main(
                 [
@@ -3597,7 +3597,7 @@ class TestStoreDestroyIntegration:
         """Destroy + info → info shows no store / 'not initialized'."""
         store_dir = str(tmp_path / 'store')
         _store_init(store_dir)
-        monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
+        monkeypatch.setattr(podrun_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
             main(
                 [
@@ -3616,7 +3616,7 @@ class TestStoreDestroyIntegration:
         """Destroy + auto-init + info → info shows fresh store."""
         store_dir = str(tmp_path / 'store')
         _store_init(store_dir)
-        monkeypatch.setattr(podrun2_mod, '_store_destroy', self._fake_destroy)
+        monkeypatch.setattr(podrun_mod, '_store_destroy', self._fake_destroy)
         with pytest.raises(SystemExit) as exc_info:
             main(
                 [

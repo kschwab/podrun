@@ -5,8 +5,8 @@ import stat
 
 import pytest
 
-import podrun.podrun2 as podrun2_mod
-from podrun.podrun2 import (
+import podrun.podrun as podrun_mod
+from podrun.podrun import (
     BOOTSTRAP_CAPS,
     GID,
     PODRUN_RC_PATH,
@@ -23,7 +23,7 @@ from podrun.podrun2 import (
 @pytest.fixture(autouse=True)
 def _isolate_tmp(tmp_path, monkeypatch):
     """Redirect PODRUN_TMP so tests don't write to the real runtime dir."""
-    monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+    monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
 
 
 def _default_ns(**overrides):
@@ -254,7 +254,7 @@ class TestGenerateRcSh:
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='4', stderr='')
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
 
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', fake_run_os_cmd)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
 
     def test_returns_file_path(self):
         path = generate_rc_sh(_default_ns())

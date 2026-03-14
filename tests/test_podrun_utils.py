@@ -5,7 +5,7 @@ import stat
 
 import pytest
 
-from podrun.podrun2 import (
+from podrun.podrun import (
     BOOTSTRAP_CAPS,
     GID,
     PODRUN_ENTRYPOINT_PATH,
@@ -142,7 +142,7 @@ class TestParseImageRef:
 
 class TestWriteShaFile:
     def test_creates_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr('podrun.podrun2.PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr('podrun.podrun.PODRUN_TMP', str(tmp_path))
         path = _write_sha_file('hello world', 'test_', '.sh')
         assert os.path.exists(path)
         assert path.startswith(str(tmp_path))
@@ -151,26 +151,26 @@ class TestWriteShaFile:
             assert f.read() == 'hello world'
 
     def test_idempotent(self, tmp_path, monkeypatch):
-        monkeypatch.setattr('podrun.podrun2.PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr('podrun.podrun.PODRUN_TMP', str(tmp_path))
         p1 = _write_sha_file('same content', 'pfx_', '.sh')
         p2 = _write_sha_file('same content', 'pfx_', '.sh')
         assert p1 == p2
 
     def test_different_content_different_path(self, tmp_path, monkeypatch):
-        monkeypatch.setattr('podrun.podrun2.PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr('podrun.podrun.PODRUN_TMP', str(tmp_path))
         p1 = _write_sha_file('content A', 'pfx_', '.sh')
         p2 = _write_sha_file('content B', 'pfx_', '.sh')
         assert p1 != p2
 
     def test_executable_permission(self, tmp_path, monkeypatch):
-        monkeypatch.setattr('podrun.podrun2.PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr('podrun.podrun.PODRUN_TMP', str(tmp_path))
         path = _write_sha_file('#!/bin/sh\necho hi', 'ep_', '.sh')
         mode = os.stat(path).st_mode
         assert mode & stat.S_IXUSR
 
     def test_creates_parent_dirs(self, tmp_path, monkeypatch):
         nested = tmp_path / 'deep' / 'nested'
-        monkeypatch.setattr('podrun.podrun2.PODRUN_TMP', str(nested))
+        monkeypatch.setattr('podrun.podrun.PODRUN_TMP', str(nested))
         path = _write_sha_file('x', 'p_', '.sh')
         assert os.path.exists(path)
 

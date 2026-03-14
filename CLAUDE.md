@@ -1,6 +1,6 @@
 # Podrun Project Notes
 
-## podrun.py to podrun2.py Transition State
+## podrun Transition State
 
 ### Phase 1 -- Ported / Updated
 
@@ -28,7 +28,7 @@
 | Podman flag scraping + caching | New | Live scrape of `podman --help` / `podman run --help` with disk cache per version. Replaces hardcoded `PODMAN_RUN_VALUE_FLAGS`. |
 | Passthrough subcommands (ps, images, etc.) | Updated | Empty subparsers per scraped subcommand; `build_passthrough_command()` + `os.execvpe()`. |
 
-### Phase 1 -- Deprecated (replaced in podrun2)
+### Phase 1 -- Deprecated (replaced in Phase 2)
 
 | Behavior | Notes |
 |---|---|
@@ -43,27 +43,21 @@
 
 ### Phase 2 -- Porting Plan
 
-Each sub-phase should:
-1. Update the module docstring at the top of `podrun2.py` with a brief summary
-   line for the phase completed (e.g. "Phase 2.1: ...").
-2. Add a test file under `tests2/` named `test_podrun2_<phase_topic>.py`
-   (e.g. `test_podrun2_utils.py` for 2.1, `test_podrun2_entrypoint.py` for 2.2).
-
 | Phase | Test file |
 |---|---|
-| 1.x | `tests2/test_podrun2_cli.py` |
-| 2.1 | `tests2/test_podrun2_utils.py` |
-| 2.2 | `tests2/test_podrun2_entrypoint.py` |
-| 2.3 | `tests2/test_podrun2_overlays.py` |
-| 2.4 | `tests2/test_podrun2_state.py` |
-| 2.5 | `tests2/test_podrun2_main.py` |
-| 2.6 | `tests2/test_podrun2_store_service.py` |
-| 2.7 | `tests2/test_podrun2_completions.py` |
-| 2.8 | `tests2/test_podrun2_lint.py` |
+| 1.x | `tests/test_podrun_cli.py` |
+| 2.1 | `tests/test_podrun_utils.py` |
+| 2.2 | `tests/test_podrun_entrypoint.py` |
+| 2.3 | `tests/test_podrun_overlays.py` |
+| 2.4 | `tests/test_podrun_state.py` |
+| 2.5 | `tests/test_podrun_main.py` |
+| 2.6 | `tests/test_podrun_store_service.py` |
+| 2.7 | `tests/test_podrun_completions.py` |
+| 2.8 | `tests/test_podrun_lint.py` |
 
 ### CLI flag form coverage
 
-`tests2/test_podrun2_cli.py` includes `TestEqualsFormRootFlags`,
+`tests/test_podrun_cli.py` includes `TestEqualsFormRootFlags`,
 `TestEqualsFormRunFlags`, and `TestEqualsFormPassthroughFlags` — 44 tests
 ensuring every value flag parses correctly in both `--flag=value` and
 `--flag value` forms. Coverage includes:
@@ -81,7 +75,7 @@ ensuring every value flag parses correctly in both `--flag=value` and
   `--security-opt`/`--security-opt=`
 
 **Guiding principle for every sub-phase:** look for opportunities to simplify
-the ported code by leveraging podrun2's `ns` dict, `ParseResult`, argparse
+the ported code by leveraging the `ns` dict, `ParseResult`, argparse
 backbone, and existing helpers (`build_run_command`, `resolve_config`,
 `_apply_store`). Specifically:
 
@@ -128,7 +122,7 @@ Depends on 2.1 (`_write_sha_file`, `_parse_export`).
 #### Phase 2.3: Overlay Arg Builders ✓
 
 Each builder returns a list of podman args. Read from `ns` dict directly.
-**Status: Complete — 73 tests in `tests2/test_podrun2_overlays.py`.**
+**Status: Complete — 73 tests in `tests/test_podrun_overlays.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
@@ -148,12 +142,12 @@ Key decisions:
 - `_user_overlay_args()` returns `(args, caps_to_drop)` so orchestration can pass filtered caps to entrypoint generation
 - `compute_caps_to_drop(pt)` handles `--cap-add` (equals/space/comma forms, case-insensitive) and `--privileged`
 - `--dot-files-overlay`/`--dotfiles` CLI flag added; implies `user_overlay` via `resolve_config()`
-- `_DOTFILES_MOUNT = ['.emacs', '.emacs.d', '.vimrc']` — mount-mode only; copy-mode deferred to Phase 2.9
+- `_DOTFILES_MOUNT = ['.emacs', '.emacs.d', '.vimrc']` — mount-mode only; copy-mode deferred to Phase 2.10
 
 #### Phase 2.4: Command Assembly + Container State ✓
 
 Wire overlay args into the existing command-building backbone.
-**Status: Complete — 65 tests in `tests2/test_podrun2_state.py`.**
+**Status: Complete — 65 tests in `tests/test_podrun_state.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
@@ -171,14 +165,14 @@ Key decisions:
 
 #### Phase 2.5: Main Orchestration + Execution ✓
 
-Final integration into `main()`. Tests: `tests2/test_podrun2_main.py` (40 tests).
+Final integration into `main()`. Tests: `tests/test_podrun_main.py` (40 tests).
 
 | Item | Source (podrun.py) | Status |
 |---|---|---|
 | `_is_nested()` | replaces `is_podman_remote()` | ✓ Single source of truth for nested-execution detection via `PODRUN_CONTAINER` env var |
 | `_default_podman_path()` | Lines 237-245 | ✓ `PODRUN_PODMAN_PATH` env var → nested podman-remote → podman fallback |
 | `_warn_missing_subids()` | Lines 1416-1439 | ✓ subuid/subgid check |
-| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files, storage-opt injection (TODO: space-form fix in Phase 2.9) |
+| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files, storage-opt injection (TODO: space-form fix in Phase 2.10) |
 | `_handle_run()` | Lines 3103-3226 | ✓ state → entrypoints → overlays → exec |
 | `main()` updated | — | ✓ Nested guard via `_is_nested()`, `_default_podman_path()`, routes to `_handle_run()` |
 | `_volume_mount_destinations()` | — | ✓ Fixed space-form volume parsing (`-v /host:/ctr`) |
@@ -189,14 +183,14 @@ Key decisions:
 - `_handle_run()` orchestrates: image extraction → container state → export conflict filtering → subid warning → overlay build → fuse-overlayfs fixup → stale cleanup → exec
 - `_volume_mount_destinations()` handles both equals form (`-v=/host:/ctr`) and space form (`-v /host:/ctr`) from `_PassthroughAction`
 - `TestPrintCmdOutput` tests updated to use structural assertions (not exact equality) since `_handle_run` injects PODRUN_* env vars
-- `_fuse_overlayfs_fixup()` has a TODO for Phase 2.9: its `:O`→`:ro` conversion only handles equals form, same space-form bug class as `_expand_volume_tilde` and `_volume_mount_destinations`
+- `_fuse_overlayfs_fixup()` has a TODO for Phase 2.10: its `:O`→`:ro` conversion only handles equals form, same space-form bug class as `_expand_volume_tilde` and `_volume_mount_destinations`
 
 Depends on 2.1-2.4.
 
 #### Phase 2.6: Store Service Lifecycle ✓
 
 Store service lifecycle for `podman system service` management.
-**Status: Complete — 35 tests in `tests2/test_podrun2_store_service.py`.**
+**Status: Complete — 35 tests in `tests/test_podrun_store_service.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
@@ -220,7 +214,7 @@ Key decisions:
 #### Phase 2.7: Shell Completion ✓
 
 Bash/zsh/fish completion script generators.
-**Status: Complete — 40 tests in `tests2/test_podrun2_completions.py`.**
+**Status: Complete — 40 tests in `tests/test_podrun_completions.py`.**
 
 | Item | Source (podrun.py) | Notes |
 |---|---|---|
@@ -231,30 +225,51 @@ Bash/zsh/fish completion script generators.
 
 Key decisions:
 - **`_completion_data()` introspects parsers** — iterates `parser._actions` on root and run parsers, collecting option strings where `dest` starts with `root.` or `run.`. Classifies as value flag based on action type. Automatically picks up new podrun flags without hardcoded lists.
-- **No subcmd context blocks** — podrun2 replaced the `store` subcommand with `--local-store-*` global flags, eliminating nested subcommand completion. All three generators are simplified by removing `podrun_subcommands`, `sub_flag_cases`, and `sub_flag_case_block`.
+- **No subcmd context blocks** — the `store` subcommand was replaced with `--local-store-*` global flags, eliminating nested subcommand completion. All three generators are simplified by removing `podrun_subcommands`, `sub_flag_cases`, and `sub_flag_case_block`.
 - **Same Cobra delegation pattern** — strip podrun flags from command line, inject implicit `run`, delegate to `podman __completeNoDesc` (bash) / `podman __complete` (zsh/fish), merge podrun flags when current word starts with `-`.
 
 #### Phase 2.8: Linting + Coverage ✓
 
-Ruff, mypy, shellcheck, vulture, and pytest-cov enforcement for podrun2.py
-and tests2/. **Status: Complete — 10 tests in `tests2/test_podrun2_lint.py`.**
+Ruff, mypy, shellcheck, vulture, and pytest-cov enforcement.
+**Status: Complete — 9 tests in `tests/test_podrun_lint.py`.**
 
 | Item | Notes |
 |---|---|
-| `TestRuff` (2 tests) | `ruff check` + `ruff format --check` on podrun2.py and tests2/ |
-| `TestMypy` (1 test) | `mypy podrun/podrun2.py` — type annotations added for all errors |
+| `TestRuff` (2 tests) | `ruff check` + `ruff format --check` on `podrun/podrun.py` and `tests/` |
+| `TestMypy` (1 test) | `mypy podrun/podrun.py` — type annotations added for all errors |
 | `TestShellcheck` (5 tests) | run-entrypoint, rc.sh, exec-entrypoint at `--severity=warning`; bash/zsh completions |
-| `TestVulture` (1 test) | Dead code detection with `podrun2_whitelist.py` for downstream-phase symbols |
-| `TestCoverage` (1 test) | Subprocess pytest run with `--cov-fail-under=90` threshold |
+| `TestVulture` (1 test) | Dead code detection with `podrun_whitelist.py` for downstream-phase symbols |
+| Coverage threshold | Enforced via `--cov-fail-under=90` in `pyproject.toml` addopts (no dedicated test) |
 
 Key decisions:
 - **Ruff fixes**: 26 auto-fixed (F401 unused imports, F541 extraneous f-prefixes), 8 manual (C901 `# noqa: C901` on 4 orchestration functions, E741 `l`→`ln` rename, F841 dead code removal)
 - **Mypy fixes**: `Optional` for defaulting-to-None params, `# type: ignore[attr-defined]` for private argparse attributes (`_run_subparser`, `_subparsers._group_actions`), `# type: ignore[union-attr]` for `_subparsers` access, type annotations on untyped variables
 - **Shellcheck**: `--severity=warning` for entrypoint scripts (fixed `uid=$(id -u)` → `uid="$(id -u)"` SC2046); `--severity=error` for zsh completion (zsh-specific constructs trigger false positive warnings in bash mode); fish completion skipped (shellcheck doesn't support fish)
-- **Vulture whitelist**: `podrun2_whitelist.py` suppresses `_extract_label_value`, `_expand_export_tilde` (used in downstream phases), `required`/`_devcontainer`/`_podrun_cfg` (dynamic attributes)
-- **Coverage**: Custom `.coveragerc` written to tmp_path to override pyproject.toml's `include = ["podrun/podrun.py"]`; threshold at 90% (current ~95%)
+- **Vulture whitelist**: `podrun_whitelist.py` suppresses `_extract_label_value`, `_expand_export_tilde` (used in downstream phases), `required`/`_devcontainer`/`_podrun_cfg` (dynamic attributes)
+- **Coverage**: `--cov-fail-under=90` in `pyproject.toml` addopts; threshold at 90% (current ~95%)
 
-#### Phase 2.9: Copy-mode Dotfiles (evaluate strategy)
+#### Phase 2.9: Rename podrun2 → podrun ✓
+
+Renamed `podrun/podrun2.py` → `podrun/podrun.py`, merged `tests2/` → `tests/`.
+**Status: Complete.**
+
+| Item | Notes |
+|---|---|
+| `podrun/podrun2.py` → `podrun/podrun.py` | Module renamed; old podrun1 `podrun/podrun.py` deleted |
+| `tests2/*.py` → `tests/test_podrun_*.py` | All 10 test files + conftest moved and renamed |
+| `podrun2_whitelist.py` → `podrun_whitelist.py` | Vulture whitelist renamed; internal references updated |
+| All imports updated | `podrun.podrun2` → `podrun.podrun`, `podrun2_mod` → `podrun_mod` |
+| `test_podrun_lint.py` paths updated | `_TARGETS`, mypy, vulture, coverage all point to new paths |
+| `live_tests_reference/test_live.py` | Old live tests preserved for reference; pending Phase 3 rewrite |
+
+Key decisions:
+- Old `podrun/podrun.py` (podrun1) deleted — no backward-compat shim
+- `tests/` directory fully replaced — old podrun1 tests removed
+- `__init__.py`, `__main__.py`, `pyproject.toml` required no changes
+  (`from .podrun import main` already points to the renamed module)
+- Live integration tests preserved in `live_tests_reference/` pending Phase 3
+
+#### Phase 2.10: Copy-mode Dotfiles (evaluate strategy)
 
 Evaluate and implement copy-mode dotfiles for `--dot-files-overlay`. Mount-mode
 dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
@@ -270,4 +285,4 @@ class of bug already fixed in `_expand_volume_tilde` and `_volume_mount_destinat
 
 Live container integration tests and bug fixes discovered during end-to-end
 testing. Unit tests cover parsing, generation, and assembly logic; Phase 3
-validates the full podrun2 lifecycle against real podman.
+validates the full podrun lifecycle against real podman.

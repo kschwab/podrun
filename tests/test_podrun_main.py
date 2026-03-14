@@ -5,8 +5,8 @@ import subprocess
 
 import pytest
 
-import podrun.podrun2 as podrun2_mod
-from podrun.podrun2 import (
+import podrun.podrun as podrun_mod
+from podrun.podrun import (
     UNAME,
     _default_podman_path,
     _fuse_overlayfs_fixup,
@@ -18,9 +18,9 @@ from podrun.podrun2 import (
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
+    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
+    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
     # Clear nested podrun guard env var (we're running inside a podrun container)
     monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
     monkeypatch.delenv('PODRUN_PODMAN_PATH', raising=False)
@@ -40,15 +40,15 @@ class TestDefaultPodmanPath:
 
     def test_prefers_remote_inside_container(self, monkeypatch):
         monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
-        original_which = podrun2_mod.shutil.which
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        original_which = podrun_mod.shutil.which
 
         def fake_which(name):
             if name == 'podman-remote':
                 return '/usr/bin/podman-remote'
             return original_which(name)
 
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', fake_which)
+        monkeypatch.setattr(podrun_mod.shutil, 'which', fake_which)
         assert _default_podman_path() == '/usr/bin/podman-remote'
 
     def test_falls_back_when_not_nested(self, monkeypatch):
@@ -59,7 +59,7 @@ class TestDefaultPodmanPath:
 
     def test_falls_back_without_container_host(self, monkeypatch):
         monkeypatch.delenv('CONTAINER_HOST', raising=False)
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         path = _default_podman_path()
         # Without CONTAINER_HOST, should use regular podman
         assert path is None or 'podman-remote' not in path
@@ -88,7 +88,7 @@ class TestDefaultPodmanPath:
     def test_podman_path_env_overrides_nested_remote(self, monkeypatch):
         """PODRUN_PODMAN_PATH takes priority over nested podman-remote preference."""
         monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         # Point to regular podman — should be used even when nested
         monkeypatch.setenv('PODRUN_PODMAN_PATH', 'podman')
         path = _default_podman_path()
@@ -177,7 +177,7 @@ class TestWarnMissingSubids:
 class TestFuseOverlayfsFixup:
     def test_injects_storage_opt(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod.shutil,
+            podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
@@ -190,7 +190,7 @@ class TestFuseOverlayfsFixup:
 
     def test_converts_overlay_to_ro_for_files(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
-            podrun2_mod.shutil,
+            podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
@@ -203,7 +203,7 @@ class TestFuseOverlayfsFixup:
 
     def test_preserves_overlay_for_directories(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
-            podrun2_mod.shutil,
+            podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
@@ -216,7 +216,7 @@ class TestFuseOverlayfsFixup:
 
     def test_non_volume_args_unchanged(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod.shutil,
+            podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
@@ -226,14 +226,14 @@ class TestFuseOverlayfsFixup:
         assert result == cmd
 
     def test_exits_when_not_found(self, monkeypatch):
-        monkeypatch.setattr(podrun2_mod.shutil, 'which', lambda name: None)
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
         ns = {}
         with pytest.raises(SystemExit):
             _fuse_overlayfs_fixup(ns, [])
 
     def test_appends_to_existing_global_args(self, monkeypatch):
         monkeypatch.setattr(
-            podrun2_mod.shutil,
+            podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
@@ -254,10 +254,10 @@ class TestHandleRunViaPrintCmd:
 
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
         # Suppress stale file cleanup
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -330,7 +330,7 @@ class TestHandleRunViaPrintCmd:
 class TestHandleRunErrors:
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
 
     def test_no_image_exits(self, capsys):
         with pytest.raises(SystemExit):
@@ -358,11 +358,11 @@ class TestHandleRunErrors:
 class TestHandleRunContainerState:
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
 
     def test_replace_prints_rm_then_run(self, monkeypatch, capsys):
         """When replacing, --print-cmd should show rm then run command."""
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--auto-replace', '--workspace', 'alpine'])
         assert exc_info.value.code == 0
@@ -375,9 +375,9 @@ class TestHandleRunContainerState:
 
     def test_attach_prints_exec(self, monkeypatch, capsys):
         """When attaching, --print-cmd should show exec command."""
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         monkeypatch.setattr(
-            podrun2_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
+            podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
         )
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--workspace', 'alpine'])
@@ -389,16 +389,16 @@ class TestHandleRunContainerState:
 
     def test_attach_non_user_overlay_container_errors(self, monkeypatch, capsys):
         """Cannot attach to a container not created with user overlay."""
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
-        monkeypatch.setattr(podrun2_mod, 'query_container_info', lambda *a, **kw: ('/work', 'none'))
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'none'))
         with pytest.raises(SystemExit):
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--workspace', 'alpine'])
         assert 'not created with podrun user overlay' in capsys.readouterr().err
 
     def test_action_none_exits_cleanly(self, monkeypatch):
         """When handle_container_state returns None, main exits with 0."""
-        monkeypatch.setattr(podrun2_mod, 'detect_container_state', lambda *a, **kw: 'running')
-        monkeypatch.setattr(podrun2_mod, 'handle_container_state', lambda *a, **kw: None)
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        monkeypatch.setattr(podrun_mod, 'handle_container_state', lambda *a, **kw: None)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--workspace', 'alpine'])
         assert exc_info.value.code == 0
@@ -412,9 +412,9 @@ class TestHandleRunContainerState:
 class TestExportConflictFiltering:
     @pytest.fixture(autouse=True)
     def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(
                 args=cmd,
@@ -466,7 +466,7 @@ class TestExportConflictFiltering:
 
 class TestNestedPodrunGuard:
     def test_exits_inside_podrun_container(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         with pytest.raises(SystemExit) as exc_info:
             main(['run', 'alpine'])
         assert exc_info.value.code == 1
@@ -493,9 +493,9 @@ class TestMainPodmanPath:
 
         def fake_default():
             called['yes'] = True
-            return podrun2_mod.shutil.which('podman')
+            return podrun_mod.shutil.which('podman')
 
-        monkeypatch.setattr(podrun2_mod, '_default_podman_path', fake_default)
+        monkeypatch.setattr(podrun_mod, '_default_podman_path', fake_default)
         with pytest.raises(SystemExit):
             main(['--version'])
         assert called.get('yes')

@@ -12,8 +12,8 @@ import threading
 
 import pytest
 
-import podrun.podrun2 as podrun2_mod
-from podrun.podrun2 import (
+import podrun.podrun as podrun_mod
+from podrun.podrun import (
     _socket_is_alive,
     _store_hash,
     _store_pid_path,
@@ -28,9 +28,9 @@ from podrun.podrun2 import (
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun2_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun2_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: False)
+    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
+    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
+    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
     monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
     monkeypatch.delenv('CONTAINER_HOST', raising=False)
 
@@ -52,7 +52,7 @@ class TestStoreHash:
     def test_consistent_with_runroot(self):
         graphroot = '/tmp/test-store/graphroot'
         h = _store_hash(graphroot)
-        from podrun.podrun2 import _runroot_path, _PODRUN_STORES_DIR
+        from podrun.podrun import _runroot_path, _PODRUN_STORES_DIR
 
         assert _runroot_path(graphroot) == f'{_PODRUN_STORES_DIR}/{h}'
 
@@ -67,7 +67,7 @@ class TestStoreSocketPath:
         assert _store_socket_path('/gr').endswith('/podman.sock')
 
     def test_under_stores_dir(self):
-        from podrun.podrun2 import _PODRUN_STORES_DIR
+        from podrun.podrun import _PODRUN_STORES_DIR
 
         assert _store_socket_path('/gr').startswith(_PODRUN_STORES_DIR)
 
@@ -175,14 +175,14 @@ class TestWaitForSocket:
 
 class TestStopStoreService:
     def test_noop_when_no_pid_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path))
         graphroot = str(tmp_path / 'graphroot')
         # Should not raise
         _stop_store_service(graphroot)
 
     def test_cleans_files(self, tmp_path, monkeypatch):
         """PID references a dead process — files are still cleaned."""
-        monkeypatch.setattr(podrun2_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path))
         graphroot = str(tmp_path / 'graphroot')
         h = _store_hash(graphroot)
         store_dir = tmp_path / h
@@ -197,7 +197,7 @@ class TestStopStoreService:
 
     def test_handles_dead_pid(self, tmp_path, monkeypatch):
         """PID file has invalid content — no crash."""
-        monkeypatch.setattr(podrun2_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path))
         graphroot = str(tmp_path / 'graphroot')
         h = _store_hash(graphroot)
         store_dir = tmp_path / h
@@ -209,7 +209,7 @@ class TestStopStoreService:
 
     def test_sends_sigterm(self, tmp_path, monkeypatch):
         """Verify SIGTERM is sent to the stored PID."""
-        monkeypatch.setattr(podrun2_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path))
         graphroot = str(tmp_path / 'graphroot')
         h = _store_hash(graphroot)
         store_dir = tmp_path / h
@@ -231,41 +231,41 @@ class TestStopStoreService:
 class TestEnsureStoreService:
     @pytest.fixture(autouse=True)
     def _stores_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, '_PODRUN_STORES_DIR', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path))
 
     def test_refuses_when_nested(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun2_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         with pytest.raises(SystemExit):
-            podrun2_mod._ensure_store_service(str(tmp_path / 'gr'), str(tmp_path / 'rr'))
+            podrun_mod._ensure_store_service(str(tmp_path / 'gr'), str(tmp_path / 'rr'))
 
     def test_returns_socket_path(self, tmp_path, monkeypatch):
         graphroot = str(tmp_path / 'graphroot')
         runroot = str(tmp_path / 'runroot')
 
-        monkeypatch.setattr(podrun2_mod, '_socket_is_alive', lambda s, p: False)
+        monkeypatch.setattr(podrun_mod, '_socket_is_alive', lambda s, p: False)
 
         # Ensure parent dir exists for PID file write
         h = _store_hash(graphroot)
         (tmp_path / h).mkdir(parents=True, exist_ok=True)
 
         mock_proc = type('Proc', (), {'pid': 42})()
-        monkeypatch.setattr(podrun2_mod.subprocess, 'Popen', lambda cmd, **kw: mock_proc)
-        monkeypatch.setattr(podrun2_mod, '_wait_for_socket', lambda s, **kw: None)
+        monkeypatch.setattr(podrun_mod.subprocess, 'Popen', lambda cmd, **kw: mock_proc)
+        monkeypatch.setattr(podrun_mod, '_wait_for_socket', lambda s, **kw: None)
 
-        sock = podrun2_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
+        sock = podrun_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
         assert sock == _store_socket_path(graphroot)
 
     def test_early_return_if_alive(self, tmp_path, monkeypatch):
         graphroot = str(tmp_path / 'graphroot')
         runroot = str(tmp_path / 'runroot')
 
-        monkeypatch.setattr(podrun2_mod, '_socket_is_alive', lambda s, p: True)
+        monkeypatch.setattr(podrun_mod, '_socket_is_alive', lambda s, p: True)
         popen_called = []
         monkeypatch.setattr(
-            podrun2_mod.subprocess, 'Popen', lambda cmd, **kw: popen_called.append(1)
+            podrun_mod.subprocess, 'Popen', lambda cmd, **kw: popen_called.append(1)
         )
 
-        sock = podrun2_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
+        sock = podrun_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
         assert sock == _store_socket_path(graphroot)
         assert popen_called == []
 
@@ -275,8 +275,8 @@ class TestEnsureStoreService:
         h = _store_hash(graphroot)
         (tmp_path / h).mkdir(parents=True, exist_ok=True)
 
-        monkeypatch.setattr(podrun2_mod, '_socket_is_alive', lambda s, p: False)
-        monkeypatch.setattr(podrun2_mod, '_wait_for_socket', lambda s, **kw: None)
+        monkeypatch.setattr(podrun_mod, '_socket_is_alive', lambda s, p: False)
+        monkeypatch.setattr(podrun_mod, '_wait_for_socket', lambda s, **kw: None)
 
         popen_args = []
 
@@ -284,9 +284,9 @@ class TestEnsureStoreService:
             popen_args.append(cmd)
             return type('Proc', (), {'pid': 99})()
 
-        monkeypatch.setattr(podrun2_mod.subprocess, 'Popen', mock_popen)
+        monkeypatch.setattr(podrun_mod.subprocess, 'Popen', mock_popen)
 
-        podrun2_mod._ensure_store_service(graphroot, runroot, podman_path='/opt/custom/podman')
+        podrun_mod._ensure_store_service(graphroot, runroot, podman_path='/opt/custom/podman')
         assert len(popen_args) == 1
         cmd = popen_args[0]
         assert cmd[0] == '/opt/custom/podman'
@@ -301,13 +301,13 @@ class TestEnsureStoreService:
         h = _store_hash(graphroot)
         (tmp_path / h).mkdir(parents=True, exist_ok=True)
 
-        monkeypatch.setattr(podrun2_mod, '_socket_is_alive', lambda s, p: False)
-        monkeypatch.setattr(podrun2_mod, '_wait_for_socket', lambda s, **kw: None)
+        monkeypatch.setattr(podrun_mod, '_socket_is_alive', lambda s, p: False)
+        monkeypatch.setattr(podrun_mod, '_wait_for_socket', lambda s, **kw: None)
 
         mock_proc = type('Proc', (), {'pid': 777})()
-        monkeypatch.setattr(podrun2_mod.subprocess, 'Popen', lambda cmd, **kw: mock_proc)
+        monkeypatch.setattr(podrun_mod.subprocess, 'Popen', lambda cmd, **kw: mock_proc)
 
-        podrun2_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
+        podrun_mod._ensure_store_service(graphroot, runroot, podman_path='/usr/bin/podman')
         pid_file = _store_pid_path(graphroot)
         assert pathlib.Path(pid_file).read_text().strip() == '777'
 
@@ -321,8 +321,8 @@ class TestEnsureStoreService:
         h = _store_hash(graphroot)
         (tmp_path / h).mkdir(parents=True, exist_ok=True)
 
-        monkeypatch.setattr(podrun2_mod, '_socket_is_alive', lambda s, p: False)
-        monkeypatch.setattr(podrun2_mod, '_wait_for_socket', lambda s, **kw: None)
+        monkeypatch.setattr(podrun_mod, '_socket_is_alive', lambda s, p: False)
+        monkeypatch.setattr(podrun_mod, '_wait_for_socket', lambda s, **kw: None)
 
         popen_kwargs = []
 
@@ -330,9 +330,9 @@ class TestEnsureStoreService:
             popen_kwargs.append(kw)
             return type('Proc', (), {'pid': 1})()
 
-        monkeypatch.setattr(podrun2_mod.subprocess, 'Popen', mock_popen)
+        monkeypatch.setattr(podrun_mod.subprocess, 'Popen', mock_popen)
 
-        podrun2_mod._ensure_store_service(
+        podrun_mod._ensure_store_service(
             graphroot, runroot, store_dir=store_dir, podman_path='/usr/bin/podman'
         )
         env = popen_kwargs[0]['env']
@@ -406,7 +406,7 @@ class TestHandleRunStoreService:
     @pytest.fixture()
     def _run_ns(self, tmp_path, monkeypatch):
         """Set up a minimal ns dict and result for _handle_run with --print-cmd."""
-        monkeypatch.setattr(podrun2_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'stores'))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'stores'))
         (tmp_path / 'stores').mkdir()
 
         store_dir = tmp_path / 'store'
@@ -453,10 +453,10 @@ class TestHandleRunStoreService:
         )()
 
         # Stub out functions that would fail without real podman
-        monkeypatch.setattr(podrun2_mod, 'handle_container_state', lambda ns, **kw: 'run')
-        monkeypatch.setattr(podrun2_mod, '_warn_missing_subids', lambda: None)
+        monkeypatch.setattr(podrun_mod, 'handle_container_state', lambda ns, **kw: 'run')
+        monkeypatch.setattr(podrun_mod, '_warn_missing_subids', lambda: None)
         mock_result = type('Result', (), {'stdout': '', 'stderr': '', 'returncode': 0})()
-        monkeypatch.setattr(podrun2_mod, 'run_os_cmd', lambda cmd: mock_result)
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', lambda cmd: mock_result)
 
         return result, ns, store_dir
 
@@ -471,10 +471,10 @@ class TestHandleRunStoreService:
             ensure_calls.append((graphroot, runroot, store_dir, podman_path))
             return '/tmp/fake.sock'
 
-        monkeypatch.setattr(podrun2_mod, '_ensure_store_service', mock_ensure)
+        monkeypatch.setattr(podrun_mod, '_ensure_store_service', mock_ensure)
 
         with pytest.raises(SystemExit):
-            podrun2_mod._handle_run(result, 'podman')
+            podrun_mod._handle_run(result, 'podman')
 
         assert len(ensure_calls) == 1
         assert 'graphroot' in ensure_calls[0][0]
@@ -487,13 +487,13 @@ class TestHandleRunStoreService:
 
         ensure_calls = []
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             '_ensure_store_service',
             lambda *a, **kw: ensure_calls.append(1) or '/tmp/fake.sock',
         )
 
         with pytest.raises(SystemExit):
-            podrun2_mod._handle_run(result, 'podman')
+            podrun_mod._handle_run(result, 'podman')
 
         assert ensure_calls == []
 
@@ -504,12 +504,12 @@ class TestHandleRunStoreService:
 
         ensure_calls = []
         monkeypatch.setattr(
-            podrun2_mod,
+            podrun_mod,
             '_ensure_store_service',
             lambda *a, **kw: ensure_calls.append(1) or '/tmp/fake.sock',
         )
 
         with pytest.raises(SystemExit):
-            podrun2_mod._handle_run(result, 'podman')
+            podrun_mod._handle_run(result, 'podman')
 
         assert ensure_calls == []

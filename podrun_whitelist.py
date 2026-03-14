@@ -1,4 +1,4 @@
-# Vulture whitelist for podrun2.py — suppress false positives.
+# Vulture whitelist for podrun.py — suppress false positives.
 # These symbols are used at runtime or in downstream phases.
 
 _extract_label_value  # unused function (used in _handle_run)

@@ -1,6 +1,6 @@
 import pytest
 
-from podrun.podrun2 import (
+from podrun.podrun import (
     _completion_data,
     _generate_bash_completion,
     _generate_fish_completion,

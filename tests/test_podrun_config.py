@@ -125,9 +125,9 @@ class TestParseConfigTokens:
         assert pt == []
 
     def test_run_flags(self):
-        ns, pt = parse_config_tokens(['--name', 'test', '--workspace'])
+        ns, pt = parse_config_tokens(['--name', 'test', '--session'])
         assert ns['run.name'] == 'test'
-        assert ns['run.workspace'] is True
+        assert ns['run.session'] is True
         assert pt == []
 
     def test_mixed_root_and_run(self):
@@ -152,7 +152,7 @@ class TestParseConfigTokens:
         ns, pt = parse_config_tokens(['--name', 'test'])
         assert 'run.name' in ns
         # None values from the default namespace should not be present
-        assert ns.get('run.workspace') is None or 'run.workspace' not in ns
+        assert ns.get('run.session') is None or 'run.session' not in ns
 
     def test_rejects_config(self):
         with pytest.raises(SystemExit):
@@ -540,7 +540,7 @@ class TestResolveConfig:
                         'podrun': {
                             'name': 'dc-name',
                             'shell': '/bin/dc-shell',
-                            'workspace': True,
+                            'session': True,
                         }
                     },
                 }
@@ -557,8 +557,8 @@ class TestResolveConfig:
         assert r.ns['run.name'] == 'cli-name'
         # Script wins for shell (CLI didn't set it)
         assert r.ns['run.shell'] == '/bin/script-shell'
-        # DC wins for workspace (neither CLI nor script set it)
-        assert r.ns.get('run.workspace') is True
+        # DC wins for session (neither CLI nor script set it)
+        assert r.ns.get('run.session') is True
 
     def test_multiple_scripts(self, monkeypatch):
         """Multiple --config-script: tokens concatenated."""
@@ -605,9 +605,9 @@ class TestResolveConfig:
             ['run'],
             monkeypatch,
             dc_json_path=dc_file,
-            script_stdout='--workspace',
+            script_stdout='--session',
         )
-        assert r.ns.get('run.workspace') is True
+        assert r.ns.get('run.session') is True
 
     def test_dc_config_script_list(self, monkeypatch, tmp_project):
         """configScript as a list in devcontainer.json — all scripts run in order."""
@@ -631,7 +631,7 @@ class TestResolveConfig:
         def fake_run_os_cmd(cmd):
             calls.append(cmd)
             if len(calls) == 1:
-                return subprocess.CompletedProcess(args='', returncode=0, stdout='--workspace')
+                return subprocess.CompletedProcess(args='', returncode=0, stdout='--session')
             return subprocess.CompletedProcess(args='', returncode=0, stdout='--shell /bin/zsh')
 
         monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
@@ -643,7 +643,7 @@ class TestResolveConfig:
         r = parse_args(['run'])
         r = resolve_config(r)
         assert len(calls) == 2
-        assert r.ns.get('run.workspace') is True
+        assert r.ns.get('run.session') is True
         assert r.ns.get('run.shell') == '/bin/zsh'
 
     def test_dc_scripts_then_cli_scripts(self, monkeypatch, tmp_project):
@@ -675,7 +675,7 @@ class TestResolveConfig:
             outputs = {
                 1: '--shell /bin/dc-a',  # dc script 0
                 2: '--shell /bin/dc-b',  # dc script 1 overrides dc-a
-                3: '--workspace',  # cli script 0
+                3: '--session',  # cli script 0
                 4: '--shell /bin/cli-b',  # cli script 1 overrides dc-b
             }
             return subprocess.CompletedProcess(
@@ -704,28 +704,28 @@ class TestResolveConfig:
         assert len(calls) == 4
         # CLI script's --shell wins (last writer wins via concatenated tokens)
         assert r.ns.get('run.shell') == '/bin/cli-b'
-        # --workspace from cli-a.sh is present
-        assert r.ns.get('run.workspace') is True
+        # --session from cli-a.sh is present
+        assert r.ns.get('run.session') is True
 
     def test_overlay_implication_adhoc(self, monkeypatch):
-        """adhoc implies workspace → host+interactive → user."""
+        """adhoc implies session → host+interactive → user."""
         r = self._resolve(
             ['--no-devconfig', 'run', '--adhoc', 'alpine'],
             monkeypatch,
         )
         assert r.ns.get('run.adhoc') is True
-        assert r.ns.get('run.workspace') is True
+        assert r.ns.get('run.session') is True
         assert r.ns.get('run.host_overlay') is True
         assert r.ns.get('run.interactive_overlay') is True
         assert r.ns.get('run.user_overlay') is True
 
-    def test_overlay_implication_workspace(self, monkeypatch):
-        """workspace implies host+interactive → user."""
+    def test_overlay_implication_session(self, monkeypatch):
+        """session implies host+interactive → user."""
         r = self._resolve(
-            ['--no-devconfig', 'run', '--workspace', 'alpine'],
+            ['--no-devconfig', 'run', '--session', 'alpine'],
             monkeypatch,
         )
-        assert r.ns.get('run.workspace') is True
+        assert r.ns.get('run.session') is True
         assert r.ns.get('run.host_overlay') is True
         assert r.ns.get('run.interactive_overlay') is True
         assert r.ns.get('run.user_overlay') is True

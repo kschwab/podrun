@@ -16,7 +16,7 @@
 | `customizations.podrun` extraction | Ported | Same behavior |
 | Three-way config merge (CLI > script > dc) | Updated | Now uses namespace-dict (`root.*`/`run.*` keys) instead of `Config` dataclass. Merge logic is cleaner but equivalent precedence. |
 | Config-script execution + token parsing | Updated | New `run_config_scripts()` + `parse_config_tokens()` replace `_expand_config_scripts()` + `_resolve_config_script()`. Scripts run through same root+run parsers. |
-| Overlay implication chain (adhoc->workspace->host+interactive->user) | Ported | In `resolve_config()` |
+| Overlay implication chain (adhoc->session->host+interactive->user) | Ported | In `resolve_config()` |
 | Image resolution from dc `image` field | Ported | Falls back to dc image when no CLI trailing args |
 | Export merging (dc + script + cli) | Ported | Append order preserved |
 | Label-based dc config path (`devcontainer.config_file=`) | Ported | Same behavior |
@@ -128,8 +128,8 @@ Each builder returns a list of podman args. Read from `ns` dict directly.
 |---|---|---|
 | `compute_caps_to_drop()` | New | Filters `BOOTSTRAP_CAPS` vs user `--cap-add`/`--privileged` |
 | `_user_overlay_args()` | Lines 2810-2830 | Returns `(args, caps_to_drop)` tuple; `--userns=keep-id`, passwd-entry, caps, entrypoint mounts, export volumes |
-| `_host_overlay_args()` | Lines 2842-2860 | hostname, network, seccomp, workspace, localtime |
-| `_interactive_overlay_args()` | Lines 2833-2839 | `-it`, detach-keys |
+| `_host_overlay_args()` | Lines 2842-2860 | hostname, network, seccomp, workdir mount, localtime |
+| `_interactive_overlay_args()` | Lines 2833-2839 | `-it`, detach-keys, `--init` |
 | `_dot_files_overlay_args()` | New | Mount-mode dotfiles (`.emacs`, `.emacs.d`, `.vimrc`) from host HOME into container |
 | `_x11_args()` | Lines 2863-2874 | X11 socket + DISPLAY |
 | `_podman_remote_args()` | Lines 2877-2893 | Socket passthrough, CONTAINER_HOST |

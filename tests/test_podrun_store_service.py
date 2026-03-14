@@ -425,7 +425,7 @@ class TestHandleRunStoreService:
             'run.host_overlay': False,
             'run.interactive_overlay': False,
             'run.dot_files_overlay': False,
-            'run.workspace': None,
+            'run.session': None,
             'run.adhoc': False,
             'run.podman_remote': False,
             'run.export': [],

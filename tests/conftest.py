@@ -1,10 +1,23 @@
 # Minimal conftest for podrun tests.
 
+import glob
+import os
+
 import pytest
 
-from podrun.podrun import load_podman_flags
+import podrun.podrun as podrun_mod
+from podrun.podrun import _read_flags_cache, load_podman_flags
 
 _COV_THRESHOLD = 95
+
+# Locate the podman flags cache file (e.g. ~/.cache/podrun/podman-4.5.0.json).
+# This is needed because tests run in an environment without a local podman
+# binary — the cache file was pre-built on the host.
+_CACHE_DIR = os.path.join(
+    os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
+    'podrun',
+)
+_CACHE_FILES = sorted(glob.glob(os.path.join(_CACHE_DIR, 'podman-*.json')))
 
 
 def _is_full_run(config):
@@ -44,13 +57,27 @@ def pytest_terminal_summary(terminalreporter, config):
 
 @pytest.fixture(autouse=True, scope='session')
 def _require_podman_flags():
-    """Skip the entire test session if podman flags cannot be loaded.
+    """Ensure podman flags are available for the test session.
 
-    This succeeds when either:
-    - A local (non-remote) podman binary is available, OR
-    - A podrun-started container has the cache file copy-mounted in
+    Resolution:
+    1. Try ``load_podman_flags()`` normally (works with local podman or
+       pre-mounted cache inside a podrun container).
+    2. Fall back to seeding the in-memory cache from the host's
+       ``~/.cache/podrun/podman-*.json`` file.  This enables unit tests
+       in environments with only ``podman-remote`` (no local podman).
+    3. Skip the session if neither succeeds.
     """
     try:
         load_podman_flags()
+        return
     except SystemExit:
-        pytest.skip('podman flags unavailable (remote client without cache)')
+        pass
+
+    # Seed from host cache file
+    if _CACHE_FILES:
+        flags = _read_flags_cache(_CACHE_FILES[-1])
+        if flags is not None:
+            podrun_mod._loaded_flags['podman'] = flags
+            return
+
+    pytest.skip('podman flags unavailable (no local podman and no cache file)')

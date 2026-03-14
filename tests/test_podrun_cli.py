@@ -355,9 +355,9 @@ class TestBuildRunParser:
         ns, _ = self._parse_run(['--interactive-overlay'])
         assert ns['run.interactive_overlay'] is True
 
-    def test_workspace(self):
-        ns, _ = self._parse_run(['--workspace'])
-        assert ns['run.workspace'] is True
+    def test_session(self):
+        ns, _ = self._parse_run(['--session'])
+        assert ns['run.session'] is True
 
     def test_adhoc(self):
         ns, _ = self._parse_run(['--adhoc'])
@@ -453,7 +453,7 @@ class TestBuildRunParser:
         assert ns['run.user_overlay'] is None
         assert ns['run.host_overlay'] is None
         assert ns['run.interactive_overlay'] is None
-        assert ns['run.workspace'] is None
+        assert ns['run.session'] is None
         assert ns['run.adhoc'] is None
         assert ns['run.print_overlays'] is None
         assert ns['run.x11'] is None
@@ -466,9 +466,9 @@ class TestBuildRunParser:
         assert ns['run.export'] is None
         assert ns['run.fuse_overlayfs'] is None
 
-    def test_workspace_and_adhoc_together(self):
-        ns, _ = self._parse_run(['--workspace', '--adhoc'])
-        assert ns['run.workspace'] is True
+    def test_session_and_adhoc_together(self):
+        ns, _ = self._parse_run(['--session', '--adhoc'])
+        assert ns['run.session'] is True
         assert ns['run.adhoc'] is True
 
     def test_equals_syntax_for_podman_flags(self):
@@ -805,10 +805,10 @@ class TestParseArgs:
         assert 'alpine' in r.trailing_args
 
     def test_global_flags_combined_with_run(self):
-        r = parse_args(['--print-cmd', 'run', '--workspace', 'alpine'])
+        r = parse_args(['--print-cmd', 'run', '--session', 'alpine'])
         assert r.ns['root.print_cmd'] is True
         assert r.ns['subcommand'] == 'run'
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert 'alpine' in r.trailing_args
 
     def test_podman_global_flags_extracted(self):
@@ -855,8 +855,8 @@ class TestParseArgs:
         assert 'alpine' in r.trailing_args
 
     def test_raw_argv_preserved(self):
-        r = parse_args(['run', '--workspace', 'alpine'])
-        assert r.raw_argv == ['run', '--workspace', 'alpine']
+        r = parse_args(['run', '--session', 'alpine'])
+        assert r.raw_argv == ['run', '--session', 'alpine']
 
     def test_store_flag_before_run_subcommand(self):
         """--local-store VALUE before 'run' — root parser consumes --store, routes to run."""
@@ -1458,7 +1458,7 @@ class TestPrintCmdOutput:
         assert mid.count('-v') == 2
 
     def test_full_realistic_command(self, capsys):
-        """Realistic workspace-like invocation."""
+        """Realistic session-like invocation."""
         cmd = self._cmd(
             [
                 '--root',
@@ -1779,10 +1779,10 @@ class TestRootAndRunCombinations:
         assert r.ns['run.host_overlay'] is True
         assert 'alpine' in r.trailing_args
 
-    def test_no_devconfig_before_run_with_workspace(self):
-        r = parse_args(['--no-devconfig', 'run', '--workspace', 'alpine'])
+    def test_no_devconfig_before_run_with_session(self):
+        r = parse_args(['--no-devconfig', 'run', '--session', 'alpine'])
         assert r.ns['root.no_devconfig'] is True
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
 
     def test_store_before_run_with_name_and_adhoc(self):
         r = parse_args(
@@ -1824,7 +1824,7 @@ class TestRootAndRunCombinations:
             [
                 '--print-cmd',
                 'run',
-                '--workspace',
+                '--session',
                 '--name',
                 'myc',
                 '--shell',
@@ -1834,7 +1834,7 @@ class TestRootAndRunCombinations:
             ]
         )
         assert r.ns['root.print_cmd'] is True
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.name'] == 'myc'
         assert r.ns['run.shell'] == '/bin/zsh'
         assert r.ns['run.login'] is True
@@ -1896,7 +1896,7 @@ class TestRunFlagCombinations:
                 '--user-overlay',
                 '--host-overlay',
                 '--interactive-overlay',
-                '--workspace',
+                '--session',
                 '--adhoc',
                 'alpine',
             ]
@@ -1904,12 +1904,12 @@ class TestRunFlagCombinations:
         assert r.ns['run.user_overlay'] is True
         assert r.ns['run.host_overlay'] is True
         assert r.ns['run.interactive_overlay'] is True
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.adhoc'] is True
 
-    def test_workspace_with_name_and_shell(self):
-        r = parse_args(['run', '--workspace', '--name', 'myc', '--shell', '/bin/zsh', 'alpine'])
-        assert r.ns['run.workspace'] is True
+    def test_session_with_name_and_shell(self):
+        r = parse_args(['run', '--session', '--name', 'myc', '--shell', '/bin/zsh', 'alpine'])
+        assert r.ns['run.session'] is True
         assert r.ns['run.name'] == 'myc'
         assert r.ns['run.shell'] == '/bin/zsh'
 
@@ -1955,11 +1955,11 @@ class TestRunFlagCombinations:
         assert r.ns['run.host_overlay'] is True
         assert r.ns['run.interactive_overlay'] is True
 
-    def test_export_with_workspace_and_name(self):
+    def test_export_with_session_and_name(self):
         r = parse_args(
             [
                 'run',
-                '--workspace',
+                '--session',
                 '--name',
                 'myc',
                 '--export',
@@ -1969,14 +1969,14 @@ class TestRunFlagCombinations:
                 'alpine',
             ]
         )
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.name'] == 'myc'
         assert r.ns['run.export'] == ['/src:/dst', '/a:/b:0']
 
-    def test_podman_remote_with_workspace(self):
-        r = parse_args(['run', '--podman-remote', '--workspace', 'alpine'])
+    def test_podman_remote_with_session(self):
+        r = parse_args(['run', '--podman-remote', '--session', 'alpine'])
         assert r.ns['run.podman_remote'] is True
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
 
     def test_prompt_banner_with_shell_and_login(self):
         r = parse_args(
@@ -2003,7 +2003,7 @@ class TestRunFlagCombinations:
                 '--user-overlay',
                 '--host-overlay',
                 '--interactive-overlay',
-                '--workspace',
+                '--session',
                 '--adhoc',
                 '--x11',
                 '--podman-remote',
@@ -2025,7 +2025,7 @@ class TestRunFlagCombinations:
         assert r.ns['run.user_overlay'] is True
         assert r.ns['run.host_overlay'] is True
         assert r.ns['run.interactive_overlay'] is True
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.adhoc'] is True
         assert r.ns['run.x11'] is True
         assert r.ns['run.podman_remote'] is True
@@ -2046,9 +2046,9 @@ class TestRunFlagCombinations:
 
 
 class TestPodmanPassthroughWithRunFlags:
-    def test_env_and_volume_with_workspace(self):
-        r = parse_args(['run', '--workspace', '-e', 'A=1', '-v', '/a:/b', 'alpine'])
-        assert r.ns['run.workspace'] is True
+    def test_env_and_volume_with_session(self):
+        r = parse_args(['run', '--session', '-e', 'A=1', '-v', '/a:/b', 'alpine'])
+        assert r.ns['run.session'] is True
         pt = r.ns.get('run.passthrough_args') or []
         assert '-e' in pt
         assert 'A=1' in pt
@@ -2105,9 +2105,9 @@ class TestPodmanPassthroughWithRunFlags:
         assert '-u' in pt
         assert '1000:1000' in pt
 
-    def test_hostname_with_workspace(self):
-        r = parse_args(['run', '--workspace', '-h', 'devbox', 'alpine'])
-        assert r.ns['run.workspace'] is True
+    def test_hostname_with_session(self):
+        r = parse_args(['run', '--session', '-h', 'devbox', 'alpine'])
+        assert r.ns['run.session'] is True
         pt = r.ns.get('run.passthrough_args') or []
         assert '-h' in pt
         assert 'devbox' in pt
@@ -2123,7 +2123,7 @@ class TestPodmanPassthroughWithRunFlags:
         r = parse_args(
             [
                 'run',
-                '--workspace',
+                '--session',
                 '--fuse-overlayfs',
                 '--rm',
                 '--privileged',
@@ -2139,7 +2139,7 @@ class TestPodmanPassthroughWithRunFlags:
                 'bash',
             ]
         )
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.fuse_overlayfs'] is True
         pt = r.ns.get('run.passthrough_args') or []
         assert '--rm' in pt
@@ -2232,11 +2232,11 @@ class TestPodmanPassthroughWithRunFlags:
 
 
 class TestGlobalPodmanWithRunCombinations:
-    def test_remote_with_run_and_workspace(self):
-        r = parse_args(['--remote', 'run', '--workspace', 'alpine'])
+    def test_remote_with_run_and_session(self):
+        r = parse_args(['--remote', 'run', '--session', 'alpine'])
         pga = r.ns.get('podman_global_args') or []
         assert '--remote' in pga
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
 
     def test_root_and_log_level_with_run_flags(self):
         r = parse_args(
@@ -2293,7 +2293,7 @@ class TestGlobalPodmanWithRunCombinations:
                 'debug',
                 '--remote',
                 'run',
-                '--workspace',
+                '--session',
                 '--name',
                 'dev',
                 '-e',
@@ -2309,7 +2309,7 @@ class TestGlobalPodmanWithRunCombinations:
         assert '--root' in pga
         assert '--log-level' in pga
         assert '--remote' in pga
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.name'] == 'dev'
         pt = r.ns.get('run.passthrough_args') or []
         assert '-e' in pt
@@ -2350,7 +2350,7 @@ class TestFullStackCombinations:
                 '--log-level',
                 'debug',
                 'run',
-                '--workspace',
+                '--session',
                 '--name',
                 'full',
                 '--shell',
@@ -2387,7 +2387,7 @@ class TestFullStackCombinations:
         assert '--log-level' in pga
         assert 'debug' in pga
         # Podrun run flags
-        assert r.ns['run.workspace'] is True
+        assert r.ns['run.session'] is True
         assert r.ns['run.name'] == 'full'
         assert r.ns['run.shell'] == '/bin/zsh'
         assert r.ns['run.login'] is True

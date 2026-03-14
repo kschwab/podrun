@@ -111,7 +111,7 @@ _OVERLAY_FIELDS = [
     ('run.host_overlay', 'host'),
     ('run.interactive_overlay', 'interactive'),
     ('run.dot_files_overlay', 'dotfiles'),
-    ('run.workspace', 'workspace'),
+    ('run.session', 'session'),
     ('run.adhoc', 'adhoc'),
 ]
 
@@ -1278,12 +1278,12 @@ def print_overlays():
     for name in _DOTFILES_MOUNT:
         print(f'    -v=~/{name}:/home/<user>/{name}:ro  (if exists)')
     print()
-    print('  workspace (implies host + interactive):')
+    print('  session (implies host + interactive):')
     print('    --host-overlay')
     print('    --interactive-overlay')
     print()
-    print('  adhoc (implies workspace):')
-    print('    --workspace')
+    print('  adhoc (implies session):')
+    print('    --session')
     print('    --rm')
     print()
 
@@ -1379,7 +1379,7 @@ def extract_podrun_config(devcontainer: dict) -> dict:
     return devcontainer.get('customizations', {}).get('podrun', {})  # type: ignore[no-any-return]
 
 
-def devcontainer_run_args(dc: dict, ns: dict) -> list:
+def devcontainer_run_args(dc: dict, ns: dict) -> list:  # noqa: C901
     """Convert devcontainer.json top-level fields to podman run args.
 
     Returns ``[]`` when the devcontainer CLI is driving
@@ -1835,7 +1835,7 @@ _RUN_CONFIG_MAP = {
     'userOverlay': 'run.user_overlay',
     'hostOverlay': 'run.host_overlay',
     'interactiveOverlay': 'run.interactive_overlay',
-    'workspace': 'run.workspace',
+    'session': 'run.session',
     'adhoc': 'run.adhoc',
     'x11': 'run.x11',
     'podmanRemote': 'run.podman_remote',
@@ -2053,11 +2053,11 @@ def _apply_run_specifics(ns, result, podrun_cfg, script_ns):
     All dc top-level fields are already resolved to ``ns['dc.*']`` by
     ``resolve_config`` before this function is called.
     """
-    # Overlay implication chain: adhoc→workspace→host+interactive→user
+    # Overlay implication chain: adhoc→session→host+interactive→user
     #                           dot_files→user
     if ns.get('run.adhoc'):
-        ns['run.workspace'] = True
-    if ns.get('run.workspace'):
+        ns['run.session'] = True
+    if ns.get('run.session'):
         ns['run.host_overlay'] = True
         ns['run.interactive_overlay'] = True
     if ns.get('run.host_overlay'):
@@ -2408,18 +2408,18 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         help='Interactive overlay (-it, --detach-keys)',
     )
     opts.add_argument(
-        '--workspace',
-        dest='run.workspace',
+        '--session',
+        dest='run.session',
         action='store_true',
         default=None,
-        help='Workspace overlay (implies --host-overlay + --interactive-overlay)',
+        help='Session overlay (implies --host-overlay + --interactive-overlay)',
     )
     opts.add_argument(
         '--adhoc',
         dest='run.adhoc',
         action='store_true',
         default=None,
-        help='Ad-hoc overlay (implies --workspace + --rm)',
+        help='Ad-hoc overlay (implies --session + --rm)',
     )
     opts.add_argument(
         '--dot-files-overlay',

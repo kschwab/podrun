@@ -521,7 +521,7 @@ class TestPrintOverlays:
         assert 'host' in out
         assert 'interactive' in out
         assert 'dotfiles' in out
-        assert 'workspace' in out
+        assert 'session' in out
         assert 'adhoc' in out
 
     def test_dotfiles_listed(self, capsys):

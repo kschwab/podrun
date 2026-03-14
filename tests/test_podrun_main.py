@@ -351,8 +351,8 @@ class TestHandleRunViaPrintCmd:
         assert '--network=host' in cmd
         assert '--userns=keep-id' in cmd  # implied
 
-    def test_workspace_run(self, capsys):
-        cmd = self._run(['run', '--workspace', 'alpine'], capsys)
+    def test_session_run(self, capsys):
+        cmd = self._run(['run', '--session', 'alpine'], capsys)
         assert '-it' in cmd
         assert '--network=host' in cmd
         assert '--userns=keep-id' in cmd
@@ -364,11 +364,11 @@ class TestHandleRunViaPrintCmd:
         assert '--userns=keep-id' in cmd
 
     def test_named_container(self, capsys):
-        cmd = self._run(['run', '--name=myc', '--workspace', 'alpine'], capsys)
+        cmd = self._run(['run', '--name=myc', '--session', 'alpine'], capsys)
         assert '--name=myc' in cmd
 
     def test_with_passthrough_flags(self, capsys):
-        cmd = self._run(['run', '--workspace', '-e', 'A=1', '-v', '/x:/y', 'alpine'], capsys)
+        cmd = self._run(['run', '--session', '-e', 'A=1', '-v', '/x:/y', 'alpine'], capsys)
         assert '-e' in cmd
         assert 'A=1' in cmd
         assert any('/x:/y' in a or a == '/x:/y' for a in cmd)
@@ -426,7 +426,7 @@ class TestHandleRunContainerState:
         """When replacing, --print-cmd should show rm then run command."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         with pytest.raises(SystemExit) as exc_info:
-            main(['--print-cmd', 'run', '--name=myc', '--auto-replace', '--workspace', 'alpine'])
+            main(['--print-cmd', 'run', '--name=myc', '--auto-replace', '--session', 'alpine'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         lines = out.strip().split('\n')
@@ -442,7 +442,7 @@ class TestHandleRunContainerState:
             podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
         )
         with pytest.raises(SystemExit) as exc_info:
-            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--workspace', 'alpine'])
+            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         cmd = shlex.split(out)
@@ -454,7 +454,7 @@ class TestHandleRunContainerState:
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         monkeypatch.setattr(podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'none'))
         with pytest.raises(SystemExit):
-            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--workspace', 'alpine'])
+            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert 'not created with podrun user overlay' in capsys.readouterr().err
 
     def test_action_none_exits_cleanly(self, monkeypatch):
@@ -462,7 +462,7 @@ class TestHandleRunContainerState:
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         monkeypatch.setattr(podrun_mod, 'handle_container_state', lambda *a, **kw: None)
         with pytest.raises(SystemExit) as exc_info:
-            main(['--print-cmd', 'run', '--name=myc', '--workspace', 'alpine'])
+            main(['--print-cmd', 'run', '--name=myc', '--session', 'alpine'])
         assert exc_info.value.code == 0
 
 
@@ -492,7 +492,7 @@ class TestExportConflictFiltering:
                 [
                     '--print-cmd',
                     'run',
-                    '--workspace',
+                    '--session',
                     '-v',
                     '/host:/data',
                     '--export',
@@ -512,7 +512,7 @@ class TestExportConflictFiltering:
                 [
                     '--print-cmd',
                     'run',
-                    '--workspace',
+                    '--session',
                     '--export',
                     f'/unique:{export_src}',
                     'alpine',

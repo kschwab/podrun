@@ -1989,7 +1989,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         '--dry-run',
         dest='root.print_cmd',
         action='store_true',
-        default=False,
+        default=None,
         help='Print the podman command instead of executing it',
     )
     opts.add_argument(
@@ -2010,7 +2010,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         '--no-devconfig',
         dest='root.no_devconfig',
         action='store_true',
-        default=False,
+        default=None,
         help='Skip devcontainer.json discovery',
     )
     opts.add_argument(
@@ -2025,7 +2025,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         '-v',
         dest='root.version',
         action='store_true',
-        default=False,
+        default=None,
         help=argparse.SUPPRESS,
     )
 
@@ -2041,28 +2041,28 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         '--local-store-ignore',
         dest='root.local_store_ignore',
         action='store_true',
-        default=False,
+        default=None,
         help='Suppress auto-discovery of project-local store',
     )
     opts.add_argument(
         '--local-store-auto-init',
         dest='root.local_store_auto_init',
         action='store_true',
-        default=False,
+        default=None,
         help='Auto-create store if missing (requires --local-store)',
     )
     opts.add_argument(
         '--local-store-info',
         dest='root.local_store_info',
         action='store_true',
-        default=False,
+        default=None,
         help='Print store information and exit',
     )
     opts.add_argument(
         '--local-store-destroy',
         dest='root.local_store_destroy',
         action='store_true',
-        default=False,
+        default=None,
         help='Remove project-local store before proceeding',
     )
 
@@ -2179,7 +2179,7 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         '--print-overlays',
         dest='run.print_overlays',
         action='store_true',
-        default=False,
+        default=None,
         help='Print each overlay group and its settings, then exit',
     )
     opts.add_argument(

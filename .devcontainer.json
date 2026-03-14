@@ -11,8 +11,8 @@
             "autoAttach": true,
             "podmanRemote": true,
             "exports": ["~/.aws:.claude/config/.aws"],
-            "store": ".devcontainer/.podrun/store",
-            "autoInitStore": true,
+            "localStore": ".podrun/store",
+            "localStoreAutoInit": true,
             "fuseOverlayfs": true,
             "shell": "bash"
         }

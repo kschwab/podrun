@@ -239,14 +239,14 @@ Ruff, mypy, shellcheck, vulture, and pytest-cov enforcement.
 | `TestMypy` (1 test) | `mypy podrun/podrun.py` — type annotations added for all errors |
 | `TestShellcheck` (5 tests) | run-entrypoint, rc.sh, exec-entrypoint at `--severity=warning`; bash/zsh completions |
 | `TestVulture` (1 test) | Dead code detection with `podrun_whitelist.py` for downstream-phase symbols |
-| Coverage threshold | Enforced via `--cov-fail-under=90` in `pyproject.toml` addopts (no dedicated test) |
+| Coverage threshold | Enforced via `--cov-fail-under=95` in `pyproject.toml` addopts (no dedicated test) |
 
 Key decisions:
 - **Ruff fixes**: 26 auto-fixed (F401 unused imports, F541 extraneous f-prefixes), 8 manual (C901 `# noqa: C901` on 4 orchestration functions, E741 `l`→`ln` rename, F841 dead code removal)
 - **Mypy fixes**: `Optional` for defaulting-to-None params, `# type: ignore[attr-defined]` for private argparse attributes (`_run_subparser`, `_subparsers._group_actions`), `# type: ignore[union-attr]` for `_subparsers` access, type annotations on untyped variables
 - **Shellcheck**: `--severity=warning` for entrypoint scripts (fixed `uid=$(id -u)` → `uid="$(id -u)"` SC2046); `--severity=error` for zsh completion (zsh-specific constructs trigger false positive warnings in bash mode); fish completion skipped (shellcheck doesn't support fish)
 - **Vulture whitelist**: `podrun_whitelist.py` suppresses `_extract_label_value`, `_expand_export_tilde` (used in downstream phases), `required`/`_devcontainer`/`_podrun_cfg` (dynamic attributes)
-- **Coverage**: `--cov-fail-under=90` in `pyproject.toml` addopts; threshold at 90% (current ~95%)
+- **Coverage**: `--cov-fail-under=95` in `pyproject.toml` addopts; threshold at 95% (current ~96%)
 
 #### Phase 2.9: Rename podrun2 → podrun ✓
 

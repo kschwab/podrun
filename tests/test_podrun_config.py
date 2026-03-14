@@ -206,6 +206,32 @@ class TestStripJsonc:
         result = json.loads(_strip_jsonc(text))
         assert result == {'key': 'value', 'num': 42}
 
+    def test_escaped_quotes_in_strings(self):
+        """Backslash-escaped quotes inside strings are preserved (lines 1317-1318)."""
+        text = r'{"path": "C:\\Users\\me", "msg": "say \"hello\""}'
+        result = json.loads(_strip_jsonc(text))
+        assert result['path'] == 'C:\\Users\\me'
+        assert result['msg'] == 'say "hello"'
+
+    def test_escaped_quotes_with_comment_after(self):
+        text = r'{"val": "has \\ backslash"} // comment'
+        result = json.loads(_strip_jsonc(text))
+        assert result == {'val': 'has \\ backslash'}
+
+
+# ---------------------------------------------------------------------------
+# TestParseDevcontainerJson — error paths
+# ---------------------------------------------------------------------------
+
+
+class TestParseDevcontainerJsonErrors:
+    def test_dir_without_devcontainer_json(self, tmp_path):
+        """Directory with no devcontainer.json anywhere exits with error."""
+        empty_dir = tmp_path / 'empty'
+        empty_dir.mkdir()
+        with pytest.raises(SystemExit):
+            parse_devcontainer_json(str(empty_dir))
+
 
 # ---------------------------------------------------------------------------
 # TestFindDevcontainerJson

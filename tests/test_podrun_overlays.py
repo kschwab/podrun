@@ -337,22 +337,23 @@ class TestPodmanRemoteArgs:
         assert f'--env=CONTAINER_HOST={podrun_mod.PODRUN_CONTAINER_HOST}' in args
 
     def test_fallback_systemd_socket(self, tmp_path, monkeypatch):
-        sock = tmp_path / 'podman.sock'
+        """Systemd socket found at /run/user/UID/podman/podman.sock."""
+        sock_dir = tmp_path / 'run' / 'user' / '12345' / 'podman'
+        sock_dir.mkdir(parents=True)
+        sock = sock_dir / 'podman.sock'
         sock.touch()
-        monkeypatch.setattr(podrun_mod, 'UID', 99999)
-        # Patch to make the fallback path point to our temp file
+        monkeypatch.setattr(podrun_mod, 'UID', 12345)
         real_exists = pathlib.Path.exists
 
         def fake_exists(self):
-            if 'podman.sock' in str(self) and '99999' in str(self):
-                return False
+            if str(self) == '/run/user/12345/podman/podman.sock':
+                return True
             return real_exists(self)
 
         monkeypatch.setattr(pathlib.Path, 'exists', fake_exists)
         args = _podman_remote_args({})
-        # No store socket and no systemd socket → warning
-        # (Just verify no crash)
-        assert isinstance(args, list)
+        assert any(podrun_mod.PODRUN_SOCKET_PATH in a for a in args)
+        assert any(podrun_mod.PODRUN_CONTAINER_HOST in a for a in args)
 
     def test_no_socket_warns(self, monkeypatch, capsys):
         monkeypatch.setattr(pathlib.Path, 'exists', lambda self: False)

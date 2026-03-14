@@ -249,6 +249,15 @@ class TestExtractLabelValue:
         # Walks forward; first match wins because the loop doesn't break
         assert _extract_label_value(pt, 'k') == 'first'
 
+    def test_space_form_non_matching(self):
+        """Space-form label with wrong key skips pair correctly."""
+        pt = ['--label', 'other=val', '--label', 'target=found']
+        assert _extract_label_value(pt, 'target') == 'found'
+
+    def test_short_space_form_non_matching(self):
+        pt = ['-l', 'other=val', '-l', 'target=hit']
+        assert _extract_label_value(pt, 'target') == 'hit'
+
 
 class TestExtractPassthroughEntrypoint:
     def test_equals_form(self):
@@ -343,6 +352,11 @@ class TestExpandVolumeTilde:
         result = _expand_volume_tilde(['-v=~/only'])
         assert result == [f'-v={USER_HOME}/only']
 
+    def test_space_form_single_part_tilde(self):
+        """Space-form volume with only one colon-part expands source tilde."""
+        result = _expand_volume_tilde(['-v', '~/only'])
+        assert result == ['-v', f'{USER_HOME}/only']
+
 
 class TestExpandExportTilde:
     def test_container_tilde(self):
@@ -404,4 +418,17 @@ class TestYesNoPrompt:
     def test_interactive_empty_uses_default_no(self, monkeypatch, capsys):
         monkeypatch.setattr('builtins.input', lambda: '')
         result = yes_no_prompt('Continue?', answer_default=False, is_interactive=False)
+        assert result is False
+
+    def test_interactive_retry_on_invalid_then_yes(self, monkeypatch, capsys):
+        answers = iter(['maybe', 'y'])
+        monkeypatch.setattr('builtins.input', lambda: next(answers))
+        result = yes_no_prompt('Continue?', answer_default=False, is_interactive=True)
+        assert result is True
+        assert 'Please answer yes or no' in capsys.readouterr().err
+
+    def test_interactive_retry_on_invalid_then_no(self, monkeypatch, capsys):
+        answers = iter(['x', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(answers))
+        result = yes_no_prompt('Continue?', answer_default=True, is_interactive=True)
         assert result is False

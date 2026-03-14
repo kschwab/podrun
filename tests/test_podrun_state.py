@@ -359,6 +359,16 @@ class TestBuildPodmanExecArgs:
         assert 'rows' in stty[0]
         assert 'cols' in stty[0]
 
+    def test_stty_init_oserror(self, monkeypatch):
+        """Terminal size lookup failure is silently ignored."""
+
+        def fail():
+            raise OSError('no tty')
+
+        monkeypatch.setattr(podrun_mod.shutil, 'get_terminal_size', fail)
+        args = build_podman_exec_args({}, 'myc')
+        assert not any('PODRUN_STTY_INIT' in a for a in args)
+
     def test_env_rc_path(self):
         args = build_podman_exec_args({}, 'myc')
         assert f'-e=ENV={PODRUN_RC_PATH}' in args

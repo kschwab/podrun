@@ -7,9 +7,12 @@ import pytest
 
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
+    PODRUN_CONTAINER_HOST,
+    PODRUN_SOCKET_PATH,
     UNAME,
     _default_podman_path,
     _fuse_overlayfs_fixup,
+    _is_nested,
     _warn_missing_subids,
     main,
 )
@@ -103,6 +106,35 @@ class TestDefaultPodmanPath:
         monkeypatch.setenv('PODRUN_PODMAN_PATH', str(fake_bin))
         path = _default_podman_path()
         assert path == str(fake_bin)
+
+
+# ---------------------------------------------------------------------------
+# _is_nested
+# ---------------------------------------------------------------------------
+
+
+class TestIsNested:
+    """Test _is_nested() directly — calls the real function, not the autouse mock."""
+
+    def test_env_var_primary(self, monkeypatch):
+        monkeypatch.setenv('PODRUN_CONTAINER', '1')
+        assert _is_nested() is True
+
+    def test_fallback_container_host_and_socket(self, monkeypatch):
+        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
+        monkeypatch.setenv('CONTAINER_HOST', PODRUN_CONTAINER_HOST)
+        real_exists = podrun_mod.os.path.exists
+        monkeypatch.setattr(
+            podrun_mod.os.path,
+            'exists',
+            lambda p: True if p == PODRUN_SOCKET_PATH else real_exists(p),
+        )
+        assert _is_nested() is True
+
+    def test_false_without_env_or_socket(self, monkeypatch):
+        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
+        monkeypatch.delenv('CONTAINER_HOST', raising=False)
+        assert _is_nested() is False
 
 
 # ---------------------------------------------------------------------------

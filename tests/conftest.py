@@ -18,6 +18,7 @@ _CACHE_DIR = os.path.join(
     'podrun',
 )
 _CACHE_FILES = sorted(glob.glob(os.path.join(_CACHE_DIR, 'podman-*.json')))
+_REMOTE_CACHE_FILES = sorted(glob.glob(os.path.join(_CACHE_DIR, 'podman-remote-*.json')))
 
 
 def _is_full_run(config):
@@ -78,6 +79,11 @@ def _require_podman_flags():
         flags = _read_flags_cache(_CACHE_FILES[-1])
         if flags is not None:
             podrun_mod._loaded_flags['podman'] = flags
+            # Also seed podman-remote cache (from dedicated cache or podman's)
+            if _REMOTE_CACHE_FILES:
+                remote_flags = _read_flags_cache(_REMOTE_CACHE_FILES[-1])
+                if remote_flags is not None:
+                    podrun_mod._loaded_flags['podman-remote'] = remote_flags
             return
 
     pytest.skip('podman flags unavailable (no local podman and no cache file)')

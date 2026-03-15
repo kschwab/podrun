@@ -11,6 +11,7 @@ from podrun.podrun import (
     PODRUN_SOCKET_PATH,
     UNAME,
     _default_podman_path,
+    _filter_global_args,
     _fuse_overlayfs_fixup,
     _is_nested,
     _warn_missing_subids,
@@ -528,13 +529,44 @@ class TestExportConflictFiltering:
 # ---------------------------------------------------------------------------
 
 
-class TestNestedPodrunGuard:
-    def test_exits_inside_podrun_container(self, monkeypatch, capsys):
+class TestNestedPodrunExecution:
+    """Nested podrun (inside a podrun container) should work, not be refused."""
+
+    def test_version_works_when_nested(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
         with pytest.raises(SystemExit) as exc_info:
-            main(['run', 'alpine'])
+            main(['--version'])
+        assert exc_info.value.code == 0
+
+    def test_passthrough_proceeds_when_nested(self, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'ps', '-a'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'ps' in out
+
+    def test_run_proceeds_when_nested(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr=''),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'run', 'alpine'])
+        assert exc_info.value.code == 0
+        cmd = capsys.readouterr().out
+        assert 'run' in cmd
+        assert 'alpine' in cmd
+
+    def test_local_store_destroy_still_errors_when_nested(self, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--local-store', '/tmp/s', '--local-store-destroy'])
         assert exc_info.value.code == 1
-        assert 'Nested podrun' in capsys.readouterr().err
+        assert 'not supported' in capsys.readouterr().err
 
     def test_no_guard_without_env(self, monkeypatch):
         # autouse fixture already sets _is_nested → False
@@ -563,3 +595,89 @@ class TestMainPodmanPath:
         with pytest.raises(SystemExit):
             main(['--version'])
         assert called.get('yes')
+
+
+# ---------------------------------------------------------------------------
+# _filter_global_args
+# ---------------------------------------------------------------------------
+
+
+class TestFilterGlobalArgs:
+    """Test cache-aware global flag filtering."""
+
+    @pytest.fixture()
+    def flags(self):
+        from podrun.podrun import PodmanFlags
+
+        return PodmanFlags(
+            global_value_flags=frozenset(['--log-level', '--network']),
+            global_boolean_flags=frozenset(['--noout']),
+            subcommands=frozenset(),
+            run_value_flags=frozenset(),
+            run_boolean_flags=frozenset(),
+        )
+
+    def test_drops_unknown_value_flags(self, flags):
+        args = ['--root', '/x', '--log-level', 'debug']
+        result = _filter_global_args(args, flags)
+        assert result == ['--log-level', 'debug']
+
+    def test_keeps_known_flags(self, flags):
+        args = ['--log-level', 'debug', '--noout']
+        result = _filter_global_args(args, flags)
+        assert result == ['--log-level', 'debug', '--noout']
+
+    def test_drops_multiple_unknown(self, flags):
+        args = ['--root', '/x', '--runroot', '/y', '--storage-driver', 'overlay']
+        result = _filter_global_args(args, flags)
+        assert result == []
+
+    def test_empty_input(self, flags):
+        assert _filter_global_args([], flags) == []
+
+    def test_mixed_known_unknown(self, flags):
+        args = ['--log-level', 'debug', '--root', '/x', '--noout', '--storage-opt', 'foo']
+        result = _filter_global_args(args, flags)
+        assert result == ['--log-level', 'debug', '--noout']
+
+    def test_non_flag_values_preserved(self, flags):
+        # Non-flag args (values without leading -) pass through
+        args = ['--log-level', 'debug']
+        result = _filter_global_args(args, flags)
+        assert result == ['--log-level', 'debug']
+
+
+# ---------------------------------------------------------------------------
+# Nested guard behavior in _handle_run
+# ---------------------------------------------------------------------------
+
+
+class TestNestedHandleRunGuards:
+    """Verify _warn_missing_subids and _fuse_overlayfs_fixup are skipped when nested."""
+
+    @pytest.fixture(autouse=True)
+    def _tmp_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd: subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr=''),
+        )
+
+    def test_warn_subids_skipped_when_nested(self, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'run', '--session', 'alpine'])
+        assert exc_info.value.code == 0
+        err = capsys.readouterr().err
+        # Should not contain subuid/subgid warnings when nested
+        assert 'subuid' not in err.lower()
+
+    def test_fuse_fixup_skipped_when_nested(self, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'run', '--fuse-overlayfs', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        # --storage-opt should NOT be injected when nested
+        assert '--storage-opt' not in out

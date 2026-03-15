@@ -274,6 +274,26 @@ dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
 host->container copy mechanism (similar to exports but reversed direction).
 Options: entrypoint copy block from staging mount, or a new staging pattern.
 
+#### Phase 2.11: Nested Podrun via Cache-Aware Flag Filtering ✓
+
+Enable nested podrun execution (running podrun inside a podrun container).
+**Status: Complete — tests in `tests/test_podrun_main.py` and `tests/test_podrun_cli.py`.**
+
+| Item | Notes |
+|---|---|
+| `_flags_cache_path()` | Added `podman_path` parameter; uses `os.path.basename()` so `podman` and `podman-remote` get separate cache files |
+| `_write_flags_cache()` | Wrapped in `try/except OSError: pass` for read-only cache dirs inside containers |
+| `load_podman_flags()` | Removed `_is_nested()` scraping refusal; passes `podman_path` to `_flags_cache_path()` |
+| `_filter_global_args()` | New function: filters `ns['podman_global_args']` against loaded `PodmanFlags`, silently dropping unknown flags + values |
+| `main()` | Removed blanket `_is_nested()` → `sys.exit(1)` guard; pre-loads flags with resolved `podman_path`; calls `_filter_global_args()` before command building |
+| `_handle_run()` | `_warn_missing_subids()` skipped when nested (misleading `/etc/subuid`); `_fuse_overlayfs_fixup()` skipped when nested (storage on remote daemon) |
+| `conftest.py` | Seeds `podman-remote` in-memory cache from host cache files |
+
+Key decisions:
+- **`_filter_global_args()` is the single gate for binary flag compatibility** — the scraped flag cache for `podman-remote` has fewer global flags than `podman`. `_filter_global_args()` uses this as source of truth to drop unsupported flags (e.g. `--root`, `--storage-driver`) silently. Callers like `_apply_store`, `_fuse_overlayfs_fixup`, and config scripts inject flags without caring which binary is in use — filtering is centralized in `main()`.
+- **`_apply_store()` nested guard is semantic, not flag-related** — `_resolve_store` is skipped when nested because the store filesystem lives on the host (not about flag compatibility). `--local-store-destroy` still errors when nested. `--local-store-info` prints "disabled".
+- **`_is_nested()` detection unchanged** — primary via `PODRUN_CONTAINER` env var, fallback via `CONTAINER_HOST` + socket existence.
+
 ### Phase 3 — Live Testing + Bug Fixes
 
 Live container integration tests and bug fixes discovered during end-to-end

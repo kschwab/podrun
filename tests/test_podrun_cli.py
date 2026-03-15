@@ -8,15 +8,18 @@ import shlex
 import shutil
 
 from podrun.podrun import (
+    PodmanFlags,
     _PODRUN_STORES_DIR,
     _apply_store,
     _default_store_dir,
+    _flags_cache_path,
     _resolve_store,
     _runroot_path,
     _scrape_podman_help,
     _store_destroy,
     _store_init,
     _store_print_info,
+    _write_flags_cache,
     build_passthrough_command,
     build_root_parser,
     build_run_command,
@@ -3677,3 +3680,72 @@ class TestStoreDestroyIntegration:
         out = capsys.readouterr().out
         assert 'Local store:' in out
         assert 'graphroot:' in out
+
+
+# ---------------------------------------------------------------------------
+# _flags_cache_path — binary basename in filename
+# ---------------------------------------------------------------------------
+
+
+class TestFlagsCachePath:
+    def test_default_uses_podman_basename(self):
+        path = _flags_cache_path('5.4.2')
+        assert path.endswith('podman-5.4.2.json')
+
+    def test_podman_remote_basename(self):
+        path = _flags_cache_path('5.4.2', podman_path='/usr/bin/podman-remote')
+        assert path.endswith('podman-remote-5.4.2.json')
+
+    def test_bare_podman_name(self):
+        path = _flags_cache_path('5.4.2', podman_path='podman')
+        assert path.endswith('podman-5.4.2.json')
+
+    def test_absolute_podman_path(self):
+        path = _flags_cache_path('5.4.2', podman_path='/usr/bin/podman')
+        assert path.endswith('podman-5.4.2.json')
+
+    def test_no_collision(self):
+        p1 = _flags_cache_path('5.4.2', podman_path='podman')
+        p2 = _flags_cache_path('5.4.2', podman_path='podman-remote')
+        assert p1 != p2
+
+
+# ---------------------------------------------------------------------------
+# _write_flags_cache — fault tolerance
+# ---------------------------------------------------------------------------
+
+
+class TestWriteFlagsCacheFaultTolerance:
+    def test_read_only_dir_does_not_crash(self, tmp_path):
+        """_write_flags_cache silently ignores write failures."""
+        ro_dir = tmp_path / 'readonly'
+        ro_dir.mkdir()
+        cache_path = str(ro_dir / 'subdir' / 'flags.json')
+        # Make parent read-only so mkdir inside fails
+        ro_dir.chmod(0o444)
+        try:
+            flags = PodmanFlags(
+                global_value_flags=frozenset(['--log-level']),
+                global_boolean_flags=frozenset(),
+                subcommands=frozenset(),
+                run_value_flags=frozenset(),
+                run_boolean_flags=frozenset(),
+            )
+            # Should not raise
+            _write_flags_cache(cache_path, flags)
+            # File should not exist
+            assert not os.path.exists(cache_path)
+        finally:
+            ro_dir.chmod(0o755)
+
+    def test_normal_write_still_works(self, tmp_path):
+        cache_path = str(tmp_path / 'flags.json')
+        flags = PodmanFlags(
+            global_value_flags=frozenset(['--log-level']),
+            global_boolean_flags=frozenset(['--noout']),
+            subcommands=frozenset(['ps', 'run']),
+            run_value_flags=frozenset(['-e']),
+            run_boolean_flags=frozenset(['--rm']),
+        )
+        _write_flags_cache(cache_path, flags)
+        assert os.path.exists(cache_path)

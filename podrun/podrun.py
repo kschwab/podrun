@@ -181,9 +181,14 @@ def _flags_cache_dir():
     return os.path.join(base, 'podrun')
 
 
-def _flags_cache_path(version):
-    """Return the cache file path for a given podman version."""
-    return os.path.join(_flags_cache_dir(), f'podman-{version}.json')
+def _flags_cache_path(version, podman_path='podman'):
+    """Return the cache file path for a given podman version.
+
+    Includes the binary basename in the filename so ``podman`` and
+    ``podman-remote`` at the same version get separate cache files.
+    """
+    basename = os.path.basename(podman_path)
+    return os.path.join(_flags_cache_dir(), f'{basename}-{version}.json')
 
 
 def _scrape_all_flags(podman_path):
@@ -228,8 +233,12 @@ def _read_flags_cache(path):
 
 
 def _write_flags_cache(path, flags):
-    """Write a PodmanFlags to a JSON cache file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """Write a PodmanFlags to a JSON cache file.
+
+    Silently ignores write failures (e.g. read-only cache dir inside a
+    container).  The in-memory cache (``_loaded_flags``) still serves the
+    current process; re-scraping on next invocation is fast and acceptable.
+    """
     data = {
         'global_value_flags': sorted(flags.global_value_flags),
         'global_boolean_flags': sorted(flags.global_boolean_flags),
@@ -237,8 +246,12 @@ def _write_flags_cache(path, flags):
         'run_value_flags': sorted(flags.run_value_flags),
         'run_boolean_flags': sorted(flags.run_boolean_flags),
     }
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
 
 
 def load_podman_flags(podman_path='podman'):
@@ -247,8 +260,13 @@ def load_podman_flags(podman_path='podman'):
     Resolution chain:
     1. In-memory cache hit → return immediately
     2. Disk cache for current podman version → read, store in memory, return
-    3. Scrape local podman (error if remote-only) → write cache, return
+    3. Live scrape from ``podman_path --help`` → write cache, return
     4. Podman not found → sys.exit(1)
+
+    Scraping works for both ``podman`` and ``podman-remote``.  The latter
+    returns fewer global flags, which is correct — the cache-aware flag
+    filter (``_filter_global_args``) uses this to silently drop unsupported
+    flags when nested.
     """
     if podman_path in _loaded_flags:
         return _loaded_flags[podman_path]
@@ -259,21 +277,11 @@ def load_podman_flags(podman_path='podman'):
         sys.exit(1)
 
     # Try disk cache
-    cache_path = _flags_cache_path(version)
+    cache_path = _flags_cache_path(version, podman_path)
     flags = _read_flags_cache(cache_path)
     if flags is not None:
         _loaded_flags[podman_path] = flags
         return flags
-
-    # Must scrape — refuse if nested (help pages on podman-remote are incomplete)
-    if _is_nested():
-        print(
-            f'Error: running inside a podrun container but no flags cache found.\n'
-            'The flags cache must be pre-built on the host before nested use.\n'
-            f'Expected cache at: {cache_path}',
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     flags = _scrape_all_flags(podman_path)
     _write_flags_cache(cache_path, flags)
@@ -1080,10 +1088,6 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
     args.append(f'-v={rc_path}:{PODRUN_RC_PATH}:ro')
     args.append(f'-v={exec_entry_path}:{PODRUN_EXEC_ENTRY_PATH}:ro')
     args.append(f'--env=ENV={PODRUN_RC_PATH}')
-    # Mount flags cache so nested podrun can parse CLI without re-scraping
-    host_cache_dir = _flags_cache_dir()
-    if os.path.isdir(host_cache_dir):
-        args.append(f'-v={host_cache_dir}:{host_cache_dir}:ro')
     for entry in ns.get('run.export') or []:
         container_path, host_path, _ = _parse_export(entry)
         abs_host = os.path.abspath(host_path)
@@ -1787,8 +1791,12 @@ def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], di
 def _apply_store(ns: dict, podman_path: str = 'podman') -> None:
     """Resolve store, prepend flags, and handle store-only exits.
 
-    Inside a nested podrun container the store is determined by the service
-    socket established at container launch — local store flags do not apply.
+    Inside a nested podrun container the store concept does not apply —
+    the store filesystem lives on the host and ``_resolve_store`` must not
+    run (it would walk the mounted workspace looking for ``.devcontainer``
+    and attempt ``mkdir`` on non-existent paths).  Any flags that *do* get
+    injected into ``podman_global_args`` are filtered for binary
+    compatibility by ``_filter_global_args`` in ``main()``.
     """
     nested = _is_nested()
 
@@ -3424,6 +3432,34 @@ def _exec_attach(result, ns, global_flags, podman_path):
     os.execvpe(podman_path, cmd, os.environ.copy())
 
 
+def _filter_global_args(global_args: List[str], flags: PodmanFlags) -> List[str]:
+    """Single gate for binary flag compatibility in ``podman_global_args``.
+
+    Various callers (``_apply_store``, ``_fuse_overlayfs_fixup``, config
+    scripts) inject global flags like ``--root``, ``--runroot``,
+    ``--storage-driver``, ``--storage-opt`` in space form (``['--root',
+    '/path']``).  Those callers don't need to know which binary is in use —
+    this function strips any flag the resolved binary doesn't recognize
+    (e.g. storage flags on ``podman-remote``).
+
+    User-typed flags are already safe — argparse only registers flags present
+    in the scraped cache, so unsupported flags are never parsed.
+    """
+    known = flags.global_value_flags | flags.global_boolean_flags
+    result: List[str] = []
+    i = 0
+    while i < len(global_args):
+        arg = global_args[i]
+        if arg.startswith('-') and arg not in known:
+            # Unknown flag — skip it + its value (podrun only injects
+            # space-form value flags like ['--root', '/path'])
+            i += 2
+            continue
+        result.append(arg)
+        i += 1
+    return result
+
+
 def _filter_conflicting_exports(ns):
     """Remove exports whose container path is already mounted via -v."""
     pt = ns.get('run.passthrough_args') or []
@@ -3515,8 +3551,9 @@ def _handle_run(result, podman_path):  # noqa: C901
     if ns.get('run.user_overlay') and (ns.get('run.export') or []):
         _filter_conflicting_exports(ns)
 
-    # Warn about missing subuid/subgid ranges
-    if ns.get('run.user_overlay'):
+    # Warn about missing subuid/subgid ranges (skip when nested — /etc/subuid
+    # inside the container is misleading)
+    if ns.get('run.user_overlay') and not _is_nested():
         _warn_missing_subids()
 
     # Ensure store service is running when using podman-remote with a local store
@@ -3532,7 +3569,8 @@ def _handle_run(result, podman_path):  # noqa: C901
     # Fuse-overlayfs fixup — must run before build_overlay_run_command so
     # --storage-opt is already in podman_global_args when the command is built,
     # and :O→:ro conversion applies to passthrough args (not the final cmd).
-    if ns.get('run.fuse_overlayfs'):
+    # Skip when nested — storage is on the remote daemon, not local.
+    if ns.get('run.fuse_overlayfs') and not _is_nested():
         _fuse_overlayfs_fixup(ns)
 
     # Build the full run command with overlay injection
@@ -3559,15 +3597,6 @@ def _handle_run(result, podman_path):  # noqa: C901
 def main(argv=None):
     raw = argv if argv is not None else sys.argv[1:]
 
-    # Guard: refuse to run inside a podrun container
-    if _is_nested():
-        print(
-            'Error: podrun cannot be run inside a podrun container.\n'
-            'Nested podrun is not supported.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     podman_path = _default_podman_path() or 'podman'
 
     # Podman-not-found guard — fail early before parsing.
@@ -3575,7 +3604,9 @@ def main(argv=None):
         print(f'Error: podman not found or not functional ({podman_path})', file=sys.stderr)
         sys.exit(1)
 
-    result = parse_args(raw)
+    # Pre-load flags for the resolved binary (podman vs podman-remote).
+    flags = load_podman_flags(podman_path)
+    result = parse_args(raw, flags=flags)
     ns = result.ns
 
     # Immediate-exit flags
@@ -3594,6 +3625,12 @@ def main(argv=None):
 
     # Store resolution (destroy, resolve, info — all handled inside)
     _apply_store(ns, podman_path)
+
+    # Filter global args against the resolved binary's flag set.
+    # This is the single gate for binary flag compatibility — any flag in
+    # podman_global_args that the resolved binary doesn't recognize (e.g.
+    # --root, --storage-driver on podman-remote) is silently dropped here.
+    ns['podman_global_args'] = _filter_global_args(ns.get('podman_global_args') or [], flags)
 
     # Route
     if ns['subcommand'] == 'run':

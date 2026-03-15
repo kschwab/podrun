@@ -35,17 +35,6 @@ _VULTURE_AVAILABLE = (
 _TARGETS = ['podrun/podrun.py', 'tests/']
 
 
-# ---------------------------------------------------------------------------
-# Fixture: isolate PODRUN_TMP for entrypoint generators
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def _isolate_tmp(tmp_path, monkeypatch):
-    """Redirect PODRUN_TMP so generators don't write to the real runtime dir."""
-    monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
-
 def _default_ns(**overrides):
     """Build a minimal ns dict for entrypoint generation."""
     ns = {
@@ -112,7 +101,6 @@ class TestMypy:
 
 class TestShellcheck:
     @pytest.mark.skipif(not _SHELLCHECK_AVAILABLE, reason='shellcheck not available')
-    @pytest.mark.usefixtures('_isolate_tmp')
     def test_run_entrypoint(self):
         path = generate_run_entrypoint(_default_ns())
         result = subprocess.run(
@@ -123,7 +111,6 @@ class TestShellcheck:
         assert result.returncode == 0, f'shellcheck errors:\n{result.stdout}'
 
     @pytest.mark.skipif(not _SHELLCHECK_AVAILABLE, reason='shellcheck not available')
-    @pytest.mark.usefixtures('_isolate_tmp')
     def test_rc_sh(self, monkeypatch):
         # Stub run_os_cmd to avoid real subprocess calls for CPU info
         mock_result = subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
@@ -138,7 +125,6 @@ class TestShellcheck:
         assert result.returncode == 0, f'shellcheck errors:\n{result.stdout}'
 
     @pytest.mark.skipif(not _SHELLCHECK_AVAILABLE, reason='shellcheck not available')
-    @pytest.mark.usefixtures('_isolate_tmp')
     def test_exec_entrypoint(self):
         path = generate_exec_entrypoint()
         result = subprocess.run(

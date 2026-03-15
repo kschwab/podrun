@@ -33,12 +33,7 @@ from podrun.podrun import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
+pytestmark = pytest.mark.usefixtures('podman_binary')
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +89,6 @@ class TestComputeCapsToDrop:
 
 
 class TestUserOverlayArgs:
-    @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
     def _call(self, ns=None, pt=None):
         ns = ns or {}
         pt = pt or []
@@ -545,10 +536,6 @@ class TestDotFilesOverlayCLI:
 
 
 class TestEntrypointCapsToDrop:
-    @pytest.fixture(autouse=True)
-    def _tmp(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
     def test_default_caps(self):
         path = generate_run_entrypoint({})
         with open(path) as f:

@@ -20,12 +20,6 @@ from podrun.podrun import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate_tmp(tmp_path, monkeypatch):
-    """Redirect PODRUN_TMP so tests don't write to the real runtime dir."""
-    monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
-
 def _default_ns(**overrides):
     """Build a minimal ns dict for entrypoint generation."""
     ns = {

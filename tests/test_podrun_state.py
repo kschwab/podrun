@@ -20,12 +20,7 @@ from podrun.podrun import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
+pytestmark = pytest.mark.usefixtures('podman_binary')
 
 
 # ---------------------------------------------------------------------------
@@ -443,10 +438,6 @@ class TestBuildPodmanExecArgs:
 
 
 class TestBuildOverlayRunCommand:
-    @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
     def _parse_and_resolve(self, argv):
         r = parse_args(argv)
         r = resolve_config(r)

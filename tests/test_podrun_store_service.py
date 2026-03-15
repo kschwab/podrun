@@ -1,8 +1,8 @@
 """Tests for Phase 2.6: Store service lifecycle.
 
 Covers _store_hash, _store_socket_path, _store_pid_path, _socket_is_alive,
-_wait_for_socket, _ensure_store_service, _stop_store_service, hardened
-_is_nested, and _handle_run store-service integration.
+_wait_for_socket, _ensure_store_service, _stop_store_service,
+and _handle_run store-service integration.
 """
 
 import os
@@ -20,19 +20,10 @@ from podrun.podrun import (
     _store_socket_path,
     _stop_store_service,
     _wait_for_socket,
-    PODRUN_CONTAINER_HOST,
-    PODRUN_SOCKET_PATH,
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
-    monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-    monkeypatch.delenv('CONTAINER_HOST', raising=False)
+pytestmark = pytest.mark.usefixtures('podman_binary')
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +224,11 @@ class TestEnsureStoreService:
     def _stores_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path))
 
-    def test_refuses_when_nested(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_refuses_when_remote(self, tmp_path, monkeypatch):
         with pytest.raises(SystemExit):
-            podrun_mod._ensure_store_service(str(tmp_path / 'gr'), str(tmp_path / 'rr'))
+            podrun_mod._ensure_store_service(
+                str(tmp_path / 'gr'), str(tmp_path / 'rr'), podman_path='podman-remote'
+            )
 
     def test_returns_socket_path(self, tmp_path, monkeypatch):
         graphroot = str(tmp_path / 'graphroot')
@@ -337,62 +329,6 @@ class TestEnsureStoreService:
         )
         env = popen_kwargs[0]['env']
         assert env['CONTAINERS_REGISTRIES_CONF'] == str(reg_conf)
-
-
-# ---------------------------------------------------------------------------
-# _is_nested (hardened)
-# ---------------------------------------------------------------------------
-
-
-class TestIsNestedHardened:
-    """Test the hardened _is_nested() directly, bypassing the autouse mock."""
-
-    def _real_is_nested(self):
-        """Call the real _is_nested from the module source."""
-        # Inline the logic directly instead of going through the monkeypatched module
-        if os.environ.get('PODRUN_CONTAINER'):
-            return True
-        if os.environ.get('CONTAINER_HOST') == PODRUN_CONTAINER_HOST and os.path.exists(
-            PODRUN_SOCKET_PATH
-        ):
-            return True
-        return False
-
-    def test_env_var_set(self, monkeypatch):
-        monkeypatch.setenv('PODRUN_CONTAINER', '1')
-        assert self._real_is_nested() is True
-
-    def test_neither_set(self, monkeypatch):
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.delenv('CONTAINER_HOST', raising=False)
-        assert self._real_is_nested() is False
-
-    def test_container_host_and_socket(self, monkeypatch):
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.setenv('CONTAINER_HOST', PODRUN_CONTAINER_HOST)
-        monkeypatch.setattr(os.path, 'exists', lambda p: p == PODRUN_SOCKET_PATH)
-        assert self._real_is_nested() is True
-
-    def test_container_host_only(self, monkeypatch):
-        """CONTAINER_HOST set but socket doesn't exist → not nested."""
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.setenv('CONTAINER_HOST', PODRUN_CONTAINER_HOST)
-        monkeypatch.setattr(os.path, 'exists', lambda p: False)
-        assert self._real_is_nested() is False
-
-    def test_socket_only(self, monkeypatch):
-        """Socket exists but CONTAINER_HOST not set → not nested."""
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.delenv('CONTAINER_HOST', raising=False)
-        monkeypatch.setattr(os.path, 'exists', lambda p: p == PODRUN_SOCKET_PATH)
-        assert self._real_is_nested() is False
-
-    def test_tamper_unset_env_var(self, monkeypatch):
-        """User unsets PODRUN_CONTAINER but socket+host still detects."""
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.setenv('CONTAINER_HOST', PODRUN_CONTAINER_HOST)
-        monkeypatch.setattr(os.path, 'exists', lambda p: p == PODRUN_SOCKET_PATH)
-        assert self._real_is_nested() is True
 
 
 # ---------------------------------------------------------------------------

@@ -21,49 +21,7 @@ from podrun.podrun import (
 
 import podrun.podrun as podrun_mod
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_run_os_cmd(monkeypatch):
-    """Monkeypatch podrun.run_os_cmd and return a controller."""
-
-    class Controller:
-        def __init__(self):
-            self.calls = []
-            self._return_value = None
-            self._side_effect = None
-
-        def set_return(self, stdout='', stderr='', returncode=0):
-            self._return_value = subprocess.CompletedProcess(
-                args='', returncode=returncode, stdout=stdout, stderr=stderr
-            )
-            self._side_effect = None
-
-        def set_side_effect(self, effects):
-            self._side_effect = list(effects)
-            self._return_value = None
-
-        def __call__(self, cmd):
-            self.calls.append(cmd)
-            if self._side_effect is not None:
-                if self._side_effect:
-                    val = self._side_effect.pop(0)
-                else:
-                    val = subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
-                if isinstance(val, subprocess.CompletedProcess):
-                    return val
-                raise val
-            if self._return_value is not None:
-                return self._return_value
-            return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
-
-    ctrl = Controller()
-    monkeypatch.setattr(podrun_mod, 'run_os_cmd', ctrl)
-    return ctrl
+pytestmark = pytest.mark.usefixtures('podman_binary')
 
 
 @pytest.fixture
@@ -1350,7 +1308,7 @@ class TestIntegrationPipeline:
 
     # -- Global podman flags with config sources ------------------------------
 
-    def test_global_flags_with_dc_args(self, monkeypatch, tmp_project):
+    def test_global_flags_with_dc_args(self, monkeypatch, tmp_project, podman_only):
         """Global podman flags appear before 'run', DC args after."""
         dc_file = self._write_dc(
             tmp_project,

@@ -1,33 +1,26 @@
 """Tests for Phase 2.5 — main orchestration + execution."""
 
 import shlex
+import shutil
 import subprocess
 
 import pytest
 
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
-    PODRUN_CONTAINER_HOST,
-    PODRUN_SOCKET_PATH,
+    ENV_PODRUN_PODMAN_PATH,
+    ENV_PODRUN_PODMAN_REMOTE,
     UNAME,
     _default_podman_path,
     _filter_global_args,
     _fuse_overlayfs_fixup,
-    _is_nested,
+    _is_remote,
     _warn_missing_subids,
     main,
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    """Prevent tests from picking up real devcontainer.json or store dirs."""
-    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
-    # Clear nested podrun guard env var (we're running inside a podrun container)
-    monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-    monkeypatch.delenv('PODRUN_PODMAN_PATH', raising=False)
+pytestmark = pytest.mark.usefixtures('podman_binary')
 
 
 # ---------------------------------------------------------------------------
@@ -37,14 +30,13 @@ def _isolate(monkeypatch):
 
 class TestDefaultPodmanPath:
     def test_returns_podman_normally(self, monkeypatch):
-        monkeypatch.delenv('CONTAINER_HOST', raising=False)
         path = _default_podman_path()
         assert path is not None
         assert 'podman' in path
 
-    def test_prefers_remote_inside_container(self, monkeypatch):
-        monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_podman_remote_env_resolves_remote(self, monkeypatch):
+        """PODRUN_PODMAN_REMOTE=1 → resolves to podman-remote."""
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
         original_which = podrun_mod.shutil.which
 
         def fake_which(name):
@@ -55,48 +47,91 @@ class TestDefaultPodmanPath:
         monkeypatch.setattr(podrun_mod.shutil, 'which', fake_which)
         assert _default_podman_path() == '/usr/bin/podman-remote'
 
-    def test_falls_back_when_not_nested(self, monkeypatch):
+    def test_podman_remote_env_falls_back_to_podman_with_container_host(self, monkeypatch):
+        """PODRUN_PODMAN_REMOTE=1 + CONTAINER_HOST + no podman-remote → podman."""
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
         monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
-        # autouse fixture already sets _is_nested → False
-        path = _default_podman_path()
-        assert path is None or 'podman-remote' not in path
 
-    def test_falls_back_without_container_host(self, monkeypatch):
-        monkeypatch.delenv('CONTAINER_HOST', raising=False)
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
-        path = _default_podman_path()
-        # Without CONTAINER_HOST, should use regular podman
-        assert path is None or 'podman-remote' not in path
+        def fake_which(name):
+            if name == 'podman':
+                return '/usr/bin/podman'
+            return None
 
-    def test_podman_path_env_returns_resolved(self, monkeypatch):
-        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'podman')
+        monkeypatch.setattr(podrun_mod.shutil, 'which', fake_which)
+        assert _default_podman_path() == '/usr/bin/podman'
+
+    def test_podman_remote_env_no_fallback_without_container_host(self, monkeypatch, capsys):
+        """PODRUN_PODMAN_REMOTE=1 without CONTAINER_HOST → no podman fallback."""
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
+
+        def fake_which(name):
+            if name == 'podman':
+                return '/usr/bin/podman'
+            return None
+
+        monkeypatch.setattr(podrun_mod.shutil, 'which', fake_which)
+        with pytest.raises(SystemExit) as exc_info:
+            _default_podman_path()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert ENV_PODRUN_PODMAN_REMOTE in err
+        assert 'podman-remote' in err
+
+    def test_podman_remote_env_missing_all_binaries_errors(self, monkeypatch, capsys):
+        """PODRUN_PODMAN_REMOTE=1 without any podman binary → hard error."""
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        with pytest.raises(SystemExit) as exc_info:
+            _default_podman_path()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert ENV_PODRUN_PODMAN_REMOTE in err
+
+    def test_fallback_to_podman_remote(self, monkeypatch):
+        """No podman found → falls back to podman-remote."""
+
+        def fake_which(name):
+            if name == 'podman-remote':
+                return '/usr/bin/podman-remote'
+            return None
+
+        monkeypatch.setattr(podrun_mod.shutil, 'which', fake_which)
+        assert _default_podman_path() == '/usr/bin/podman-remote'
+
+    def test_no_binaries_returns_none(self, monkeypatch):
+        """Neither podman nor podman-remote found → returns None."""
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        assert _default_podman_path() is None
+
+    def test_podman_path_env_returns_resolved(self, monkeypatch, podman_binary):
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_PATH, podman_binary)
         path = _default_podman_path()
-        # shutil.which('podman') should resolve to a real path
         assert path is not None
-        assert 'podman' in path
+        assert podman_binary in path
 
     def test_podman_path_env_invalid_exits(self, monkeypatch):
-        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'no-such-binary-xyz')
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_PATH, 'no-such-binary-xyz')
         with pytest.raises(SystemExit) as exc_info:
             _default_podman_path()
         assert exc_info.value.code == 1
 
     def test_podman_path_env_invalid_message(self, monkeypatch, capsys):
-        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'no-such-binary-xyz')
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_PATH, 'no-such-binary-xyz')
         with pytest.raises(SystemExit):
             _default_podman_path()
         err = capsys.readouterr().err
-        assert 'PODRUN_PODMAN_PATH' in err
+        assert ENV_PODRUN_PODMAN_PATH in err
         assert 'no-such-binary-xyz' in err
 
-    def test_podman_path_env_overrides_nested_remote(self, monkeypatch):
-        """PODRUN_PODMAN_PATH takes priority over nested podman-remote preference."""
-        monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
-        # Point to regular podman — should be used even when nested
-        monkeypatch.setenv('PODRUN_PODMAN_PATH', 'podman')
+    def test_podman_path_env_overrides_remote_env(self, monkeypatch, tmp_path):
+        """PODRUN_PODMAN_PATH takes priority over PODRUN_PODMAN_REMOTE."""
+        fake_bin = tmp_path / 'podman'
+        fake_bin.write_text('#!/bin/sh\n')
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_PATH, str(fake_bin))
         path = _default_podman_path()
-        assert path is not None
+        assert path == str(fake_bin)
         assert 'podman-remote' not in path
 
     def test_podman_path_env_absolute(self, monkeypatch, tmp_path):
@@ -104,38 +139,41 @@ class TestDefaultPodmanPath:
         fake_bin = tmp_path / 'my-podman'
         fake_bin.write_text('#!/bin/sh\n')
         fake_bin.chmod(0o755)
-        monkeypatch.setenv('PODRUN_PODMAN_PATH', str(fake_bin))
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_PATH, str(fake_bin))
         path = _default_podman_path()
         assert path == str(fake_bin)
 
 
 # ---------------------------------------------------------------------------
-# _is_nested
+# _is_remote
 # ---------------------------------------------------------------------------
 
 
-class TestIsNested:
-    """Test _is_nested() directly — calls the real function, not the autouse mock."""
+class TestIsRemote:
+    """Test _is_remote() — checks binary basename and CONTAINER_HOST."""
 
-    def test_env_var_primary(self, monkeypatch):
-        monkeypatch.setenv('PODRUN_CONTAINER', '1')
-        assert _is_nested() is True
+    def test_podman_remote_is_true(self):
+        assert _is_remote('podman-remote') is True
+        assert _is_remote('/usr/bin/podman-remote') is True
 
-    def test_fallback_container_host_and_socket(self, monkeypatch):
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.setenv('CONTAINER_HOST', PODRUN_CONTAINER_HOST)
-        real_exists = podrun_mod.os.path.exists
-        monkeypatch.setattr(
-            podrun_mod.os.path,
-            'exists',
-            lambda p: True if p == PODRUN_SOCKET_PATH else real_exists(p),
-        )
-        assert _is_nested() is True
+    def test_podman_is_false(self):
+        assert _is_remote('podman') is False
+        assert _is_remote('/usr/bin/podman') is False
 
-    def test_false_without_env_or_socket(self, monkeypatch):
-        monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-        monkeypatch.delenv('CONTAINER_HOST', raising=False)
-        assert _is_nested() is False
+    def test_custom_path_basename(self):
+        assert _is_remote('/opt/custom/podman-remote') is True
+        assert _is_remote('/opt/custom/podman') is False
+
+    def test_container_host_makes_podman_remote(self, monkeypatch):
+        """CONTAINER_HOST in env causes even full podman to be treated as remote."""
+        monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
+        assert _is_remote('podman') is True
+        assert _is_remote('/usr/bin/podman') is True
+
+    def test_container_host_unset_podman_not_remote(self):
+        """Without CONTAINER_HOST, full podman is not remote."""
+        # _isolate already clears CONTAINER_HOST
+        assert _is_remote('podman') is False
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +354,8 @@ class TestHandleRunViaPrintCmd:
     """Test _handle_run indirectly via main(['--print-cmd', 'run', ...])."""
 
     @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-        # Suppress stale file cleanup
+    def _mock_run_os_cmd(self, monkeypatch):
+        """Suppress stale file cleanup and container state checks."""
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
@@ -391,10 +428,6 @@ class TestHandleRunViaPrintCmd:
 
 
 class TestHandleRunErrors:
-    @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
     def test_no_image_exits(self, capsys):
         with pytest.raises(SystemExit):
             main(['--print-cmd', 'run'])
@@ -419,10 +452,6 @@ class TestHandleRunErrors:
 
 
 class TestHandleRunContainerState:
-    @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
-
     def test_replace_prints_rm_then_run(self, monkeypatch, capsys):
         """When replacing, --print-cmd should show rm then run command."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
@@ -474,8 +503,8 @@ class TestHandleRunContainerState:
 
 class TestExportConflictFiltering:
     @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+    def _mock_run_os_cmd(self, monkeypatch):
+        """Suppress stale file cleanup and container state checks."""
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
@@ -529,25 +558,32 @@ class TestExportConflictFiltering:
 # ---------------------------------------------------------------------------
 
 
-class TestNestedPodrunExecution:
-    """Nested podrun (inside a podrun container) should work, not be refused."""
+@pytest.mark.usefixtures('requires_podman_remote')
+class TestRemotePodrunExecution:
+    """Podrun with podman-remote should work for normal operations."""
 
-    def test_version_works_when_nested(self, monkeypatch):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def _force_remote(self, monkeypatch):
+        """Force remote mode by patching _default_podman_path directly."""
+        path = shutil.which('podman-remote')
+        monkeypatch.setattr(podrun_mod, '_default_podman_path', lambda: path)
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
+
+    def test_version_works_when_remote(self, monkeypatch):
+        self._force_remote(monkeypatch)
         with pytest.raises(SystemExit) as exc_info:
             main(['--version'])
         assert exc_info.value.code == 0
 
-    def test_passthrough_proceeds_when_nested(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_passthrough_proceeds_when_remote(self, monkeypatch, capsys):
+        self._force_remote(monkeypatch)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'ps', '-a'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert 'ps' in out
 
-    def test_run_proceeds_when_nested(self, monkeypatch, capsys, tmp_path):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_run_proceeds_when_remote(self, monkeypatch, capsys, tmp_path):
+        self._force_remote(monkeypatch)
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
         monkeypatch.setattr(
             podrun_mod,
@@ -561,16 +597,15 @@ class TestNestedPodrunExecution:
         assert 'run' in cmd
         assert 'alpine' in cmd
 
-    def test_local_store_destroy_still_errors_when_nested(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_local_store_destroy_errors_when_remote(self, monkeypatch, capsys):
+        self._force_remote(monkeypatch)
         with pytest.raises(SystemExit) as exc_info:
             main(['--local-store', '/tmp/s', '--local-store-destroy'])
         assert exc_info.value.code == 1
         assert 'not supported' in capsys.readouterr().err
 
-    def test_no_guard_without_env(self, monkeypatch):
-        # autouse fixture already sets _is_nested → False
-        # Just verify it doesn't exit with the nested error
+    def test_version_works_without_remote(self, monkeypatch):
+        # autouse fixture clears PODRUN_PODMAN_REMOTE — uses regular podman
         try:
             main(['--version'])
         except SystemExit as e:
@@ -589,7 +624,7 @@ class TestMainPodmanPath:
 
         def fake_default():
             called['yes'] = True
-            return podrun_mod.shutil.which('podman')
+            return podrun_mod.shutil.which('podman-remote') or podrun_mod.shutil.which('podman')
 
         monkeypatch.setattr(podrun_mod, '_default_podman_path', fake_default)
         with pytest.raises(SystemExit):
@@ -648,36 +683,43 @@ class TestFilterGlobalArgs:
 
 
 # ---------------------------------------------------------------------------
-# Nested guard behavior in _handle_run
+# Remote guard behavior in _handle_run
 # ---------------------------------------------------------------------------
 
 
-class TestNestedHandleRunGuards:
-    """Verify _warn_missing_subids and _fuse_overlayfs_fixup are skipped when nested."""
+@pytest.mark.usefixtures('requires_podman_remote')
+class TestRemoteHandleRunGuards:
+    """Verify _warn_missing_subids and _fuse_overlayfs_fixup are skipped when remote."""
 
     @pytest.fixture(autouse=True)
-    def _tmp_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+    def _mock_run_os_cmd(self, monkeypatch):
+        """Suppress stale file cleanup and container state checks."""
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
             lambda cmd: subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr=''),
         )
 
-    def test_warn_subids_skipped_when_nested(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def _force_remote(self, monkeypatch):
+        """Force remote mode by patching _default_podman_path directly."""
+        path = shutil.which('podman-remote')
+        monkeypatch.setattr(podrun_mod, '_default_podman_path', lambda: path)
+        monkeypatch.setenv(ENV_PODRUN_PODMAN_REMOTE, '1')
+
+    def test_warn_subids_skipped_when_remote(self, monkeypatch, capsys):
+        self._force_remote(monkeypatch)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--session', 'alpine'])
         assert exc_info.value.code == 0
         err = capsys.readouterr().err
-        # Should not contain subuid/subgid warnings when nested
+        # Should not contain subuid/subgid warnings when remote
         assert 'subuid' not in err.lower()
 
-    def test_fuse_fixup_skipped_when_nested(self, monkeypatch, capsys):
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_fuse_fixup_skipped_when_remote(self, monkeypatch, capsys):
+        self._force_remote(monkeypatch)
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--fuse-overlayfs', 'alpine'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        # --storage-opt should NOT be injected when nested
+        # --storage-opt should NOT be injected when remote
         assert '--storage-opt' not in out

@@ -34,67 +34,7 @@ from podrun.podrun import (
 
 import podrun.podrun as podrun_mod
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _isolate_from_filesystem(monkeypatch):
-    """Prevent CLI tests from picking up real devcontainer.json or store dirs.
-
-    Also force _is_nested=False so store tests behave consistently
-    regardless of the test environment (this container runs inside podrun).
-    """
-    monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
-    monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
-    monkeypatch.setattr(podrun_mod, '_is_nested', lambda: False)
-    # Clear nested podrun guard env var (we're running inside a podrun container)
-    monkeypatch.delenv('PODRUN_CONTAINER', raising=False)
-
-
-@pytest.fixture
-def mock_run_os_cmd(monkeypatch):
-    """Monkeypatch podrun.run_os_cmd and return a controller.
-
-    Only used for tests that need to simulate podman failure or control
-    exact output.  Most tests use real podman.
-    """
-
-    class Controller:
-        def __init__(self):
-            self.calls = []
-            self._return_value = None
-            self._side_effect = None
-
-        def set_return(self, stdout='', stderr='', returncode=0):
-            self._return_value = subprocess.CompletedProcess(
-                args='', returncode=returncode, stdout=stdout, stderr=stderr
-            )
-            self._side_effect = None
-
-        def set_side_effect(self, effects):
-            self._side_effect = list(effects)
-            self._return_value = None
-
-        def __call__(self, cmd):
-            self.calls.append(cmd)
-            if self._side_effect is not None:
-                if self._side_effect:
-                    val = self._side_effect.pop(0)
-                else:
-                    val = subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
-                if isinstance(val, subprocess.CompletedProcess):
-                    return val
-                raise val
-            if self._return_value is not None:
-                return self._return_value
-            return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
-
-    ctrl = Controller()
-    monkeypatch.setattr(podrun_mod, 'run_os_cmd', ctrl)
-    return ctrl
+pytestmark = pytest.mark.usefixtures('podman_binary')
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +104,7 @@ class TestSubcommandRouting:
         r = parse_args(['inspect', 'abc123'])
         assert r.ns['subcommand'] == 'inspect'
 
-    def test_global_flags_before_subcommand(self):
+    def test_global_flags_before_subcommand(self, podman_only):
         """Root parser consumes --root /x, then 'ps' routes correctly."""
         r = parse_args(['--root', '/x', 'ps'])
         assert r.ns['subcommand'] == 'ps'
@@ -172,14 +112,14 @@ class TestSubcommandRouting:
         assert '--root' in pga
         assert '/x' in pga
 
-    def test_global_equals_before_subcommand(self):
+    def test_global_equals_before_subcommand(self, podman_only):
         r = parse_args(['--root=/x', 'ps'])
         assert r.ns['subcommand'] == 'ps'
         pga = r.ns.get('podman_global_args') or []
         assert '--root' in pga
         assert '/x' in pga
 
-    def test_multiple_global_flags(self):
+    def test_multiple_global_flags(self, podman_only):
         r = parse_args(['--root', '/x', '--log-level', 'debug', 'ps'])
         assert r.ns['subcommand'] == 'ps'
         pga = r.ns.get('podman_global_args') or []
@@ -200,7 +140,7 @@ class TestSubcommandRouting:
         assert r.ns['root.local_store'] == '/my/store'
         assert 'alpine' in r.trailing_args
 
-    def test_remote_boolean_global_flag(self):
+    def test_remote_boolean_global_flag(self, podman_only):
         """--remote is a podman global boolean flag, consumed by root parser."""
         r = parse_args(['--remote', 'ps', '-a'])
         assert r.ns['subcommand'] == 'ps'
@@ -294,7 +234,7 @@ class TestBuildRootParser:
         ns, _ = self._parse([])
         assert ns['root.local_store_destroy'] is None
 
-    def test_podman_global_value_flags_consumed(self):
+    def test_podman_global_value_flags_consumed(self, podman_only):
         """Podman global value flags are consumed into podman_global_args."""
         ns, unknowns = self._parse(['--root', '/x', '--log-level', 'debug'])
         args = ns.get('podman_global_args') or []
@@ -304,7 +244,7 @@ class TestBuildRootParser:
         assert 'debug' in args
         assert '--root' not in unknowns
 
-    def test_podman_global_boolean_flags_consumed(self):
+    def test_podman_global_boolean_flags_consumed(self, podman_only):
         """Podman global boolean flags are consumed into podman_global_args."""
         ns, unknowns = self._parse(['--remote'])
         args = ns.get('podman_global_args') or []
@@ -514,7 +454,7 @@ class TestPassthroughAction:
         assert '--mount' in pt
         assert 'type=bind,src=/a,dst=/b' in pt
 
-    def test_boolean_passthrough_on_root(self):
+    def test_boolean_passthrough_on_root(self, podman_only):
         """_PassthroughAction with nargs=0 captures boolean flags."""
         parser = build_root_parser()
         ns = vars(parser.parse_known_args(['--remote'])[0])
@@ -814,7 +754,7 @@ class TestParseArgs:
         assert r.ns['run.session'] is True
         assert 'alpine' in r.trailing_args
 
-    def test_podman_global_flags_extracted(self):
+    def test_podman_global_flags_extracted(self, podman_only):
         r = parse_args(['--root', '/x', 'run', 'alpine'])
         pga = r.ns.get('podman_global_args') or []
         assert '--root' in pga
@@ -842,7 +782,7 @@ class TestParseArgs:
         assert '--rm' in pt
         assert '--privileged' in pt
 
-    def test_podman_global_flags_with_equals(self):
+    def test_podman_global_flags_with_equals(self, podman_only):
         r = parse_args(['--root=/x', 'run', 'alpine'])
         pga = r.ns.get('podman_global_args') or []
         assert '--root' in pga
@@ -882,7 +822,7 @@ class TestParseArgs:
         assert r.ns['root.config'] == '/path/to/config.json'
         assert r.ns['subcommand'] == 'run'
 
-    def test_remote_before_passthrough(self):
+    def test_remote_before_passthrough(self, podman_only):
         """--remote before passthrough subcommand lands in podman_global_args."""
         r = parse_args(['--remote', 'ps', '-a'])
         assert r.ns['subcommand'] == 'ps'
@@ -897,17 +837,17 @@ class TestParseArgs:
 
 
 class TestHelp:
-    def test_run_help_shows_podman_and_podrun(self, capsys):
+    def test_run_help_shows_podman_and_podrun(self, capsys, podman_binary):
         with pytest.raises(SystemExit) as exc_info:
-            print_help('run', ['--help'], 'podman')
+            print_help('run', ['--help'], podman_binary)
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert 'podrun' in out
         assert 'Podrun:' in out
 
-    def test_global_help(self, capsys):
+    def test_global_help(self, capsys, podman_binary):
         with pytest.raises(SystemExit) as exc_info:
-            print_help(None, ['--help'], 'podman')
+            print_help(None, ['--help'], podman_binary)
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert 'podrun' in out
@@ -941,7 +881,7 @@ class TestPrintCmd:
         assert 'FOO=bar' in cmd
         assert 'alpine' in cmd
 
-    def test_run_print_cmd_global_flags_before_subcommand(self):
+    def test_run_print_cmd_global_flags_before_subcommand(self, podman_only):
         r = parse_args(['--root', '/x', 'run', 'alpine'])
         cmd = build_run_command(r, 'podman')
         run_idx = cmd.index('run')
@@ -983,7 +923,7 @@ class TestBuildPassthroughCommand:
         cmd = build_passthrough_command(r, 'podman')
         assert cmd == ['podman', 'ps', '-a']
 
-    def test_passthrough_with_global_flags(self):
+    def test_passthrough_with_global_flags(self, podman_only):
         r = parse_args(['--root', '/x', 'ps', '-a'])
         cmd = build_passthrough_command(r, 'podman')
         assert cmd[0] == 'podman'
@@ -991,7 +931,7 @@ class TestBuildPassthroughCommand:
         root_idx = cmd.index('--root')
         assert root_idx < ps_idx
 
-    def test_passthrough_with_remote(self):
+    def test_passthrough_with_remote(self, podman_only):
         r = parse_args(['--remote', 'ps', '-a'])
         cmd = build_passthrough_command(r, 'podman')
         remote_idx = cmd.index('--remote')
@@ -1041,8 +981,8 @@ class TestCompletion:
 
 
 class TestScrapePodmanHelp:
-    def test_scrape_run_value_flags(self):
-        result = _scrape_podman_help('podman', subcmd='run')
+    def test_scrape_run_value_flags(self, podman_binary):
+        result = _scrape_podman_help(podman_binary, subcmd='run')
         assert result is not None
         value_flags, bool_flags, _ = result
         assert '--env' in value_flags
@@ -1051,8 +991,8 @@ class TestScrapePodmanHelp:
         assert '--name' in value_flags
         assert '--rm' in bool_flags
 
-    def test_scrape_global(self):
-        result = _scrape_podman_help('podman')
+    def test_scrape_global(self, podman_binary):
+        result = _scrape_podman_help(podman_binary)
         assert result is not None
         value_flags, bool_flags, subcommands = result
         assert '--log-level' in value_flags
@@ -1071,10 +1011,10 @@ class TestScrapePodmanHelp:
 
 
 class TestVersion:
-    def test_print_version_real(self, capsys):
-        print_version('podman')
+    def test_print_version_real(self, capsys, podman_binary):
+        print_version(podman_binary)
         out = capsys.readouterr().out
-        assert 'podman version' in out
+        assert 'version' in out
         assert 'podrun version' in out
 
     def test_print_version_podman_failure(self, mock_run_os_cmd, capsys):
@@ -1096,7 +1036,7 @@ class TestMain:
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert 'podrun version' in out
-        assert 'podman version' in out
+        assert 'version' in out
 
     def test_version_short_flag(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -1155,7 +1095,7 @@ class TestMain:
         out = capsys.readouterr().out
         assert 'store' in out
 
-    def test_print_cmd_with_global_podman_flags(self, capsys):
+    def test_print_cmd_with_global_podman_flags(self, capsys, podman_only):
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', '--root', '/x', 'run', 'alpine'])
         assert exc_info.value.code == 0
@@ -1174,7 +1114,7 @@ class TestMain:
         assert '/a:/b' in out
         assert 'alpine' in out
 
-    def test_print_cmd_passthrough_with_remote(self, monkeypatch, capsys):
+    def test_print_cmd_passthrough_with_remote(self, monkeypatch, capsys, podman_only):
         """--remote should appear before the subcommand in passthrough output."""
         monkeypatch.setattr(podrun_mod.os, 'execvpe', lambda *a: None)
         with pytest.raises(SystemExit) as exc_info:
@@ -1220,7 +1160,7 @@ class TestPrintCmdOutput:
             main(['--print-cmd'] + argv)
         assert exc_info.value.code == 0
         tokens = _shlex.split(capsys.readouterr().out)
-        if tokens and tokens[0].endswith('podman'):
+        if tokens and tokens[0].endswith(('podman', 'podman-remote')):
             tokens[0] = 'podman'
         return tokens
 
@@ -1359,7 +1299,7 @@ class TestPrintCmdOutput:
 
     # -- global podman flags ordering ----------------------------------------
 
-    def test_global_flags_before_run(self, capsys):
+    def test_global_flags_before_run(self, capsys, podman_only):
         cmd = self._cmd(['--root', '/x', '--log-level', 'debug', 'run', 'alpine'], capsys)
         run_idx = cmd.index('run')
         assert cmd.index('--root') < run_idx
@@ -1367,11 +1307,11 @@ class TestPrintCmdOutput:
         assert cmd.index('--log-level') < run_idx
         assert cmd.index('debug') < run_idx
 
-    def test_remote_before_run(self, capsys):
+    def test_remote_before_run(self, capsys, podman_only):
         cmd = self._cmd(['--remote', 'run', 'alpine'], capsys)
         assert cmd.index('--remote') < cmd.index('run')
 
-    def test_multiple_global_flags(self, capsys):
+    def test_multiple_global_flags(self, capsys, podman_only):
         cmd = self._cmd(
             [
                 '--root',
@@ -1394,7 +1334,7 @@ class TestPrintCmdOutput:
         cmd = self._cmd(['ps', '-a'], capsys, monkeypatch)
         assert cmd == ['podman', 'ps', '-a']
 
-    def test_passthrough_with_global(self, capsys, monkeypatch):
+    def test_passthrough_with_global(self, capsys, monkeypatch, podman_only):
         cmd = self._cmd(['--remote', 'ps', '-a', '--format', 'json'], capsys, monkeypatch)
         assert cmd.index('--remote') < cmd.index('ps')
         assert '-a' in cmd
@@ -1428,7 +1368,7 @@ class TestPrintCmdOutput:
 
     # -- rich combinations ---------------------------------------------------
 
-    def test_global_plus_run_flags_plus_env_volume(self, capsys):
+    def test_global_plus_run_flags_plus_env_volume(self, capsys, podman_only):
         cmd = self._cmd(
             [
                 '--root',
@@ -1460,7 +1400,7 @@ class TestPrintCmdOutput:
         assert mid.count('-e') == 2
         assert mid.count('-v') == 2
 
-    def test_full_realistic_command(self, capsys):
+    def test_full_realistic_command(self, capsys, podman_only):
         """Realistic session-like invocation."""
         cmd = self._cmd(
             [
@@ -1517,7 +1457,7 @@ class TestPrintCmdOutput:
         assert img_idx > run_idx
         assert cmd[img_idx + 1] == 'bash'
 
-    def test_full_with_command_and_separator(self, capsys):
+    def test_full_with_command_and_separator(self, capsys, podman_only):
         cmd = self._cmd(
             [
                 '--root',
@@ -1639,10 +1579,10 @@ class TestRunOsCmd:
         result = run_os_cmd('false')
         assert result.returncode != 0
 
-    def test_podman_version(self):
-        result = run_os_cmd('podman --version')
+    def test_podman_version(self, podman_binary):
+        result = run_os_cmd(f'{podman_binary} --version')
         assert result.returncode == 0
-        assert 'podman' in result.stdout
+        assert 'version' in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -1661,7 +1601,7 @@ class TestBuildRunCommand:
         cmd = build_run_command(r, 'podman')
         assert cmd == ['podman', 'run', 'alpine']
 
-    def test_with_global_flags(self):
+    def test_with_global_flags(self, podman_only):
         r = parse_args(['--root', '/x', 'run', 'alpine'])
         cmd = build_run_command(r, 'podman')
         assert cmd.index('--root') < cmd.index('run')
@@ -2235,13 +2175,13 @@ class TestPodmanPassthroughWithRunFlags:
 
 
 class TestGlobalPodmanWithRunCombinations:
-    def test_remote_with_run_and_session(self):
+    def test_remote_with_run_and_session(self, podman_only):
         r = parse_args(['--remote', 'run', '--session', 'alpine'])
         pga = r.ns.get('podman_global_args') or []
         assert '--remote' in pga
         assert r.ns['run.session'] is True
 
-    def test_root_and_log_level_with_run_flags(self):
+    def test_root_and_log_level_with_run_flags(self, podman_only):
         r = parse_args(
             [
                 '--root',
@@ -2263,7 +2203,7 @@ class TestGlobalPodmanWithRunCombinations:
         assert r.ns['run.host_overlay'] is True
         assert r.ns['run.name'] == 'myc'
 
-    def test_remote_with_run_podman_flags(self):
+    def test_remote_with_run_podman_flags(self, podman_only):
         r = parse_args(['--remote', 'run', '-e', 'A=1', '--rm', 'alpine'])
         pga = r.ns.get('podman_global_args') or []
         assert '--remote' in pga
@@ -2287,7 +2227,7 @@ class TestGlobalPodmanWithRunCombinations:
         assert 'ignore_chown_errors=true' in pga
         assert r.ns['run.name'] == 'myc'
 
-    def test_multiple_global_flags_with_run_podman_and_podrun_flags(self):
+    def test_multiple_global_flags_with_run_podman_and_podrun_flags(self, podman_only):
         r = parse_args(
             [
                 '--root',
@@ -2321,7 +2261,7 @@ class TestGlobalPodmanWithRunCombinations:
         assert 'alpine' in r.trailing_args
         assert 'bash' in r.trailing_args
 
-    def test_global_flags_with_passthrough_subcommand(self):
+    def test_global_flags_with_passthrough_subcommand(self, podman_only):
         r = parse_args(['--root', '/x', '--remote', 'ps', '-a', '--format', 'json'])
         pga = r.ns.get('podman_global_args') or []
         assert '--root' in pga
@@ -2337,7 +2277,7 @@ class TestGlobalPodmanWithRunCombinations:
 
 
 class TestFullStackCombinations:
-    def test_everything_together(self):
+    def test_everything_together(self, podman_only):
         """All layers: root flags + podman global + run podrun + run podman + image + cmd."""
         r = parse_args(
             [
@@ -2411,7 +2351,7 @@ class TestFullStackCombinations:
         assert r.trailing_args == ['myimage:latest', 'bash', '-c', 'echo hi']
         assert r.ns['subcommand'] == 'run'
 
-    def test_everything_with_separator(self):
+    def test_everything_with_separator(self, podman_only):
         """Full stack with explicit command after '--'."""
         r = parse_args(
             [
@@ -2446,7 +2386,7 @@ class TestFullStackCombinations:
         assert 'alpine' in r.trailing_args
         assert r.explicit_command == ['sh', '-c', 'echo done']
 
-    def test_build_run_command_full_stack(self):
+    def test_build_run_command_full_stack(self, podman_only):
         """build_run_command produces correct ordering with all flag types."""
         r = parse_args(
             [
@@ -2516,7 +2456,7 @@ class TestFullStackCombinations:
         assert '512m' in cmd
         assert 'alpine' in cmd
 
-    def test_print_cmd_main_full_stack(self, capsys):
+    def test_print_cmd_main_full_stack(self, capsys, podman_only):
         """main() with --print-cmd outputs correct full command."""
         with pytest.raises(SystemExit) as exc_info:
             main(
@@ -2547,7 +2487,7 @@ class TestFullStackCombinations:
         assert '--' in out
         assert 'echo' in out
 
-    def test_passthrough_command_with_global_flags(self):
+    def test_passthrough_command_with_global_flags(self, podman_only):
         """build_passthrough_command preserves global flag ordering."""
         r = parse_args(['--root', '/x', '--remote', 'exec', 'mycontainer', 'ls', '-la'])
         cmd = build_passthrough_command(r, 'podman')
@@ -2558,7 +2498,7 @@ class TestFullStackCombinations:
         assert 'ls' in cmd
         assert '-la' in cmd
 
-    def test_root_flags_before_passthrough_subcommand(self):
+    def test_root_flags_before_passthrough_subcommand(self, podman_only):
         """Root podrun flags + podman global flags + passthrough."""
         r = parse_args(['--print-cmd', '--local-store', '/s', '--remote', 'images', '--all'])
         assert r.ns['root.print_cmd'] is True
@@ -2911,6 +2851,7 @@ class TestApplyStore:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures('podman_only')
 class TestStoreCommandIntegration:
     """Verify store flags in the final podman command through main()."""
 
@@ -3368,21 +3309,19 @@ class TestStoreCommandIntegration:
 
     # -- podman remote ------------------------------------------------------
 
-    def test_nested_no_store_flags(self, init_store, monkeypatch):
-        """Nested (inside podrun container) → _apply_store skips store flags."""
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_remote_no_store_flags(self, init_store, monkeypatch):
+        """podman-remote → _apply_store skips store flags."""
         ns = {'root.local_store': init_store}
-        _apply_store(ns, 'podman')
+        _apply_store(ns, 'podman-remote')
         assert 'podman_global_args' not in ns or '--root' not in (
             ns.get('podman_global_args') or []
         )
 
-    def test_nested_store_info(self, init_store, capsys, monkeypatch):
-        """Nested + --local-store-info → disabled message."""
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+    def test_remote_store_info(self, init_store, capsys, monkeypatch):
+        """podman-remote + --local-store-info → disabled message."""
         ns = {'root.local_store': init_store, 'root.local_store_info': True}
         with pytest.raises(SystemExit) as exc_info:
-            _apply_store(ns, 'podman')
+            _apply_store(ns, 'podman-remote')
         assert exc_info.value.code == 0
         err = capsys.readouterr().err
         assert 'disabled' in err
@@ -3545,6 +3484,7 @@ class TestStoreDestroy:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures('podman_only')
 class TestStoreDestroyIntegration:
     """Verify --local-store-destroy through main().
 
@@ -3585,11 +3525,10 @@ class TestStoreDestroyIntegration:
         assert exc_info.value.code == 0
 
     def test_store_destroy_nested_error(self, capsys, monkeypatch):
-        """Nested (inside podrun) + --local-store-destroy → exits 1 with error."""
-        monkeypatch.setattr(podrun_mod, '_is_nested', lambda: True)
+        """podman-remote + --local-store-destroy → exits 1 with error."""
         ns = {'root.local_store_destroy': True}
         with pytest.raises(SystemExit) as exc_info:
-            _apply_store(ns, 'podman')
+            _apply_store(ns, 'podman-remote')
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert '--local-store-destroy' in err
@@ -3708,6 +3647,12 @@ class TestFlagsCachePath:
         p1 = _flags_cache_path('5.4.2', podman_path='podman')
         p2 = _flags_cache_path('5.4.2', podman_path='podman-remote')
         assert p1 != p2
+
+    def test_container_host_makes_podman_use_remote_label(self, monkeypatch):
+        """When CONTAINER_HOST is set, podman binary gets the remote cache label."""
+        monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
+        path = _flags_cache_path('5.4.2', podman_path='/usr/bin/podman')
+        assert path.endswith('podman-remote-5.4.2.json')
 
 
 # ---------------------------------------------------------------------------

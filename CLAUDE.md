@@ -38,7 +38,7 @@
 | `_ProjectContext` / `_find_project_context()` | Combined store+dc walk replaced by separate `_default_store_dir()` + `find_devcontainer_json()` |
 | Hardcoded `PODMAN_RUN_VALUE_FLAGS` / `PODMAN_SUBCOMMANDS` | Replaced by live scraping into `PodmanFlags` |
 | `merge_config()` (monolithic) | Replaced by `resolve_config()` with cleaner separation |
-| `_expand_volume_tilde()` / `_expand_export_tilde()` | Not yet addressed -- may need porting in Phase 2 |
+| `_expand_volume_tilde()` / `_expand_export_tilde()` | Ported in Phase 2.1. Enhanced for space-separated form in Phase 2.4. Used by `_DOTFILES` tilde expansion in Phase 2.10. |
 | `check_flags()` / `_scrape_podman_value_flags()` (diff tool) | No longer needed -- flags are scraped live |
 
 ### Phase 2 -- Porting Plan
@@ -142,7 +142,7 @@ Key decisions:
 - `_user_overlay_args()` returns `(args, caps_to_drop)` so orchestration can pass filtered caps to entrypoint generation
 - `compute_caps_to_drop(pt)` handles `--cap-add` (equals/space/comma forms, case-insensitive) and `--privileged`
 - `--dot-files-overlay`/`--dotfiles` CLI flag added; implies `user_overlay` via `resolve_config()`
-- `_DOTFILES_MOUNT = ['.emacs', '.emacs.d', '.vimrc']` — mount-mode only; copy-mode deferred to Phase 2.10
+- `_DOTFILES` unified list replaces `_DOTFILES_MOUNT` — entries use `-v=` syntax with `:ro` (mount-mode) or `:0` (copy-mode). Copy-mode items (`.ssh`, `.gitconfig`) resolved by `_resolve_overlay_mounts` via entrypoint copy-staging (Phase 2.10)
 
 #### Phase 2.4: Command Assembly + Container State ✓
 
@@ -172,7 +172,7 @@ Final integration into `main()`. Tests: `tests/test_podrun_main.py` (40 tests).
 | `_is_nested()` | replaces `is_podman_remote()` | ✓ Single source of truth for nested-execution detection via `PODRUN_CONTAINER` env var |
 | `_default_podman_path()` | Lines 237-245 | ✓ `PODRUN_PODMAN_PATH` env var → nested podman-remote → podman fallback |
 | `_warn_missing_subids()` | Lines 1416-1439 | ✓ subuid/subgid check |
-| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ `:O`→`:ro` for files (equals + space form), storage-opt injection |
+| `_fuse_overlayfs_fixup()` | Lines 3193-3218 | ✓ Replaced by `_resolve_overlay_mounts()` in Phase 2.10 — `:O`→copy-staging fallback + storage-opt injection |
 | `_handle_run()` | Lines 3103-3226 | ✓ state → entrypoints → overlays → exec |
 | `main()` updated | — | ✓ Nested guard via `_is_nested()`, `_default_podman_path()`, routes to `_handle_run()` |
 | `_volume_mount_destinations()` | — | ✓ Fixed space-form volume parsing (`-v /host:/ctr`) |
@@ -266,13 +266,31 @@ Key decisions:
   (`from .podrun import main` already points to the renamed module)
 - Live integration tests preserved in `live_tests_reference/` pending Phase 3
 
-#### Phase 2.10: Copy-mode Dotfiles (evaluate strategy)
+#### Phase 2.10: Copy-mode Dotfiles + `:O` Entrypoint-Copy Fallback ✓
 
-Evaluate and implement copy-mode dotfiles for `--dot-files-overlay`. Mount-mode
-dotfiles (Phase 2.3) are `:ro` bind mounts. Copy-mode dotfiles (`.ssh`,
-`.gitconfig`) need to be writable in the container, so they require a
-host->container copy mechanism (similar to exports but reversed direction).
-Options: entrypoint copy block from staging mount, or a new staging pattern.
+Copy-mode dotfiles and unified `:O`/`:0` overlay mount resolution.
+**Status: Complete — tests in `tests/test_podrun_overlays.py`, `tests/test_podrun_entrypoint.py`, `tests/test_podrun_main.py`.**
+
+| Item | Notes |
+|---|---|
+| `_DOTFILES` | Unified list replaces `_DOTFILES_MOUNT`. Entries use `-v=` syntax: `:ro` for mount-mode (`.emacs`, `.emacs.d`, `.vimrc`), `:0` for copy-mode (`.ssh`, `.gitconfig`) |
+| `_dot_files_overlay_args()` | Returns raw `-v=` args from `_DOTFILES` whose host paths exist. Tilde expansion and `:0` resolution happen downstream |
+| `_copy_staging_args(items)` | New. Builds staging dirs under `PODRUN_TMP/copy-staging/` + podman mount args. Files: one mount (data copied at build time). Dirs: two mounts (metadata + data bind) |
+| `_extract_copy_staging(args)` | New. Extracts `:0` volume entries from arg lists, returns `(filtered_args, items)` |
+| `_resolve_overlay_mounts(ctx)` | Replaces `_fuse_overlayfs_fixup(ns)`. Handles `--fuse-overlayfs` storage-opt injection AND `:O`/`:0` mount fallback. No longer gated on `--fuse-overlayfs` flag |
+| `generate_run_entrypoint()` | Added generic copy-staging loop after home dir setup (before sudo). Iterates `/.podrun/copy-staging/*`, reads `.podrun_target`, copies `data` to target, chowns |
+| `build_overlay_run_command()` | After tilde expansion, extracts `:0` items from overlay_args + passthrough, builds staging mounts |
+| `PodrunContext.copy_staging` | New optional field for `:O` fallback items from `_resolve_overlay_mounts` |
+| Session implication chain | `session` now implies `dot_files_overlay` (was: session→host+interactive→user) |
+
+Key decisions:
+- **Entrypoint copy block** chosen over `:O` overlay because: (a) `:O` doesn't work on individual files like `.gitconfig`, (b) fuse-overlayfs may not be available, (c) single mechanism for all copy-mode items
+- **`:0` suffix** is the explicit writable-copy marker in `-v=` args. Distinct from `:O` (overlay) — `:0` always uses entrypoint copy, `:O` uses native overlay when possible
+- **`_resolve_overlay_mounts` fallback priority**: `:0` → always copy-staging; `:O` file → copy-staging; `:O` dir + fuse-overlayfs → native; `:O` dir − fuse-overlayfs → copy-staging
+- **`--fuse-overlayfs` flag kept** — its meaning is `--storage-opt overlay.mount_program=...` injection for kernels without `CONFIG_OVERLAY_FS_IDMAP`. Orthogonal to the `:O` fallback logic. The flag no longer gates `:O` handling (that's automatic)
+- **Self-describing staging entries** — each `/.podrun/copy-staging/{sha12}/` contains `.podrun_target` (destination path) and `data` (content). Entrypoint iterates generically without knowing the dotfile list
+- **Session implies dotfiles** — `session` → `host+interactive+dotfiles` → `user`. Previous chain was `session` → `host+interactive` → `user`
+- **`_DOTFILES` uses `-v=~/.ssh:~/.ssh:0` syntax** — tilde expanded by `_expand_volume_tilde()` downstream, consistent with passthrough volume handling
 
 #### Phase 2.11: Nested Podrun via Cache-Aware Flag Filtering ✓
 
@@ -286,11 +304,11 @@ Enable nested podrun execution (running podrun inside a podrun container).
 | `load_podman_flags()` | Removed `_is_nested()` scraping refusal; passes `podman_path` to `_flags_cache_path()` |
 | `_filter_global_args()` | New function: filters `ns['podman_global_args']` against loaded `PodmanFlags`, silently dropping unknown flags + values |
 | `main()` | Removed blanket `_is_nested()` → `sys.exit(1)` guard; pre-loads flags with resolved `podman_path`; calls `_filter_global_args()` before command building |
-| `_handle_run()` | `_warn_missing_subids()` skipped when nested (misleading `/etc/subuid`); `_fuse_overlayfs_fixup()` skipped when nested (storage on remote daemon) |
+| `_handle_run()` | `_warn_missing_subids()` skipped when nested (misleading `/etc/subuid`); `_resolve_overlay_mounts()` skipped when nested (storage on remote daemon) |
 | `conftest.py` | Seeds `podman-remote` in-memory cache from host cache files |
 
 Key decisions:
-- **`_filter_global_args()` is the single gate for binary flag compatibility** — the scraped flag cache for `podman-remote` has fewer global flags than `podman`. `_filter_global_args()` uses this as source of truth to drop unsupported flags (e.g. `--root`, `--storage-driver`) silently. Callers like `_apply_store`, `_fuse_overlayfs_fixup`, and config scripts inject flags without caring which binary is in use — filtering is centralized in `main()`.
+- **`_filter_global_args()` is the single gate for binary flag compatibility** — the scraped flag cache for `podman-remote` has fewer global flags than `podman`. `_filter_global_args()` uses this as source of truth to drop unsupported flags (e.g. `--root`, `--storage-driver`) silently. Callers like `_apply_store`, `_resolve_overlay_mounts`, and config scripts inject flags without caring which binary is in use — filtering is centralized in `main()`.
 - **`_apply_store()` nested guard is semantic, not flag-related** — `_resolve_store` is skipped when nested because the store filesystem lives on the host (not about flag compatibility). `--local-store-destroy` still errors when nested. `--local-store-info` prints "disabled".
 - **`_is_nested()` detection unchanged** — primary via `PODRUN_CONTAINER` env var, fallback via `CONTAINER_HOST` + socket existence.
 

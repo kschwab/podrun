@@ -227,6 +227,42 @@ class TestGenerateRunEntrypoint:
             content = f.read()
         assert '/etc/group' in content
 
+    def test_copy_staging_loop_present(self):
+        """Entrypoint includes generic copy-staging loop."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        assert '/.podrun/copy-staging' in content
+        assert '.podrun_target' in content
+        assert 'cp -a' in content
+
+    def test_copy_staging_loop_before_sudo(self):
+        """Copy-staging loop appears before sudo setup (needs home dir first)."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        idx_staging = content.index('copy-staging')
+        idx_sudo = content.index('Opportunistic sudo')
+        assert idx_staging < idx_sudo
+
+    def test_copy_staging_loop_after_home_dir(self):
+        """Copy-staging loop appears after home directory creation."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        idx_home = content.index(f'mkdir -p /home/{UNAME}')
+        idx_staging = content.index('copy-staging')
+        assert idx_home < idx_staging
+
+    def test_copy_staging_chown(self):
+        """Copy-staging loop chowns copied files to container user."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        # Find the chown inside the copy-staging block
+        staging_section = content[content.index('Copy-mode staging') :]
+        assert f'chown -R {UID}:{GID}' in staging_section
+
 
 # ---------------------------------------------------------------------------
 # generate_rc_sh

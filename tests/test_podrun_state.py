@@ -557,6 +557,7 @@ class TestBuildOverlayRunCommand:
 
     def test_dotfiles_overlay(self, tmp_path, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setenv('HOME', str(tmp_path))
         (tmp_path / '.vimrc').write_text('set nocp')
         r = self._parse_and_resolve(['run', '--dotfiles', 'alpine'])
         cmd, _ = build_overlay_run_command(r)

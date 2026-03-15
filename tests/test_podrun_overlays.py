@@ -15,8 +15,10 @@ from podrun.podrun import (
     PODRUN_RC_PATH,
     UID,
     UNAME,
-    _DOTFILES_MOUNT,
+    _DOTFILES,
     _OVERLAY_FIELDS,
+    _copy_staging_args,
+    _extract_copy_staging,
     _dot_files_overlay_args,
     _env_args,
     _host_overlay_args,
@@ -275,40 +277,182 @@ class TestHostOverlayArgs:
 
 
 class TestDotFilesOverlayArgs:
-    def test_mounts_existing_files(self, tmp_path, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def _fake_home(self, tmp_path, monkeypatch):
+        """Point both USER_HOME and $HOME at tmp_path so expanduser works."""
         monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
-        # Create a dotfile
+        monkeypatch.setenv('HOME', str(tmp_path))
+
+    def test_mounts_existing_files(self, tmp_path):
         (tmp_path / '.vimrc').write_text('set nocp')
         args = _dot_files_overlay_args({}, [])
         vimrc_args = [a for a in args if '.vimrc' in a]
         assert len(vimrc_args) == 1
         assert ':ro' in vimrc_args[0]
 
-    def test_skips_missing_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
-        # No dotfiles exist
+    def test_skips_missing_files(self, tmp_path):
         args = _dot_files_overlay_args({}, [])
         assert args == []
 
-    def test_mounts_directory(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+    def test_mounts_directory(self, tmp_path):
         (tmp_path / '.emacs.d').mkdir()
         args = _dot_files_overlay_args({}, [])
         emacs_args = [a for a in args if '.emacs.d' in a]
         assert len(emacs_args) == 1
 
-    def test_only_known_dotfiles(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+    def test_only_known_dotfiles(self, tmp_path):
         (tmp_path / '.random_config').write_text('x')
         args = _dot_files_overlay_args({}, [])
         assert args == []
 
-    def test_all_dotfiles_present(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
-        for name in _DOTFILES_MOUNT:
-            (tmp_path / name).write_text('x')
+    def test_all_dotfiles_present(self, tmp_path):
+        for arg in _DOTFILES:
+            # Extract host path from -v=host:ctr:mode
+            name = arg.split('=')[1].split(':')[0].removeprefix('~/')
+            p = tmp_path / name
+            if not p.exists():
+                p.write_text('x') if '.' in name else p.mkdir()
         args = _dot_files_overlay_args({}, [])
-        assert len(args) == len(_DOTFILES_MOUNT)
+        assert len(args) == len(_DOTFILES)
+
+    def test_copy_mode_emits_zero_suffix(self, tmp_path):
+        """:0 items emit raw -v=...:0 args (resolved downstream)."""
+        (tmp_path / '.ssh').mkdir()
+        args = _dot_files_overlay_args({}, [])
+        ssh_args = [a for a in args if '.ssh' in a]
+        assert len(ssh_args) == 1
+        assert ssh_args[0].endswith(':0')
+
+    def test_copy_mode_gitconfig(self, tmp_path):
+        (tmp_path / '.gitconfig').write_text('[user]')
+        args = _dot_files_overlay_args({}, [])
+        gc_args = [a for a in args if '.gitconfig' in a]
+        assert len(gc_args) == 1
+        assert gc_args[0].endswith(':0')
+
+    def test_copy_mode_skips_missing(self, tmp_path):
+        args = _dot_files_overlay_args({}, [])
+        zero_args = [a for a in args if a.endswith(':0')]
+        assert zero_args == []
+
+    def test_mount_and_copy_together(self, tmp_path):
+        (tmp_path / '.vimrc').write_text('set nocp')
+        (tmp_path / '.gitconfig').write_text('[user]')
+        args = _dot_files_overlay_args({}, [])
+        ro_args = [a for a in args if a.endswith(':ro')]
+        zero_args = [a for a in args if a.endswith(':0')]
+        assert len(ro_args) == 1  # .vimrc
+        assert len(zero_args) == 1  # .gitconfig
+
+
+# ---------------------------------------------------------------------------
+# _copy_staging_args
+# ---------------------------------------------------------------------------
+
+
+class TestCopyStagingArgs:
+    def test_file_staging(self, tmp_path):
+        """File item creates staging dir with data file."""
+        f = tmp_path / 'config'
+        f.write_text('content')
+        args = _copy_staging_args([(str(f), '/home/user/.gitconfig')])
+        assert len(args) == 1
+        assert 'copy-staging' in args[0]
+        assert ':ro' in args[0]
+        # Verify staging content
+        staging_path = args[0].split('=')[1].split(':')[0]
+        assert open(os.path.join(staging_path, '.podrun_target')).read() == '/home/user/.gitconfig'
+        assert open(os.path.join(staging_path, 'data')).read() == 'content'
+
+    def test_dir_staging(self, tmp_path):
+        """Directory item creates two mounts (staging + data)."""
+        d = tmp_path / 'ssh'
+        d.mkdir()
+        (d / 'config').write_text('Host *')
+        args = _copy_staging_args([(str(d), '/home/user/.ssh')])
+        assert len(args) == 2
+        # First mount: staging dir
+        assert 'copy-staging' in args[0] and ':ro' in args[0]
+        # Second mount: data bind
+        assert '/data:ro' in args[1]
+        # Verify target file
+        staging_path = args[0].split('=')[1].split(':')[0]
+        assert open(os.path.join(staging_path, '.podrun_target')).read() == '/home/user/.ssh'
+
+    def test_empty_items(self):
+        assert _copy_staging_args([]) == []
+
+    def test_multiple_items(self, tmp_path):
+        """Multiple items produce correct number of mounts."""
+        f = tmp_path / 'gitconfig'
+        f.write_text('[user]')
+        d = tmp_path / 'ssh'
+        d.mkdir()
+        args = _copy_staging_args(
+            [
+                (str(f), '/home/user/.gitconfig'),
+                (str(d), '/home/user/.ssh'),
+            ]
+        )
+        # File: 1 mount, Dir: 2 mounts = 3 total
+        assert len(args) == 3
+
+    def test_staging_dirs_have_unique_shas(self, tmp_path):
+        """Different container paths get different staging dirs."""
+        f1 = tmp_path / 'a'
+        f1.write_text('a')
+        f2 = tmp_path / 'b'
+        f2.write_text('b')
+        args = _copy_staging_args(
+            [
+                (str(f1), '/home/user/.gitconfig'),
+                (str(f2), '/home/user/.other'),
+            ]
+        )
+        paths = [a.split('=')[1].split(':')[0] for a in args]
+        assert paths[0] != paths[1]
+
+
+# ---------------------------------------------------------------------------
+# _extract_copy_staging
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCopyStaging:
+    def test_extracts_zero_suffix_equals_form(self):
+        args = ['-v=/host/.ssh:/ctr/.ssh:0', '-v=/a:/b:ro']
+        filtered, items = _extract_copy_staging(args)
+        assert filtered == ['-v=/a:/b:ro']
+        assert items == [('/host/.ssh', '/ctr/.ssh')]
+
+    def test_extracts_zero_suffix_space_form(self):
+        args = ['-v', '/host/.ssh:/ctr/.ssh:0', '-v=/a:/b:ro']
+        filtered, items = _extract_copy_staging(args)
+        assert filtered == ['-v=/a:/b:ro']
+        assert items == [('/host/.ssh', '/ctr/.ssh')]
+
+    def test_preserves_non_zero_args(self):
+        args = ['-v=/a:/b:ro', '--rm', '-e', 'FOO=bar']
+        filtered, items = _extract_copy_staging(args)
+        assert filtered == args
+        assert items == []
+
+    def test_empty(self):
+        filtered, items = _extract_copy_staging([])
+        assert filtered == []
+        assert items == []
+
+    def test_multiple_zero_items(self):
+        args = ['-v=/a:/b:0', '-v=/c:/d:0', '-v=/e:/f:ro']
+        filtered, items = _extract_copy_staging(args)
+        assert filtered == ['-v=/e:/f:ro']
+        assert len(items) == 2
+
+    def test_volume_long_form(self):
+        args = ['--volume=/host:/ctr:0']
+        filtered, items = _extract_copy_staging(args)
+        assert filtered == []
+        assert items == [('/host', '/ctr')]
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +656,8 @@ class TestPrintOverlays:
     def test_dotfiles_listed(self, capsys):
         print_overlays()
         out = capsys.readouterr().out
-        for name in _DOTFILES_MOUNT:
-            assert name in out
+        for arg in _DOTFILES:
+            assert arg in out
 
 
 # ---------------------------------------------------------------------------

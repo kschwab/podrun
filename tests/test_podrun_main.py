@@ -11,10 +11,11 @@ from podrun.podrun import (
     ENV_PODRUN_PODMAN_PATH,
     ENV_PODRUN_PODMAN_REMOTE,
     UNAME,
+    PodrunContext,
     _default_podman_path,
     _filter_global_args,
-    _fuse_overlayfs_fixup,
     _is_remote,
+    _resolve_overlay_mounts,
     _warn_missing_subids,
     main,
 )
@@ -241,24 +242,52 @@ class TestWarnMissingSubids:
 
 
 # ---------------------------------------------------------------------------
-# _fuse_overlayfs_fixup
+# _resolve_overlay_mounts
 # ---------------------------------------------------------------------------
 
 
-class TestFuseOverlayfsFixup:
-    def test_injects_storage_opt(self, monkeypatch):
+class TestResolveOverlayMounts:
+    """Tests for fuse-overlayfs storage-opt injection and :O fallback."""
+
+    @staticmethod
+    def _ctx(ns):
+        """Build a minimal PodrunContext wrapping the given ns dict."""
+        return PodrunContext(
+            ns=ns, trailing_args=[], explicit_command=[], raw_argv=[], subcmd_passthrough_args=[]
+        )
+
+    def test_fuse_flag_injects_storage_opt(self, monkeypatch):
         monkeypatch.setattr(
             podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
-        ns = {'run.passthrough_args': ['-v=/a:/b']}
-        _fuse_overlayfs_fixup(ns)
+        ns = {'run.fuse_overlayfs': True, 'run.passthrough_args': ['-v=/a:/b']}
+        _resolve_overlay_mounts(self._ctx(ns))
         gf = ns.get('podman_global_args') or []
         assert '--storage-opt' in gf
         assert 'overlay.mount_program=/usr/bin/fuse-overlayfs' in gf
 
-    def test_converts_overlay_to_ro_for_files_equals_form(self, monkeypatch, tmp_path):
+    def test_fuse_flag_exits_when_not_found(self, monkeypatch):
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        ns = {'run.fuse_overlayfs': True}
+        with pytest.raises(SystemExit):
+            _resolve_overlay_mounts(self._ctx(ns))
+
+    def test_fuse_flag_appends_to_existing_global_args(self, monkeypatch):
+        monkeypatch.setattr(
+            podrun_mod.shutil,
+            'which',
+            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
+        )
+        ns = {'run.fuse_overlayfs': True, 'podman_global_args': ['--root', '/x']}
+        _resolve_overlay_mounts(self._ctx(ns))
+        gf = ns['podman_global_args']
+        assert '--root' in gf
+        assert '--storage-opt' in gf
+
+    def test_file_overlay_to_copy_staging_equals_form(self, tmp_path, monkeypatch):
+        """File :O mounts → copy-staging (even with fuse-overlayfs available)."""
         monkeypatch.setattr(
             podrun_mod.shutil,
             'which',
@@ -267,10 +296,12 @@ class TestFuseOverlayfsFixup:
         f = tmp_path / 'file.txt'
         f.write_text('hi')
         ns = {'run.passthrough_args': [f'-v={f}:/container/file.txt:O']}
-        _fuse_overlayfs_fixup(ns)
-        assert ns['run.passthrough_args'] == [f'-v={f}:/container/file.txt:ro']
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == []
+        assert ctx.copy_staging == [(str(f), '/container/file.txt')]
 
-    def test_converts_overlay_to_ro_for_files_space_form(self, monkeypatch, tmp_path):
+    def test_file_overlay_to_copy_staging_space_form(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             podrun_mod.shutil,
             'which',
@@ -279,10 +310,13 @@ class TestFuseOverlayfsFixup:
         f = tmp_path / 'file.txt'
         f.write_text('hi')
         ns = {'run.passthrough_args': ['-v', f'{f}:/container/file.txt:O']}
-        _fuse_overlayfs_fixup(ns)
-        assert ns['run.passthrough_args'] == ['-v', f'{f}:/container/file.txt:ro']
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == []
+        assert ctx.copy_staging == [(str(f), '/container/file.txt')]
 
-    def test_preserves_overlay_for_directories(self, monkeypatch, tmp_path):
+    def test_dir_overlay_preserved_with_fuse(self, tmp_path, monkeypatch):
+        """Directory :O mounts stay native when fuse-overlayfs is available."""
         monkeypatch.setattr(
             podrun_mod.shutil,
             'which',
@@ -291,10 +325,12 @@ class TestFuseOverlayfsFixup:
         d = tmp_path / 'dir'
         d.mkdir()
         ns = {'run.passthrough_args': [f'-v={d}:/container/dir:O']}
-        _fuse_overlayfs_fixup(ns)
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
         assert ns['run.passthrough_args'] == [f'-v={d}:/container/dir:O']
+        assert ctx.copy_staging == []
 
-    def test_preserves_overlay_for_directories_space_form(self, monkeypatch, tmp_path):
+    def test_dir_overlay_preserved_with_fuse_space_form(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             podrun_mod.shutil,
             'which',
@@ -303,46 +339,80 @@ class TestFuseOverlayfsFixup:
         d = tmp_path / 'dir'
         d.mkdir()
         ns = {'run.passthrough_args': ['-v', f'{d}:/container/dir:O']}
-        _fuse_overlayfs_fixup(ns)
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
         assert ns['run.passthrough_args'] == ['-v', f'{d}:/container/dir:O']
+        assert ctx.copy_staging == []
+
+    def test_dir_overlay_fallback_without_fuse(self, tmp_path, monkeypatch):
+        """Directory :O mounts → copy-staging when fuse-overlayfs absent."""
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        d = tmp_path / 'dir'
+        d.mkdir()
+        ns = {'run.passthrough_args': [f'-v={d}:/container/dir:O']}
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == []
+        assert ctx.copy_staging == [(str(d), '/container/dir')]
+
+    def test_dir_overlay_fallback_without_fuse_space_form(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        d = tmp_path / 'dir'
+        d.mkdir()
+        ns = {'run.passthrough_args': ['-v', f'{d}:/container/dir:O']}
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == []
+        assert ctx.copy_staging == [(str(d), '/container/dir')]
 
     def test_non_volume_args_unchanged(self, monkeypatch):
-        monkeypatch.setattr(
-            podrun_mod.shutil,
-            'which',
-            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
-        )
-        ns = {'run.passthrough_args': ['--rm', '-e', 'FOO=bar', '-it']}
-        _fuse_overlayfs_fixup(ns)
-        assert ns['run.passthrough_args'] == ['--rm', '-e', 'FOO=bar', '-it']
-
-    def test_exits_when_not_found(self, monkeypatch):
         monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
-        ns = {}
-        with pytest.raises(SystemExit):
-            _fuse_overlayfs_fixup(ns)
-
-    def test_appends_to_existing_global_args(self, monkeypatch):
-        monkeypatch.setattr(
-            podrun_mod.shutil,
-            'which',
-            lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
-        )
-        ns = {'podman_global_args': ['--root', '/x']}
-        _fuse_overlayfs_fixup(ns)
-        gf = ns['podman_global_args']
-        assert '--root' in gf
-        assert '--storage-opt' in gf
+        ns = {'run.passthrough_args': ['--rm', '-e', 'FOO=bar', '-it']}
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == ['--rm', '-e', 'FOO=bar', '-it']
+        assert ctx.copy_staging == []
 
     def test_empty_passthrough(self, monkeypatch):
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        ns = {}
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == []
+        assert ctx.copy_staging == []
+
+    def test_no_fuse_flag_skips_storage_opt(self, monkeypatch):
+        """Without --fuse-overlayfs, no storage-opt is injected."""
         monkeypatch.setattr(
             podrun_mod.shutil,
             'which',
             lambda name: '/usr/bin/fuse-overlayfs' if name == 'fuse-overlayfs' else None,
         )
-        ns = {}
-        _fuse_overlayfs_fixup(ns)
-        assert ns['run.passthrough_args'] == []
+        ns = {'run.passthrough_args': ['-v=/a:/b']}
+        _resolve_overlay_mounts(self._ctx(ns))
+        gf = ns.get('podman_global_args') or []
+        assert '--storage-opt' not in gf
+
+    def test_mixed_mounts(self, tmp_path, monkeypatch):
+        """Mix of file :O, dir :O, and normal mounts."""
+        monkeypatch.setattr(podrun_mod.shutil, 'which', lambda name: None)
+        f = tmp_path / 'file.txt'
+        f.write_text('hi')
+        d = tmp_path / 'dir'
+        d.mkdir()
+        ns = {
+            'run.passthrough_args': [
+                f'-v={f}:/container/file.txt:O',
+                f'-v={d}:/container/dir:O',
+                '-v=/normal:/mount',
+            ]
+        }
+        ctx = self._ctx(ns)
+        _resolve_overlay_mounts(ctx)
+        assert ns['run.passthrough_args'] == ['-v=/normal:/mount']
+        assert len(ctx.copy_staging) == 2
+        assert (str(f), '/container/file.txt') in ctx.copy_staging
+        assert (str(d), '/container/dir') in ctx.copy_staging
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +759,7 @@ class TestFilterGlobalArgs:
 
 @pytest.mark.usefixtures('requires_podman_remote')
 class TestRemoteHandleRunGuards:
-    """Verify _warn_missing_subids and _fuse_overlayfs_fixup are skipped when remote."""
+    """Verify _warn_missing_subids and _resolve_overlay_mounts are skipped when remote."""
 
     @pytest.fixture(autouse=True)
     def _mock_run_os_cmd(self, monkeypatch):

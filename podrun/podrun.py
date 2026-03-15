@@ -106,13 +106,17 @@ _OVERLAY_FIELDS = [
     ('run.adhoc', 'adhoc'),
 ]
 
-# Mount-mode dotfiles: (relative_path, description).
-# Only mounted if they exist on the host.  All are :ro bind mounts.
-# TODO Copy-mode dotfiles (.ssh, .gitconfig) deferred
-_DOTFILES_MOUNT = [
-    '.emacs',
-    '.emacs.d',
-    '.vimrc',
+# Default dotfile volume mounts for --dot-files-overlay.
+# :ro items are read-only bind mounts; :0 items are writable copies
+# (resolved by _resolve_overlay_mounts via entrypoint copy-staging).
+_DOTFILES = [
+    # Mount dot files
+    '-v=~/.emacs:~/.emacs:ro',
+    '-v=~/.emacs.d:~/.emacs.d:ro',
+    '-v=~/.vimrc:~/.vimrc:ro',
+    # Copy dot files
+    '-v=~/.ssh:~/.ssh:0',
+    '-v=~/.gitconfig:~/.gitconfig:0',
 ]
 
 # ---------------------------------------------------------------------------
@@ -822,6 +826,21 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         fi
         find /home/{UNAME} -xdev -exec chown {UID}:{GID} {{}} + 2>/dev/null || true
 
+        # Copy-mode staging: host content staged :ro, copied here for writable access.
+        # Each entry under /.podrun/copy-staging/ contains .podrun_target (destination)
+        # and data (the actual file or directory content).  This is a no-op when
+        # /.podrun/copy-staging/ is empty or absent.
+        if [ -d /.podrun/copy-staging ]; then
+          for _staging_entry in /.podrun/copy-staging/*; do
+            [ -d "$_staging_entry" ] || continue
+            _target="$(cat "$_staging_entry/.podrun_target" 2>/dev/null)" || continue
+            mkdir -p "$(dirname "$_target")"
+            cp -a "$_staging_entry/data/." "$_target/" 2>/dev/null ||
+              cp -a "$_staging_entry/data" "$_target" 2>/dev/null || true
+            chown -R {UID}:{GID} "$_target" 2>/dev/null || true
+          done
+        fi
+
         # Opportunistic sudo setup (requires CAP_DAC_OVERRIDE to write sudoers)
         if command -v sudo > /dev/null 2>&1; then
           echo "{UNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers 2>/dev/null || true
@@ -1156,14 +1175,93 @@ def _host_overlay_args(ns, pt):
     return args
 
 
+def _copy_staging_args(items: list) -> list:
+    """Build staging dirs and podman volume args for copy-mode items.
+
+    *items* is a list of ``(host_path, container_path)`` tuples.
+
+    For each item a staging directory is created under ``PODRUN_TMP``
+    containing a ``.podrun_target`` file (the container destination) and a
+    ``data`` entry (the actual content).  The staging directory is mounted
+    ``:ro`` into ``/.podrun/copy-staging/{sha12}``; the entrypoint copies
+    its contents to the target path so the container has a writable copy.
+
+    For **files**, the host file is copied into the staging dir at build
+    time (self-contained — one mount).  For **directories**, a nested bind
+    mount provides the content (two mounts: one for the target metadata,
+    one for the data directory).
+    """
+    args: list = []
+    for host_path, container_path in items:
+        sha12 = hashlib.sha256(container_path.encode()).hexdigest()[:12]
+        staging_dir = os.path.join(PODRUN_TMP, 'copy-staging', sha12)
+        container_staging = f'/.podrun/copy-staging/{sha12}'
+        pathlib.Path(staging_dir).mkdir(parents=True, exist_ok=True)
+
+        # Write the target path descriptor
+        target_file = os.path.join(staging_dir, '.podrun_target')
+        with open(target_file, 'w') as f:
+            f.write(container_path)
+
+        if os.path.isfile(host_path):
+            # File: copy into staging/data at build time (one mount)
+            data_path = os.path.join(staging_dir, 'data')
+            shutil.copy2(host_path, data_path)
+            args.append(f'-v={staging_dir}:{container_staging}:ro')
+        elif os.path.isdir(host_path):
+            # Directory: bind-mount the host dir as staging/data (two mounts)
+            args.append(f'-v={staging_dir}:{container_staging}:ro')
+            args.append(f'-v={host_path}:{container_staging}/data:ro')
+    return args
+
+
+def _extract_copy_staging(args: list) -> Tuple[list, list]:
+    """Extract ``:0`` volume mounts from *args* for copy-staging.
+
+    Returns ``(filtered_args, items)`` where *filtered_args* has the
+    ``:0`` entries removed and *items* is a list of ``(host_path,
+    container_path)`` tuples ready for :func:`_copy_staging_args`.
+
+    Handles both equals form (``-v=host:ctr:0``) and space form
+    (``-v host:ctr:0``).
+    """
+    result: list = []
+    items: list = []
+    skip = False
+    for i, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        # Equals form
+        m = re.match(r'^(-v=|--volume=)(.+)$', arg)
+        if m:
+            parts = m.group(2).split(':')
+            if len(parts) >= 3 and parts[-1] == '0':
+                items.append((parts[0], parts[1]))
+                continue
+        # Space form
+        if arg in ('-v', '--volume') and i + 1 < len(args):
+            parts = args[i + 1].split(':')
+            if len(parts) >= 3 and parts[-1] == '0':
+                items.append((parts[0], parts[1]))
+                skip = True
+                continue
+        result.append(arg)
+    return result, items
+
+
 def _dot_files_overlay_args(ns, pt):
-    """Build args for --dot-files-overlay: mount-mode dotfiles from host HOME."""
+    """Build args for --dot-files-overlay.
+
+    Returns items from ``_DOTFILES`` whose host path exists.  Tilde
+    expansion and ``:0`` → copy-staging resolution happen downstream.
+    """
     args = []
-    for name in _DOTFILES_MOUNT:
-        host_path = os.path.join(USER_HOME, name)
-        if os.path.exists(host_path):
-            container_path = f'/home/{UNAME}/{name}'
-            args.append(f'-v={host_path}:{container_path}:ro')
+    for arg in _DOTFILES:
+        # Extract host path from -v=host:ctr:mode
+        m = re.match(r'^-v=([^:]+):', arg)
+        if m and os.path.exists(os.path.expanduser(m.group(1))):
+            args.append(arg)
     return args
 
 
@@ -1292,21 +1390,21 @@ def print_overlays():
     print(f'    --hostname={platform.node()}')
     print('    --network=host')
     print('    --security-opt=seccomp=unconfined')
-    print('    --init')
     print('    -v=<cwd>:<workspaceFolder>')
     print('    -w=<workspaceFolder>')
     print('    --env=TERM=xterm-256color')
     print()
     print('  interactive:')
     print('    -it')
+    print('    --init')
     print('    --detach-keys=ctrl-q,ctrl-q')
     print()
     print('  dotfiles (implies user):')
     print('    --user-overlay')
-    for name in _DOTFILES_MOUNT:
-        print(f'    -v=~/{name}:/home/<user>/{name}:ro  (if exists)')
+    for arg in _DOTFILES:
+        print(f'    {arg}  (if exists)')
     print()
-    print('  session (implies host + interactive):')
+    print('  session (implies host + interactive + dotfiles):')
     print('    --host-overlay')
     print('    --interactive-overlay')
     print()
@@ -1881,6 +1979,7 @@ _RUN_CONFIG_MAP = {
     'autoReplace': 'run.auto_replace',
     'fuseOverlayfs': 'run.fuse_overlayfs',
     'dotFilesOverlay': 'run.dot_files_overlay',
+    'exports': 'run.export',
 }
 
 # Top-level devcontainer.json fields → ns['dc.*'] keys.
@@ -2083,19 +2182,19 @@ def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dic
     return parse_config_tokens(script_tokens, flags)
 
 
-def _apply_run_specifics(ns, ctx: 'PodrunContext', podrun_cfg, script_ns):
+def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns):
     """Apply run-subcommand-specific merges: overlays, image fallback, exports.
 
     All dc top-level fields are already resolved to ``ns['dc.*']`` by
     ``resolve_config`` before this function is called.
     """
-    # Overlay implication chain: adhoc→session→host+interactive→user
-    #                           dot_files→user
+    # Overlay implication chain: adhoc→session→host+interactive+dotfiles→user
     if ns.get('run.adhoc'):
         ns['run.session'] = True
     if ns.get('run.session'):
         ns['run.host_overlay'] = True
         ns['run.interactive_overlay'] = True
+        ns['run.dot_files_overlay'] = True
     if ns.get('run.host_overlay'):
         ns['run.user_overlay'] = True
     if ns.get('run.dot_files_overlay'):
@@ -2112,7 +2211,7 @@ def _apply_run_specifics(ns, ctx: 'PodrunContext', podrun_cfg, script_ns):
         ctx.trailing_args = [dc_image]
 
     # Exports append: dc + script + cli, with tilde expansion
-    dc_exports = podrun_cfg.get('exports', [])
+    dc_exports = dc_ns.get('run.export') or []
     script_exports = script_ns.get('run.export') or []
     cli_exports = ns.get('run.export') or []
     combined_exports = dc_exports + script_exports + cli_exports
@@ -2148,6 +2247,8 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
     dc_run_args = devcontainer_run_args(dc, ns)
 
     # 7. Merge scalars — _first(cli_ns, script_ns, dc_ns) per key
+    #    List-append keys (run.export) are handled in _apply_run_specifics.
+    _APPEND_KEYS = {'run.export'}
     all_keys = set()
     for k in ns:
         if k.startswith('root.') or k.startswith('run.'):
@@ -2156,6 +2257,8 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
     all_keys.update(dc_ns.keys())
 
     for key in all_keys:
+        if key in _APPEND_KEYS:
+            continue
         cli_val = ns.get(key)
         script_val = script_ns.get(key)
         dc_val = dc_ns.get(key)
@@ -2170,7 +2273,7 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
 
     # 9. Handle run specifics
     if ns.get('subcommand') == 'run':
-        _apply_run_specifics(ns, ctx, podrun_cfg, script_ns)
+        _apply_run_specifics(ns, ctx, dc_ns, script_ns)
 
     return ctx
 
@@ -2601,6 +2704,7 @@ class PodrunContext:
     subcmd_passthrough_args: List[str]  # For passthrough subcommands
     podman_path: str = 'podman'  # Resolved podman binary path
     dc_from_cli: bool = False  # True when devcontainer CLI is driving
+    copy_staging: Optional[List[tuple]] = None  # Copy-staging items from :O fallback
 
 
 # ---------------------------------------------------------------------------
@@ -2916,6 +3020,16 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
     if ns.get('run.user_overlay'):
         pt = _expand_volume_tilde(pt)
         overlay_args = _expand_volume_tilde(overlay_args)
+
+    # Extract :0 (writable-copy) volumes from overlay_args and passthrough.
+    # :O (overlay) items were already resolved by _resolve_overlay_mounts().
+    copy_staging = ctx.copy_staging or []
+    overlay_args, extra = _extract_copy_staging(overlay_args)
+    copy_staging.extend(extra)
+    pt, extra = _extract_copy_staging(pt)
+    copy_staging.extend(extra)
+    if copy_staging:
+        overlay_args.extend(_copy_staging_args(copy_staging))
 
     # Inject overlay args into passthrough
     ns['run.passthrough_args'] = overlay_args + pt
@@ -3373,63 +3487,110 @@ def print_completion(shell: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fuse-overlayfs fixup
+# Overlay mount resolution (fuse-overlayfs + :O fallback)
 # ---------------------------------------------------------------------------
 
 
-def _fuse_overlayfs_fixup(ns):
-    """Apply fuse-overlayfs storage-opt and convert :O to :ro for files.
+def _resolve_overlay_mounts(ctx: 'PodrunContext'):  # noqa: C901
+    """Handle ``--fuse-overlayfs`` storage-opt and ``:O`` mount fallback.
 
-    Mutates ``ns['podman_global_args']`` to inject
-    ``--storage-opt overlay.mount_program=<path>`` and converts ``:O`` to
-    ``:ro`` for file-type volume mounts in ``ns['run.passthrough_args']``.
+    1. When ``--fuse-overlayfs`` is set, injects ``--storage-opt`` for the
+       fuse-overlayfs mount program (unchanged from the old behaviour).
+    2. Scans passthrough args for ``:O`` volume mounts and applies fallback
+       logic: **file** mounts always get rewritten to copy-staging (overlay
+       does not work on individual files); **directory** mounts use native
+       ``:O`` when fuse-overlayfs is available, otherwise fall back to
+       copy-staging.
+
+    Rewritten items are collected in ``ctx.copy_staging`` for
+    consumption by ``build_overlay_run_command()``.
 
     Must be called **before** ``build_overlay_run_command()`` so that the
     storage-opt is included in the built command and the ``:O`` conversion
     applies to passthrough args before overlay args are prepended.
     """
+    ns = ctx.ns
     fuse_path = shutil.which('fuse-overlayfs')
-    if not fuse_path:
-        print(
-            'Error: --fuse-overlayfs requested but fuse-overlayfs not found in PATH',
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
-    existing = ns.get('podman_global_args') or []
-    ns['podman_global_args'] = existing + ['--storage-opt', f'overlay.mount_program={fuse_path}']
+    # Step 1: --fuse-overlayfs → inject storage-opt
+    if ns.get('run.fuse_overlayfs'):
+        if not fuse_path:
+            print(
+                'Error: --fuse-overlayfs requested but fuse-overlayfs not found in PATH',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        existing = ns.get('podman_global_args') or []
+        ns['podman_global_args'] = existing + [
+            '--storage-opt',
+            f'overlay.mount_program={fuse_path}',
+        ]
 
-    # fuse-overlayfs cannot overlay single files — only directories.
-    # Convert :O to :ro for file-type volume mounts in passthrough args.
-    # Handles both equals form (-v=/host:ctr:O) and space form (-v /host:ctr:O).
+    # Step 2: scan for :O and :0 mounts and apply fallback
+    #   :0 — always copy-staging (explicit writable-copy request)
+    #   :O — copy-staging for files (overlay doesn't work on files) or
+    #         dirs without fuse-overlayfs; native overlay otherwise
     pt = ns.get('run.passthrough_args') or []
-    result = []
+    result: list = []
+    copy_staging_items: list = []
     skip = False
     for i, arg in enumerate(pt):
         if skip:
             skip = False
             continue
-        # Equals form: -v=/host/file:/ctr:O or --volume=/host/file:/ctr:O
+
+        rewritten = False
+
+        # Equals form: -v=/host:/ctr:O or -v=/host:/ctr:0
         m = re.match(r'^(-v=|--volume=)(.+)$', arg)
         if m:
-            prefix, spec = m.group(1), m.group(2)
+            spec = m.group(2)
             parts = spec.split(':')
-            if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
-                parts[-1] = 'ro'
-            result.append(prefix + ':'.join(parts))
+            if len(parts) >= 3 and parts[-1] in ('O', '0'):
+                host_path = parts[0]
+                container_path = parts[1]
+                mode = parts[-1]
+                if mode == '0':
+                    copy_staging_items.append((host_path, container_path))
+                    rewritten = True
+                elif os.path.isfile(host_path):
+                    copy_staging_items.append((host_path, container_path))
+                    rewritten = True
+                elif os.path.isdir(host_path) and not fuse_path:
+                    copy_staging_items.append((host_path, container_path))
+                    rewritten = True
+            if not rewritten:
+                result.append(arg)
             continue
-        # Space form: -v /host/file:/ctr:O or --volume /host/file:/ctr:O
+
+        # Space form: -v /host:/ctr:O or -v /host:/ctr:0
         if arg in ('-v', '--volume') and i + 1 < len(pt):
             spec = pt[i + 1]
             parts = spec.split(':')
-            if len(parts) >= 3 and parts[-1] == 'O' and os.path.isfile(parts[0]):
-                parts[-1] = 'ro'
+            if len(parts) >= 3 and parts[-1] in ('O', '0'):
+                host_path = parts[0]
+                container_path = parts[1]
+                mode = parts[-1]
+                if mode == '0':
+                    copy_staging_items.append((host_path, container_path))
+                    rewritten = True
+                    skip = True
+                elif os.path.isfile(host_path):
+                    copy_staging_items.append((host_path, container_path))
+                    rewritten = True
+                    skip = True
+                elif os.path.isdir(host_path) and not fuse_path:
+                    copy_staging_items.append((host_path, container_path))
+                    rewritten = True
+                    skip = True
+            if not rewritten:
                 result.append(arg)
-                result.append(':'.join(parts))
-                skip = True
-                continue
+            continue
+
         result.append(arg)
+
     ns['run.passthrough_args'] = result
+    ctx.copy_staging = copy_staging_items
 
 
 # ---------------------------------------------------------------------------
@@ -3606,12 +3767,13 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
         )
         ns['run.store_socket'] = sock
 
-    # Fuse-overlayfs fixup — must run before build_overlay_run_command so
-    # --storage-opt is already in podman_global_args when the command is built,
-    # and :O→:ro conversion applies to passthrough args (not the final cmd).
+    # Overlay mount resolution — handles --fuse-overlayfs storage-opt injection
+    # and :O → copy-staging fallback for files / dirs without fuse-overlayfs.
+    # Must run before build_overlay_run_command so storage-opt is already in
+    # podman_global_args and :O rewrites apply to passthrough args.
     # Skip when remote — storage is on the remote daemon, not local.
-    if ns.get('run.fuse_overlayfs') and not _is_remote(ctx.podman_path):
-        _fuse_overlayfs_fixup(ns)
+    if not _is_remote(ctx.podman_path):
+        _resolve_overlay_mounts(ctx)
 
     # Build the full run command with overlay injection
     cmd, _caps_to_drop = build_overlay_run_command(ctx)

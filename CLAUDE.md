@@ -294,6 +294,56 @@ Key decisions:
 - **`_apply_store()` nested guard is semantic, not flag-related** — `_resolve_store` is skipped when nested because the store filesystem lives on the host (not about flag compatibility). `--local-store-destroy` still errors when nested. `--local-store-info` prints "disabled".
 - **`_is_nested()` detection unchanged** — primary via `PODRUN_CONTAINER` env var, fallback via `CONTAINER_HOST` + socket existence.
 
+### Binary State Testing
+
+The test suite is validated against all four podman binary installation states.
+To cycle through them, temporarily rename binaries with `sudo mv` and run
+`python3 -m pytest tests/ -x -q`:
+
+| State | How | Expected |
+|---|---|---|
+| Both binaries | Default (both installed) | All tests pass, 0 skipped, coverage gate enforced |
+| podman only | `sudo mv /usr/bin/podman-remote /usr/bin/podman-remote.bak` | `[podman-remote]` params skipped, coverage gate relaxed |
+| podman-remote only | Hide podman, restore podman-remote | `[podman]` params skipped, coverage gate relaxed |
+| Neither | Hide both | All tests skipped, coverage gate relaxed |
+
+**Restore after testing:** `sudo mv /usr/bin/podman.bak /usr/bin/podman` (and
+similarly for podman-remote).
+
+Key infrastructure and fixture guidance:
+
+- **`_isolate`** (conftest.py, autouse) — universal test isolation applied to
+  every test automatically: clears `PODRUN_PODMAN_REMOTE`, `PODRUN_CONTAINER`,
+  `PODRUN_PODMAN_PATH`, `CONTAINER_HOST` env vars; mocks
+  `find_devcontainer_json` and `_default_store_dir` to return None; redirects
+  `PODRUN_TMP` to `tmp_path`. **Do not duplicate this in test files.**
+- **`podman_binary`** (conftest.py, parameterized) — runs the test once per
+  available binary (`podman`, `podman-remote`); skips unavailable binaries;
+  monkeypatches `_default_podman_path`. Test files opt in with
+  `pytestmark = pytest.mark.usefixtures('podman_binary')` at module level.
+- **`podman_only`** / **`requires_podman_remote`** (conftest.py) — restrict a
+  test to one binary. Use `@pytest.mark.usefixtures('podman_only')` on a class
+  or test function. Incompatible parameterizations are **deselected** (not
+  skipped) at collection time via `pytest_collection_modifyitems`.
+- **`mock_run_os_cmd`** (conftest.py) — monkeypatches `run_os_cmd` with a
+  `Controller` that supports `set_return()` and `set_side_effect()`. Request it
+  as a test parameter; do not redefine in test files.
+- **Coverage gate** — enforced only on full runs with 0 skipped tests.
+  `pytest_terminal_summary` (tryfirst) disables `cov_fail_under` before
+  pytest-cov checks it when any tests are skipped.
+
+When writing new tests:
+
+1. **Do not** create per-file `_isolate` fixtures — conftest handles isolation.
+2. Add `pytestmark = pytest.mark.usefixtures('podman_binary')` if the test file
+   exercises code that depends on the resolved podman binary or scraped flags.
+3. Use `@pytest.mark.usefixtures('podman_only')` on tests/classes that use flags
+   only available in full podman (e.g. `--root`, `--storage-driver`).
+4. For tests needing a `run_os_cmd` mock, use `mock_run_os_cmd` from conftest or
+   a class-level fixture that only patches `run_os_cmd` (not PODRUN_TMP).
+5. `PODRUN_TMP` is already redirected to `tmp_path` — no need for class-level
+   `_tmp_dir` fixtures unless adding extra mocking.
+
 ### Phase 3 — Live Testing + Bug Fixes
 
 Live container integration tests and bug fixes discovered during end-to-end

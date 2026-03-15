@@ -72,7 +72,6 @@ BOOTSTRAP_CAPS = ['CAP_DAC_OVERRIDE', 'CAP_CHOWN', 'CAP_FOWNER', 'CAP_SETPCAP']
 
 # Host-read
 ENV_PODRUN_PODMAN_PATH = 'PODRUN_PODMAN_PATH'  # explicit podman binary override
-ENV_PODRUN_PODMAN_REMOTE = 'PODRUN_PODMAN_REMOTE'  # force podman-remote resolution
 
 # Container-exported (always)
 ENV_PODRUN_CONTAINER = 'PODRUN_CONTAINER'  # "inside a podrun container" marker
@@ -87,6 +86,12 @@ ENV_PODRUN_IMG_NAME = 'PODRUN_IMG_NAME'  # image name component
 ENV_PODRUN_IMG_REPO = 'PODRUN_IMG_REPO'  # image repo component
 ENV_PODRUN_IMG_TAG = 'PODRUN_IMG_TAG'  # image tag component
 ENV_PODRUN_ALT_ENTRYPOINT = 'PODRUN_ALT_ENTRYPOINT'  # user --entrypoint override
+
+# Container-exported and config-script exported (on-demand)
+ENV_PODRUN_PODMAN_REMOTE = 'PODRUN_PODMAN_REMOTE'  # force podman-remote resolution
+
+# Container-exported and config-script exported (on-demand) and Host-read
+ENV_PODRUN_DEVCONTAINER_CLI = 'PODRUN_DEVCONTAINER_CLI'  # invoked by devcontainer CLI
 
 # Exec-session (set on ``podman exec``, also read inside entrypoint scripts)
 ENV_PODRUN_STTY_INIT = 'PODRUN_STTY_INIT'  # terminal size for exec attach
@@ -284,13 +289,14 @@ def load_podman_flags(podman_path=None):
 # ---------------------------------------------------------------------------
 
 
-def run_os_cmd(cmd: str) -> subprocess.CompletedProcess:
+def run_os_cmd(cmd: str, env: Optional[dict] = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=True,
         universal_newlines=True,
+        env=env,
     )
 
 
@@ -373,14 +379,28 @@ def _warn_missing_subids():
         pass
 
 
-def run_config_scripts(script_paths: List[str]) -> List[str]:
+def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] = None) -> List[str]:
     """Execute scripts left-to-right, return concatenated shlex.split tokens.
 
     Fatal (sys.exit(1)) on non-zero exit.
+
+    When *ctx* is provided, scripts receive on-demand env vars so they
+    can branch on context:
+
+    - ``PODRUN_DEVCONTAINER_CLI=1`` when ``ctx.dc_from_cli`` is set
+    - ``PODRUN_PODMAN_REMOTE=1`` when the resolved podman binary is remote
     """
+    extra: dict = {}
+    if ctx:
+        if ctx.dc_from_cli or ctx.ns.get('internal.dc_from_cli'):
+            extra[ENV_PODRUN_DEVCONTAINER_CLI] = '1'
+        if _is_remote(ctx.podman_path):
+            extra[ENV_PODRUN_PODMAN_REMOTE] = '1'
+    env: Optional[dict] = {**os.environ, **extra} if extra else None
+
     tokens: List[str] = []
     for path in script_paths:
-        out = run_os_cmd(shlex.quote(path))
+        out = run_os_cmd(shlex.quote(path), env=env)
         if out.returncode != 0:
             print(
                 f'Error: --config-script {path} failed (exit {out.returncode}):\n{out.stderr}',
@@ -1195,6 +1215,9 @@ def _env_args(ns):
     if ns.get('run.podman_remote'):
         args.append(f'--env={ENV_PODRUN_PODMAN_REMOTE}=1')
 
+    if ns.get('internal.dc_from_cli'):
+        args.append(f'--env={ENV_PODRUN_DEVCONTAINER_CLI}=1')
+
     overlays = sorted([name for ns_key, name in _OVERLAY_FIELDS if ns.get(ns_key)])
     overlay_str = ','.join(overlays) if overlays else 'none'
     args.append(f'--env={ENV_PODRUN_OVERLAYS}={overlay_str}')
@@ -1710,7 +1733,7 @@ def _store_destroy(store_dir: str, podman_path: str) -> None:  # noqa: C901
         print(f'Removed {parent} (empty)')
 
 
-def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], dict]:
+def _resolve_store(ctx: 'PodrunContext') -> Tuple[List[str], dict]:
     """Resolve store directory into podman global flags.
 
     Returns ``(flags_list, env_dict)`` where *flags_list* contains
@@ -1722,6 +1745,8 @@ def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], di
     (i.e. the user passed it explicitly), that value is respected and
     the local store does not inject a redundant ``--storage-driver``.
     """
+    ns = ctx.ns
+
     # --local-store-ignore → skip store entirely
     if ns.get('root.local_store_ignore'):
         return [], {}
@@ -1740,7 +1765,7 @@ def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], di
     # Destroy store if requested — wipe before checking graphroot so the
     # existing auto-init / uninitialised logic handles post-destroy state.
     if ns.get('root.local_store_destroy'):
-        _store_destroy(store_dir, podman_path)
+        _store_destroy(store_dir, ctx.podman_path)
 
     store_path = pathlib.Path(store_dir).resolve()
     graphroot = store_path / 'graphroot'
@@ -1789,7 +1814,7 @@ def _resolve_store(ns: dict, podman_path: str = 'podman') -> Tuple[List[str], di
     return flags, {}
 
 
-def _apply_store(ns: dict, podman_path: str = 'podman') -> None:
+def _apply_store(ctx: 'PodrunContext') -> None:
     """Resolve store, prepend flags, and handle store-only exits.
 
     When using ``podman-remote`` the store concept does not apply —
@@ -1799,14 +1824,15 @@ def _apply_store(ns: dict, podman_path: str = 'podman') -> None:
     injected into ``podman_global_args`` are filtered for binary
     compatibility by ``_filter_global_args`` in ``main()``.
     """
-    remote = _is_remote(podman_path)
+    ns = ctx.ns
+    remote = _is_remote(ctx.podman_path)
 
     if ns.get('root.local_store_destroy') and remote:
         print('Error: --local-store-destroy not supported with podman remote', file=sys.stderr)
         sys.exit(1)
 
     if not remote:
-        flags, _env = _resolve_store(ns, podman_path)
+        flags, _env = _resolve_store(ctx)
         if flags:
             existing = ns.get('podman_global_args') or []
             ns['podman_global_args'] = flags + existing
@@ -2039,8 +2065,9 @@ def _load_devcontainer(ns) -> Tuple[dict, dict]:
     return dc, podrun_cfg
 
 
-def _collect_script_config(ns, podrun_cfg, flags) -> Tuple[dict, list]:
+def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dict, list]:
     """Find and execute config scripts, return ``(script_ns, script_passthrough)``."""
+    ns = ctx.ns
     script_paths: list = []
     dc_script = podrun_cfg.get('configScript')
     if dc_script:
@@ -2052,11 +2079,11 @@ def _collect_script_config(ns, podrun_cfg, flags) -> Tuple[dict, list]:
     if not script_paths:
         return {}, []
 
-    script_tokens = run_config_scripts(script_paths)
+    script_tokens = run_config_scripts(script_paths, ctx=ctx)
     return parse_config_tokens(script_tokens, flags)
 
 
-def _apply_run_specifics(ns, result, podrun_cfg, script_ns):
+def _apply_run_specifics(ns, ctx: 'PodrunContext', podrun_cfg, script_ns):
     """Apply run-subcommand-specific merges: overlays, image fallback, exports.
 
     All dc top-level fields are already resolved to ``ns['dc.*']`` by
@@ -2081,8 +2108,8 @@ def _apply_run_specifics(ns, result, podrun_cfg, script_ns):
 
     # Image/command resolution: CLI trailing > devcontainer image
     dc_image = ns.get('dc.image')
-    if not result.trailing_args and dc_image:
-        result.trailing_args = [dc_image]
+    if not ctx.trailing_args and dc_image:
+        ctx.trailing_args = [dc_image]
 
     # Exports append: dc + script + cli, with tilde expansion
     dc_exports = podrun_cfg.get('exports', [])
@@ -2093,10 +2120,10 @@ def _apply_run_specifics(ns, result, podrun_cfg, script_ns):
         ns['run.export'] = _expand_export_tilde(combined_exports)
 
 
-def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
+def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
     """Three-way merge: CLI > config-script > devcontainer.json.
 
-    Updates result.ns in place and attaches context.
+    Updates ctx.ns in place and attaches context.
     """
 
     def _first(*values):
@@ -2105,13 +2132,16 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
                 return v
         return None
 
-    ns = result.ns
+    ns = ctx.ns
 
     # 1–3. Load devcontainer.json, expand variables, resolve to ns['dc.*']
     dc, podrun_cfg = _load_devcontainer(ns)
 
+    # Copy dc_from_cli from ns (set by _load_devcontainer) to ctx
+    ctx.dc_from_cli = ns.get('internal.dc_from_cli', False)
+
     # 4–5. Determine and execute config scripts
-    script_ns, script_passthrough = _collect_script_config(ns, podrun_cfg, flags)
+    script_ns, script_passthrough = _collect_script_config(ctx, podrun_cfg, flags)
 
     # 6. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
     dc_ns = _devcontainer_to_ns(podrun_cfg)
@@ -2140,9 +2170,9 @@ def resolve_config(result: 'ParseResult', flags=None) -> 'ParseResult':
 
     # 9. Handle run specifics
     if ns.get('subcommand') == 'run':
-        _apply_run_specifics(ns, result, podrun_cfg, script_ns)
+        _apply_run_specifics(ns, ctx, podrun_cfg, script_ns)
 
-    return result
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -2544,19 +2574,24 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
 
 
 # ---------------------------------------------------------------------------
-# ParseResult
+# PodrunContext
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
-class ParseResult:
-    """Structured result from :func:`parse_args`.
+class PodrunContext:
+    """Structured context object for podrun.
 
+    Returned by :func:`parse_args` and threaded through the call chain.
     Access parsed values through the dict using prefix conventions::
 
-        result.ns['subcommand']              # 'run', 'store', 'ps', etc. or None
-        result.ns['root.print_cmd']          # global podrun config flags
-        result.ns.get('podman_global_args') or []  # ['--root', '/x', '--remote', ...]
+        ctx.ns['subcommand']              # 'run', 'store', 'ps', etc. or None
+        ctx.ns['root.print_cmd']          # global podrun config flags
+        ctx.ns.get('podman_global_args') or []  # ['--root', '/x', '--remote', ...]
+
+    Runtime state (``podman_path``, ``dc_from_cli``) is set after parsing
+    by ``main()`` and ``resolve_config()`` respectively, eliminating the
+    need to thread ``podman_path`` as a separate parameter.
     """
 
     ns: dict
@@ -2564,6 +2599,8 @@ class ParseResult:
     explicit_command: List[str]  # Args after '--'
     raw_argv: List[str]  # Original argv
     subcmd_passthrough_args: List[str]  # For passthrough subcommands
+    podman_path: str = 'podman'  # Resolved podman binary path
+    dc_from_cli: bool = False  # True when devcontainer CLI is driving
 
 
 # ---------------------------------------------------------------------------
@@ -2571,8 +2608,8 @@ class ParseResult:
 # ---------------------------------------------------------------------------
 
 
-def parse_args(argv: List[str], flags=None) -> ParseResult:
-    """Parse podrun CLI arguments and return a structured :class:`ParseResult`.
+def parse_args(argv: List[str], flags=None) -> PodrunContext:
+    """Parse podrun CLI arguments and return a structured :class:`PodrunContext`.
 
     Architecture:
 
@@ -2629,7 +2666,7 @@ def parse_args(argv: List[str], flags=None) -> ParseResult:
 
     # subcmd is None: handled in main() for --version, --help, etc.
 
-    return ParseResult(
+    return PodrunContext(
         ns=ns,
         trailing_args=trailing_args,
         explicit_command=explicit_command,
@@ -2697,16 +2734,17 @@ def _handle_stopped_state(name, auto_attach, auto_replace, is_interactive):
     return None
 
 
-def handle_container_state(ns, global_flags=None, podman_path: str = 'podman'):
+def handle_container_state(ctx: 'PodrunContext', global_flags=None):
     """Returns ``"run"``, ``"attach"``, ``"replace"``, or ``None`` (exit).
 
-    Reads from *ns*: ``run.name``, ``run.auto_attach``, ``run.auto_replace``.
+    Reads from *ctx.ns*: ``run.name``, ``run.auto_attach``, ``run.auto_replace``.
     """
+    ns = ctx.ns
     name = ns.get('run.name')
     if not name:
         return 'run'
 
-    state = detect_container_state(name, global_flags=global_flags, podman_path=podman_path)
+    state = detect_container_state(name, global_flags=global_flags, podman_path=ctx.podman_path)
     if state is None:
         return 'run'
 
@@ -2795,10 +2833,10 @@ def build_podman_exec_args(
 # ---------------------------------------------------------------------------
 
 
-def build_run_command(result: ParseResult, podman_path: str = 'podman') -> List[str]:
-    """Build the full ``podman run`` command from a ParseResult."""
-    ns = result.ns
-    cmd = [podman_path]
+def build_run_command(ctx: PodrunContext) -> List[str]:
+    """Build the full ``podman run`` command from a PodrunContext."""
+    ns = ctx.ns
+    cmd = [ctx.podman_path]
     cmd.extend(ns.get('podman_global_args') or [])
     cmd.append('run')
 
@@ -2812,19 +2850,17 @@ def build_run_command(result: ParseResult, podman_path: str = 'podman') -> List[
     cmd.extend(ns.get('run.passthrough_args') or [])
 
     # Trailing positionals (image + command)
-    cmd.extend(result.trailing_args)
+    cmd.extend(ctx.trailing_args)
 
     # Explicit command after '--'
-    if result.explicit_command:
+    if ctx.explicit_command:
         cmd.append('--')
-        cmd.extend(result.explicit_command)
+        cmd.extend(ctx.explicit_command)
 
     return cmd
 
 
-def build_overlay_run_command(  # noqa: C901
-    result: ParseResult, podman_path: str = 'podman'
-) -> Tuple[List[str], List[str]]:
+def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]:  # noqa: C901
     """Generate entrypoints, build overlay args, and return the full run command.
 
     Returns ``(cmd, caps_to_drop)`` where *cmd* is the complete
@@ -2834,7 +2870,7 @@ def build_overlay_run_command(  # noqa: C901
     Overlay args are injected into ``ns['run.passthrough_args']`` before
     delegating to :func:`build_run_command`.
     """
-    ns = result.ns
+    ns = ctx.ns
     pt = ns.get('run.passthrough_args') or []
     overlay_args = []
     caps_to_drop = []
@@ -2884,19 +2920,19 @@ def build_overlay_run_command(  # noqa: C901
     # Inject overlay args into passthrough
     ns['run.passthrough_args'] = overlay_args + pt
 
-    return build_run_command(result, podman_path), caps_to_drop
+    return build_run_command(ctx), caps_to_drop
 
 
-def build_passthrough_command(result: ParseResult, podman_path: str = 'podman') -> List[str]:
+def build_passthrough_command(ctx: PodrunContext) -> List[str]:
     """Build a passthrough ``podman <subcommand> ...`` command."""
-    ns = result.ns
-    cmd = [podman_path]
+    ns = ctx.ns
+    cmd = [ctx.podman_path]
     cmd.extend(ns.get('podman_global_args') or [])
     cmd.append(ns['subcommand'])
-    cmd.extend(result.subcmd_passthrough_args)
-    if result.explicit_command:
+    cmd.extend(ctx.subcmd_passthrough_args)
+    if ctx.explicit_command:
         cmd.append('--')
-        cmd.extend(result.explicit_command)
+        cmd.extend(ctx.explicit_command)
     return cmd
 
 
@@ -3401,13 +3437,14 @@ def _fuse_overlayfs_fixup(ns):
 # ---------------------------------------------------------------------------
 
 
-def _exec_attach(result, ns, global_flags, podman_path):
+def _exec_attach(ctx: 'PodrunContext', global_flags):
     """Handle the 'attach' action — exec into a running container."""
+    ns = ctx.ns
     name = ns['run.name']
     container_workdir, container_overlays = query_container_info(
         name,
         global_flags=global_flags,
-        podman_path=podman_path,
+        podman_path=ctx.podman_path,
     )
     if 'user' not in container_overlays.split(','):
         print(
@@ -3419,20 +3456,20 @@ def _exec_attach(result, ns, global_flags, podman_path):
         )
         sys.exit(1)
     cmd = (
-        [podman_path]
+        [ctx.podman_path]
         + global_flags
         + build_podman_exec_args(
             ns,
             name,
             container_workdir=container_workdir,
-            trailing_args=result.trailing_args,
-            explicit_command=result.explicit_command,
+            trailing_args=ctx.trailing_args,
+            explicit_command=ctx.explicit_command,
         )
     )
     if ns.get('root.print_cmd'):
         print(shlex.join(cmd))
         sys.exit(0)
-    os.execvpe(podman_path, cmd, os.environ.copy())
+    os.execvpe(ctx.podman_path, cmd, os.environ.copy())
 
 
 def _filter_global_args(global_args: List[str], flags: PodmanFlags) -> List[str]:
@@ -3481,17 +3518,17 @@ def _filter_conflicting_exports(ns):
     ns['run.export'] = filtered
 
 
-def _handle_run(result, podman_path):  # noqa: C901
+def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     """Handle the ``run`` subcommand: state → entrypoints → overlays → exec.
 
     This is the main orchestration function.  ``resolve_config()`` and
     ``_apply_store()`` have already run by the time this is called.
     """
-    ns = result.ns
+    ns = ctx.ns
     global_flags = ns.get('podman_global_args') or []
 
     # Guard: no image
-    if not result.trailing_args:
+    if not ctx.trailing_args:
         print(
             'Error: No image specified. Pass image as argument or set "image" in devcontainer.json.',
             file=sys.stderr,
@@ -3512,7 +3549,7 @@ def _handle_run(result, podman_path):  # noqa: C901
         sys.exit(0)
 
     # Set run.image for _env_args (image ref parsing for PODRUN_IMG_* env vars)
-    ns['run.image'] = result.trailing_args[0]
+    ns['run.image'] = ctx.trailing_args[0]
 
     # Default prompt banner to image name (matches old_podrun.py fallback chain)
     if not ns.get('run.prompt_banner'):
@@ -3532,13 +3569,13 @@ def _handle_run(result, podman_path):  # noqa: C901
     ):
         ns['run.auto_attach'] = None
         ns['run.auto_replace'] = None
-    action = handle_container_state(ns, global_flags=global_flags, podman_path=podman_path)
+    action = handle_container_state(ctx, global_flags=global_flags)
     if action is None:
         sys.exit(0)
 
     replace_rm_cmd = None
     if action == 'replace':
-        pm = shlex.quote(podman_path)
+        pm = shlex.quote(ctx.podman_path)
         gf_str = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
         replace_rm_cmd = f'{pm} {gf_str}rm -f {shlex.quote(ns["run.name"])}'
         if not ns.get('root.print_cmd'):
@@ -3546,7 +3583,7 @@ def _handle_run(result, podman_path):  # noqa: C901
         action = 'run'
 
     if action == 'attach':
-        _exec_attach(result, ns, global_flags, podman_path)
+        _exec_attach(ctx, global_flags)
 
     # action == 'run'
 
@@ -3556,7 +3593,7 @@ def _handle_run(result, podman_path):  # noqa: C901
 
     # Warn about missing subuid/subgid ranges (skip when remote — /etc/subuid
     # inside the container is misleading)
-    if ns.get('run.user_overlay') and not _is_remote(podman_path):
+    if ns.get('run.user_overlay') and not _is_remote(ctx.podman_path):
         _warn_missing_subids()
 
     # Ensure store service is running when using podman-remote with a local store
@@ -3565,7 +3602,7 @@ def _handle_run(result, podman_path):  # noqa: C901
         graphroot = str(store_path / 'graphroot')
         runroot = _runroot_path(graphroot)
         sock = _ensure_store_service(
-            graphroot, runroot, store_dir=str(store_path), podman_path=podman_path
+            graphroot, runroot, store_dir=str(store_path), podman_path=ctx.podman_path
         )
         ns['run.store_socket'] = sock
 
@@ -3573,11 +3610,11 @@ def _handle_run(result, podman_path):  # noqa: C901
     # --storage-opt is already in podman_global_args when the command is built,
     # and :O→:ro conversion applies to passthrough args (not the final cmd).
     # Skip when remote — storage is on the remote daemon, not local.
-    if ns.get('run.fuse_overlayfs') and not _is_remote(podman_path):
+    if ns.get('run.fuse_overlayfs') and not _is_remote(ctx.podman_path):
         _fuse_overlayfs_fixup(ns)
 
     # Build the full run command with overlay injection
-    cmd, _caps_to_drop = build_overlay_run_command(result, podman_path)
+    cmd, _caps_to_drop = build_overlay_run_command(ctx)
 
     # Clean stale files (>48h) from previous configs
     if ns.get('run.user_overlay'):
@@ -3589,7 +3626,7 @@ def _handle_run(result, podman_path):  # noqa: C901
         print(shlex.join(cmd))
         sys.exit(0)
 
-    os.execvpe(podman_path, cmd, os.environ.copy())
+    os.execvpe(ctx.podman_path, cmd, os.environ.copy())
 
 
 # ---------------------------------------------------------------------------
@@ -3609,8 +3646,9 @@ def main(argv=None):
 
     # Pre-load flags for the resolved binary (podman vs podman-remote).
     flags = load_podman_flags(podman_path)
-    result = parse_args(raw, flags=flags)
-    ns = result.ns
+    ctx = parse_args(raw, flags=flags)
+    ctx.podman_path = podman_path
+    ns = ctx.ns
 
     # Immediate-exit flags
     if ns['root.version']:
@@ -3623,28 +3661,28 @@ def main(argv=None):
     print_help(ns['subcommand'], raw, podman_path)
 
     # Config resolution (three-way merge: CLI > config-script > devcontainer.json)
-    result = resolve_config(result)
-    ns = result.ns
+    ctx = resolve_config(ctx)
+    ns = ctx.ns
 
     # Store resolution (destroy, resolve, info — all handled inside)
-    _apply_store(ns, podman_path)
+    _apply_store(ctx)
 
     # Filter global args against the resolved binary's flag set — only needed
     # for podman-remote, which doesn't recognize storage flags like --root,
     # --storage-driver.  Full podman accepts all global args.
-    if _is_remote(podman_path):
+    if _is_remote(ctx.podman_path):
         ns['podman_global_args'] = _filter_global_args(ns.get('podman_global_args') or [], flags)
 
     # Route
     if ns['subcommand'] == 'run':
-        _handle_run(result, podman_path)
+        _handle_run(ctx)
     elif ns['subcommand'] is not None:
         # Passthrough to podman
-        cmd = build_passthrough_command(result, podman_path)
+        cmd = build_passthrough_command(ctx)
         if ns['root.print_cmd']:
             print(shlex.join(cmd))
             sys.exit(0)
-        os.execvpe(podman_path, cmd, os.environ.copy())
+        os.execvpe(ctx.podman_path, cmd, os.environ.copy())
 
 
 if __name__ == '__main__':

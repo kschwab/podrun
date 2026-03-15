@@ -239,7 +239,7 @@ class TestGenerateRcSh:
         """Mock run_os_cmd so rc.sh generation doesn't need /proc/cpuinfo."""
         import subprocess
 
-        def fake_run_os_cmd(cmd):
+        def fake_run_os_cmd(cmd, env=None):
             if 'model name' in cmd:
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=0, stdout='Test CPU', stderr=''

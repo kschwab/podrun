@@ -384,11 +384,12 @@ class TestHandleRunStoreService:
                 'ns': ns,
                 'trailing_args': ['ubuntu:latest'],
                 'explicit_command': None,
+                'podman_path': 'podman',
             },
         )()
 
         # Stub out functions that would fail without real podman
-        monkeypatch.setattr(podrun_mod, 'handle_container_state', lambda ns, **kw: 'run')
+        monkeypatch.setattr(podrun_mod, 'handle_container_state', lambda ctx, **kw: 'run')
         monkeypatch.setattr(podrun_mod, '_warn_missing_subids', lambda: None)
         mock_result = type('Result', (), {'stdout': '', 'stderr': '', 'returncode': 0})()
         monkeypatch.setattr(podrun_mod, 'run_os_cmd', lambda cmd: mock_result)
@@ -409,7 +410,7 @@ class TestHandleRunStoreService:
         monkeypatch.setattr(podrun_mod, '_ensure_store_service', mock_ensure)
 
         with pytest.raises(SystemExit):
-            podrun_mod._handle_run(result, 'podman')
+            podrun_mod._handle_run(result)
 
         assert len(ensure_calls) == 1
         assert 'graphroot' in ensure_calls[0][0]
@@ -428,7 +429,7 @@ class TestHandleRunStoreService:
         )
 
         with pytest.raises(SystemExit):
-            podrun_mod._handle_run(result, 'podman')
+            podrun_mod._handle_run(result)
 
         assert ensure_calls == []
 
@@ -445,6 +446,6 @@ class TestHandleRunStoreService:
         )
 
         with pytest.raises(SystemExit):
-            podrun_mod._handle_run(result, 'podman')
+            podrun_mod._handle_run(result)
 
         assert ensure_calls == []

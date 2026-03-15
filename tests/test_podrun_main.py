@@ -359,7 +359,7 @@ class TestHandleRunViaPrintCmd:
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
-            lambda cmd: subprocess.CompletedProcess(
+            lambda cmd, env=None: subprocess.CompletedProcess(
                 args=cmd,
                 returncode=0,
                 stdout='',
@@ -508,7 +508,7 @@ class TestExportConflictFiltering:
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
-            lambda cmd: subprocess.CompletedProcess(
+            lambda cmd, env=None: subprocess.CompletedProcess(
                 args=cmd,
                 returncode=0,
                 stdout='',
@@ -697,7 +697,9 @@ class TestRemoteHandleRunGuards:
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
-            lambda cmd: subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr=''),
+            lambda cmd, env=None: subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='', stderr=''
+            ),
         )
 
     def _force_remote(self, monkeypatch):

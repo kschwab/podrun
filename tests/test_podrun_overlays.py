@@ -448,6 +448,16 @@ class TestEnvArgs:
         assert '--env=FOO=bar' in args
         assert '--env=BAZ=qux' in args
 
+    def test_devcontainer_cli_env(self):
+        ns = {'internal.dc_from_cli': True}
+        args = _env_args(ns)
+        assert '--env=PODRUN_DEVCONTAINER_CLI=1' in args
+
+    def test_devcontainer_cli_env_absent(self):
+        args = _env_args({})
+        dc_args = [a for a in args if 'DEVCONTAINER_CLI' in a]
+        assert dc_args == []
+
 
 # ---------------------------------------------------------------------------
 # _validate_overlay_args

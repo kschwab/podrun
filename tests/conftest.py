@@ -268,7 +268,7 @@ def mock_run_os_cmd(monkeypatch):
             self._side_effect = list(effects)
             self._return_value = None
 
-        def __call__(self, cmd):
+        def __call__(self, cmd, env=None):
             self.calls.append(cmd)
             if self._side_effect is not None:
                 if self._side_effect:

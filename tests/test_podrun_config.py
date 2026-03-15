@@ -448,7 +448,7 @@ class TestResolveConfig:
             monkeypatch.setattr(
                 podrun_mod,
                 'run_os_cmd',
-                lambda cmd: subprocess.CompletedProcess(
+                lambda cmd, env=None: subprocess.CompletedProcess(
                     args='', returncode=0, stdout=script_stdout
                 ),
             )
@@ -522,7 +522,7 @@ class TestResolveConfig:
         """Multiple --config-script: tokens concatenated."""
         call_count = [0]
 
-        def fake_run_os_cmd(cmd):
+        def fake_run_os_cmd(cmd, env=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return subprocess.CompletedProcess(args='', returncode=0, stdout='--rm')
@@ -586,7 +586,7 @@ class TestResolveConfig:
         )
         calls = []
 
-        def fake_run_os_cmd(cmd):
+        def fake_run_os_cmd(cmd, env=None):
             calls.append(cmd)
             if len(calls) == 1:
                 return subprocess.CompletedProcess(args='', returncode=0, stdout='--session')
@@ -628,7 +628,7 @@ class TestResolveConfig:
         )
         calls = []
 
-        def fake_run_os_cmd(cmd):
+        def fake_run_os_cmd(cmd, env=None):
             calls.append(cmd)
             outputs = {
                 1: '--shell /bin/dc-a',  # dc script 0
@@ -931,7 +931,7 @@ class TestResolveConfig:
             ['--no-devconfig', 'run', '-l', 'app=test', '-l', 'env=dev', 'alpine'],
             monkeypatch,
         )
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--label=app=test' in cmd
         assert '--label=env=dev' in cmd
 
@@ -974,7 +974,7 @@ class TestIntegrationPipeline:
         if script_effects is not None:
             call_idx = [0]
 
-            def fake_run_os_cmd(cmd):
+            def fake_run_os_cmd(cmd, env=None):
                 i = call_idx[0]
                 call_idx[0] += 1
                 if i < len(script_effects):
@@ -988,7 +988,7 @@ class TestIntegrationPipeline:
 
         r = parse_args(argv)
         r = resolve_config(r)
-        return build_run_command(r, 'podman')
+        return build_run_command(r)
 
     def _write_dc(self, tmp_path, dc):
         """Write devcontainer.json and return its path."""

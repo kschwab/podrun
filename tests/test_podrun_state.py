@@ -10,6 +10,7 @@ from podrun.podrun import (
     PODRUN_ENTRYPOINT_PATH,
     PODRUN_EXEC_ENTRY_PATH,
     PODRUN_RC_PATH,
+    PodrunContext,
     build_overlay_run_command,
     build_podman_exec_args,
     detect_container_state,
@@ -21,6 +22,18 @@ from podrun.podrun import (
 
 
 pytestmark = pytest.mark.usefixtures('podman_binary')
+
+
+def _ctx_from_ns(ns, **kwargs):
+    """Build a minimal PodrunContext from an ns dict for unit tests."""
+    return PodrunContext(
+        ns=ns,
+        trailing_args=kwargs.get('trailing_args', []),
+        explicit_command=kwargs.get('explicit_command', []),
+        raw_argv=kwargs.get('raw_argv', []),
+        subcmd_passthrough_args=kwargs.get('subcmd_passthrough_args', []),
+        podman_path=kwargs.get('podman_path', 'podman'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -167,32 +180,32 @@ class TestDetectContainerState:
 
 class TestHandleContainerState:
     def test_no_name_returns_run(self):
-        assert handle_container_state({}) == 'run'
+        assert handle_container_state(_ctx_from_ns({})) == 'run'
 
     def test_container_not_found_returns_run(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: None)
-        assert handle_container_state({'run.name': 'myc'}) == 'run'
+        assert handle_container_state(_ctx_from_ns({'run.name': 'myc'})) == 'run'
 
     def test_running_auto_attach(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_attach': True}
-        assert handle_container_state(ns) == 'attach'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'attach'
 
     def test_running_auto_replace(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_replace': True}
-        assert handle_container_state(ns) == 'replace'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
 
     def test_running_both_false_returns_none(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_attach': False, 'run.auto_replace': False}
-        assert handle_container_state(ns) is None
+        assert handle_container_state(_ctx_from_ns(ns)) is None
 
     def test_running_prompt_attach_yes(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
         ns = {'run.name': 'myc'}
-        assert handle_container_state(ns) == 'attach'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'attach'
 
     def test_running_prompt_attach_no_replace_yes(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
@@ -201,49 +214,49 @@ class TestHandleContainerState:
             podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: next(prompts)
         )
         ns = {'run.name': 'myc'}
-        assert handle_container_state(ns) == 'replace'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
 
     def test_running_prompt_both_no(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
         ns = {'run.name': 'myc'}
-        assert handle_container_state(ns) is None
+        assert handle_container_state(_ctx_from_ns(ns)) is None
 
     def test_stopped_auto_attach_warns(self, monkeypatch, capsys):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         # auto_attach=True but stopped → warn, then check auto_replace
         ns = {'run.name': 'myc', 'run.auto_attach': True, 'run.auto_replace': True}
-        assert handle_container_state(ns) == 'replace'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
         assert 'Cannot auto-attach' in capsys.readouterr().err
 
     def test_stopped_auto_replace(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         ns = {'run.name': 'myc', 'run.auto_replace': True}
-        assert handle_container_state(ns) == 'replace'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
 
     def test_stopped_both_false_non_interactive(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr('sys.stdin', type('F', (), {'isatty': lambda self: False})())
         ns = {'run.name': 'myc', 'run.auto_attach': False, 'run.auto_replace': False}
-        assert handle_container_state(ns) is None
+        assert handle_container_state(_ctx_from_ns(ns)) is None
 
     def test_stopped_prompt_replace_yes(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
         ns = {'run.name': 'myc'}
-        assert handle_container_state(ns) == 'replace'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
 
     def test_stopped_prompt_replace_no(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
         ns = {'run.name': 'myc'}
-        assert handle_container_state(ns) is None
+        assert handle_container_state(_ctx_from_ns(ns)) is None
 
     def test_auto_attach_priority_over_auto_replace(self, monkeypatch):
         """When both auto_attach and auto_replace are True and running, attach wins."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
         ns = {'run.name': 'myc', 'run.auto_attach': True, 'run.auto_replace': True}
-        assert handle_container_state(ns) == 'attach'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'attach'
 
 
 # ---------------------------------------------------------------------------

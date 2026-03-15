@@ -9,6 +9,7 @@ import shutil
 
 from podrun.podrun import (
     PodmanFlags,
+    PodrunContext,
     _PODRUN_STORES_DIR,
     _apply_store,
     _default_store_dir,
@@ -35,6 +36,18 @@ from podrun.podrun import (
 import podrun.podrun as podrun_mod
 
 pytestmark = pytest.mark.usefixtures('podman_binary')
+
+
+def _ctx_from_ns(ns, **kwargs):
+    """Build a minimal PodrunContext from an ns dict for unit tests."""
+    return PodrunContext(
+        ns=ns,
+        trailing_args=kwargs.get('trailing_args', []),
+        explicit_command=kwargs.get('explicit_command', []),
+        raw_argv=kwargs.get('raw_argv', []),
+        subcmd_passthrough_args=kwargs.get('subcmd_passthrough_args', []),
+        podman_path=kwargs.get('podman_path', 'podman'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +887,7 @@ class TestHelp:
 class TestPrintCmd:
     def test_run_print_cmd(self):
         r = parse_args(['--print-cmd', 'run', '-e', 'FOO=bar', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert cmd[0] == 'podman'
         assert 'run' in cmd
         assert '-e' in cmd
@@ -883,7 +896,7 @@ class TestPrintCmd:
 
     def test_run_print_cmd_global_flags_before_subcommand(self, podman_only):
         r = parse_args(['--root', '/x', 'run', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         run_idx = cmd.index('run')
         root_idx = cmd.index('--root')
         assert root_idx < run_idx
@@ -892,7 +905,7 @@ class TestPrintCmd:
         r = parse_args(
             ['run', '--rm', '-e', 'A=1', '--privileged', 'alpine', 'bash', '-c', 'echo hi']
         )
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--rm' in cmd
         assert '-e' in cmd
         assert 'A=1' in cmd
@@ -902,13 +915,13 @@ class TestPrintCmd:
 
     def test_explicit_command_with_separator(self):
         r = parse_args(['run', 'alpine', '--', 'bash', '-c', 'echo hi'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         sep_idx = cmd.index('--')
         assert cmd[sep_idx + 1 :] == ['bash', '-c', 'echo hi']
 
     def test_name_flag_in_run_command(self):
         r = parse_args(['run', '--name', 'mycontainer', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--name=mycontainer' in cmd
 
 
@@ -920,12 +933,12 @@ class TestPrintCmd:
 class TestBuildPassthroughCommand:
     def test_simple_passthrough(self):
         r = parse_args(['ps', '-a'])
-        cmd = build_passthrough_command(r, 'podman')
+        cmd = build_passthrough_command(r)
         assert cmd == ['podman', 'ps', '-a']
 
     def test_passthrough_with_global_flags(self, podman_only):
         r = parse_args(['--root', '/x', 'ps', '-a'])
-        cmd = build_passthrough_command(r, 'podman')
+        cmd = build_passthrough_command(r)
         assert cmd[0] == 'podman'
         ps_idx = cmd.index('ps')
         root_idx = cmd.index('--root')
@@ -933,14 +946,14 @@ class TestBuildPassthroughCommand:
 
     def test_passthrough_with_remote(self, podman_only):
         r = parse_args(['--remote', 'ps', '-a'])
-        cmd = build_passthrough_command(r, 'podman')
+        cmd = build_passthrough_command(r)
         remote_idx = cmd.index('--remote')
         ps_idx = cmd.index('ps')
         assert remote_idx < ps_idx
 
     def test_passthrough_with_explicit_command(self):
         r = parse_args(['exec', 'mycontainer', '--', 'bash'])
-        cmd = build_passthrough_command(r, 'podman')
+        cmd = build_passthrough_command(r)
         assert 'exec' in cmd
         assert 'mycontainer' in cmd
         assert '--' in cmd
@@ -1598,18 +1611,18 @@ class TestRunOsCmd:
 class TestBuildRunCommand:
     def test_basic_run(self):
         r = parse_args(['run', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert cmd == ['podman', 'run', 'alpine']
 
     def test_with_global_flags(self, podman_only):
         r = parse_args(['--root', '/x', 'run', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert cmd.index('--root') < cmd.index('run')
         assert cmd.index('/x') < cmd.index('run')
 
     def test_with_passthrough_flags(self):
         r = parse_args(['run', '-e', 'A=1', '--rm', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '-e' in cmd
         assert 'A=1' in cmd
         assert '--rm' in cmd
@@ -1617,19 +1630,19 @@ class TestBuildRunCommand:
 
     def test_with_explicit_command(self):
         r = parse_args(['run', 'alpine', '--', 'echo', 'hi'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--' in cmd
         assert cmd[cmd.index('--') + 1 :] == ['echo', 'hi']
 
     def test_with_name(self):
         r = parse_args(['run', '--name', 'myc', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--name=myc' in cmd
 
     def test_store_not_in_run_command(self):
         """--local-store is config only; no --root injected at parse time."""
         r = parse_args(['--local-store', '/s', 'run', 'alpine'])
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--root' not in cmd
         assert cmd == ['podman', 'run', 'alpine']
 
@@ -2408,7 +2421,7 @@ class TestFullStackCombinations:
                 'hi',
             ]
         )
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         # podman + global args before 'run'
         run_idx = cmd.index('run')
         assert cmd[0] == 'podman'
@@ -2444,7 +2457,7 @@ class TestFullStackCombinations:
                 'alpine',
             ]
         )
-        cmd = build_run_command(r, 'podman')
+        cmd = build_run_command(r)
         assert '--name=myc' in cmd
         assert '--rm' in cmd
         assert '--privileged' in cmd
@@ -2490,7 +2503,7 @@ class TestFullStackCombinations:
     def test_passthrough_command_with_global_flags(self, podman_only):
         """build_passthrough_command preserves global flag ordering."""
         r = parse_args(['--root', '/x', '--remote', 'exec', 'mycontainer', 'ls', '-la'])
-        cmd = build_passthrough_command(r, 'podman')
+        cmd = build_passthrough_command(r)
         exec_idx = cmd.index('exec')
         assert cmd.index('--root') < exec_idx
         assert cmd.index('--remote') < exec_idx
@@ -2681,28 +2694,28 @@ class TestResolveStore:
     def test_ignore_returns_empty(self):
         """--local-store-ignore → empty flags regardless of store."""
         ns = {'root.local_store_ignore': True, 'root.local_store': '/some/path'}
-        flags, env = _resolve_store(ns)
+        flags, env = _resolve_store(_ctx_from_ns(ns))
         assert flags == []
         assert env == {}
 
     def test_ignore_preserves_local_store_value(self):
         """--local-store-ignore does not clear root.local_store."""
         ns = {'root.local_store_ignore': True, 'root.local_store': '/some/path'}
-        _resolve_store(ns)
+        _resolve_store(_ctx_from_ns(ns))
         assert ns['root.local_store'] == '/some/path'
 
     def test_no_store_no_project_root(self, monkeypatch):
         """No explicit store and _default_store_dir returns None → empty."""
         monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
         ns = {}
-        flags, env = _resolve_store(ns)
+        flags, env = _resolve_store(_ctx_from_ns(ns))
         assert flags == []
         assert ns.get('root.local_store') is None
 
     def test_explicit_initialized_store(self, init_store):
         """Initialized store → 6-element flags list."""
         ns = {'root.local_store': init_store}
-        flags, env = _resolve_store(ns)
+        flags, env = _resolve_store(_ctx_from_ns(ns))
         assert len(flags) == 6
         assert flags[0] == '--root'
         assert flags[2] == '--runroot'
@@ -2712,19 +2725,19 @@ class TestResolveStore:
     def test_graphroot_path_in_flags(self, init_store):
         """--root value is the resolved graphroot subdirectory."""
         ns = {'root.local_store': init_store}
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert flags[1] == str(pathlib.Path(init_store).resolve() / 'graphroot')
 
     def test_runroot_path_in_flags(self, init_store):
         """--runroot value is under _PODRUN_STORES_DIR."""
         ns = {'root.local_store': init_store}
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert flags[3].startswith(_PODRUN_STORES_DIR + '/')
 
     def test_uninitialized_no_auto_init_returns_empty(self, uninit_store):
         """Uninitialized store without auto-init → empty, clears local_store."""
         ns = {'root.local_store': uninit_store}
-        flags, env = _resolve_store(ns)
+        flags, env = _resolve_store(_ctx_from_ns(ns))
         assert flags == []
         assert ns['root.local_store'] is None
 
@@ -2732,21 +2745,21 @@ class TestResolveStore:
         """Uninitialized store with auto-init → creates store, returns flags."""
         store_dir = str(tmp_path / 'new-store')
         ns = {'root.local_store': store_dir, 'root.local_store_auto_init': True}
-        flags, env = _resolve_store(ns)
+        flags, env = _resolve_store(_ctx_from_ns(ns))
         assert len(flags) == 6
         assert (tmp_path / 'new-store' / 'graphroot').is_dir()
 
     def test_storage_driver_from_config(self, init_store):
         """root.storage_driver from devcontainer flows to --storage-driver."""
         ns = {'root.local_store': init_store, 'root.storage_driver': 'vfs'}
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         idx = flags.index('--storage-driver')
         assert flags[idx + 1] == 'vfs'
 
     def test_default_driver_is_overlay(self, init_store):
         """No explicit driver → overlay."""
         ns = {'root.local_store': init_store}
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         idx = flags.index('--storage-driver')
         assert flags[idx + 1] == 'overlay'
 
@@ -2756,7 +2769,7 @@ class TestResolveStore:
             'root.local_store': init_store,
             'podman_global_args': ['--storage-driver', 'vfs'],
         }
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert '--storage-driver' not in flags
         assert '--root' in flags
         assert '--runroot' in flags
@@ -2768,19 +2781,19 @@ class TestResolveStore:
             'root.storage_driver': 'btrfs',
             'podman_global_args': ['--storage-driver', 'vfs'],
         }
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert '--storage-driver' not in flags
 
     def test_conflict_root(self, init_store):
         ns = {'root.local_store': init_store, 'podman_global_args': ['--root', '/x']}
         with pytest.raises(SystemExit) as exc_info:
-            _resolve_store(ns)
+            _resolve_store(_ctx_from_ns(ns))
         assert exc_info.value.code == 1
 
     def test_conflict_runroot(self, init_store):
         ns = {'root.local_store': init_store, 'podman_global_args': ['--runroot', '/x']}
         with pytest.raises(SystemExit) as exc_info:
-            _resolve_store(ns)
+            _resolve_store(_ctx_from_ns(ns))
         assert exc_info.value.code == 1
 
     def test_auto_discovery_with_project_root(self, tmp_path, monkeypatch):
@@ -2789,7 +2802,7 @@ class TestResolveStore:
         pathlib.Path(store_dir, 'graphroot').mkdir(parents=True)
         monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: store_dir)
         ns = {}
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert len(flags) == 6
         assert ns['root.local_store'] == store_dir
 
@@ -2799,7 +2812,7 @@ class TestResolveStore:
         pathlib.Path(store_dir).mkdir(parents=True)
         monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: store_dir)
         ns = {}
-        flags, _ = _resolve_store(ns)
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert flags == []
         assert ns['root.local_store'] is None
 
@@ -2813,7 +2826,7 @@ class TestApplyStore:
     def test_prepends_flags(self, init_store):
         """Store flags are prepended before existing global args."""
         ns = {'root.local_store': init_store, 'podman_global_args': ['--remote']}
-        _apply_store(ns)
+        _apply_store(_ctx_from_ns(ns))
         pga = ns['podman_global_args']
         assert pga[0] == '--root'
         assert '--remote' in pga
@@ -2823,13 +2836,13 @@ class TestApplyStore:
         """No store resolved → podman_global_args untouched."""
         monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
         ns = {'podman_global_args': ['--remote']}
-        _apply_store(ns)
+        _apply_store(_ctx_from_ns(ns))
         assert ns['podman_global_args'] == ['--remote']
 
     def test_empty_initial_global_args(self, init_store):
         """Store flags set even when podman_global_args starts empty."""
         ns = {'root.local_store': init_store}
-        _apply_store(ns)
+        _apply_store(_ctx_from_ns(ns))
         pga = ns['podman_global_args']
         assert pga[0] == '--root'
         assert '--storage-driver' in pga
@@ -2842,7 +2855,7 @@ class TestApplyStore:
             'root.local_store_ignore': True,
             'podman_global_args': ['--remote'],
         }
-        _apply_store(ns)
+        _apply_store(_ctx_from_ns(ns))
         assert ns['podman_global_args'] == ['--remote']
 
 
@@ -3312,7 +3325,7 @@ class TestStoreCommandIntegration:
     def test_remote_no_store_flags(self, init_store, monkeypatch):
         """podman-remote → _apply_store skips store flags."""
         ns = {'root.local_store': init_store}
-        _apply_store(ns, 'podman-remote')
+        _apply_store(_ctx_from_ns(ns, podman_path='podman-remote'))
         assert 'podman_global_args' not in ns or '--root' not in (
             ns.get('podman_global_args') or []
         )
@@ -3321,7 +3334,7 @@ class TestStoreCommandIntegration:
         """podman-remote + --local-store-info → disabled message."""
         ns = {'root.local_store': init_store, 'root.local_store_info': True}
         with pytest.raises(SystemExit) as exc_info:
-            _apply_store(ns, 'podman-remote')
+            _apply_store(_ctx_from_ns(ns, podman_path='podman-remote'))
         assert exc_info.value.code == 0
         err = capsys.readouterr().err
         assert 'disabled' in err
@@ -3528,7 +3541,7 @@ class TestStoreDestroyIntegration:
         """podman-remote + --local-store-destroy → exits 1 with error."""
         ns = {'root.local_store_destroy': True}
         with pytest.raises(SystemExit) as exc_info:
-            _apply_store(ns, 'podman-remote')
+            _apply_store(_ctx_from_ns(ns, podman_path='podman-remote'))
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert '--local-store-destroy' in err

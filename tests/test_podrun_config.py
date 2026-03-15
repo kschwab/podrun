@@ -420,6 +420,11 @@ class TestDevcontainerToNs:
         assert ns['run.adhoc'] is True
         assert ns['run.shell'] == '/bin/zsh'
 
+    def test_no_auto_resolve_git_submodules_key(self):
+        cfg = {'noAutoResolveGitSubmodules': True}
+        ns = _devcontainer_to_ns(cfg)
+        assert ns['run.no_auto_resolve_git_submodules'] is True
+
     def test_non_none_only(self):
         cfg = {'name': 'test'}
         ns = _devcontainer_to_ns(cfg)

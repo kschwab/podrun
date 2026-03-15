@@ -21,10 +21,14 @@ from podrun.podrun import (
     _extract_copy_staging,
     _dot_files_overlay_args,
     _env_args,
+    _find_root_git_dir,
+    _git_submodule_args,
     _host_overlay_args,
     _interactive_overlay_args,
     _podman_remote_args,
+    _resolve_git_submodule,
     _user_overlay_args,
+    devcontainer_run_args,
     _validate_overlay_args,
     _x11_args,
     compute_caps_to_drop,
@@ -710,3 +714,264 @@ class TestEntrypointCapsToDrop:
             content = f.read()
         # With no caps to drop, setpriv section should have empty drop string
         assert '_drop=","' not in content
+
+
+# ---------------------------------------------------------------------------
+# _resolve_git_submodule
+# ---------------------------------------------------------------------------
+
+
+class TestResolveGitSubmodule:
+    def test_directory_returns_none(self, tmp_path):
+        (tmp_path / '.git').mkdir()
+        assert _resolve_git_submodule(str(tmp_path)) is None
+
+    def test_file_with_gitdir(self, tmp_path):
+        git_objects = tmp_path / 'parent' / '.git' / 'modules' / 'sub'
+        git_objects.mkdir(parents=True)
+        (tmp_path / 'sub').mkdir()
+        (tmp_path / 'sub' / '.git').write_text(f'gitdir: {git_objects}\n')
+        result = _resolve_git_submodule(str(tmp_path / 'sub'))
+        assert result == str(git_objects)
+
+    def test_file_without_gitdir_prefix(self, tmp_path):
+        (tmp_path / '.git').write_text('not a gitdir pointer\n')
+        assert _resolve_git_submodule(str(tmp_path)) is None
+
+    def test_no_dot_git_returns_none(self, tmp_path):
+        assert _resolve_git_submodule(str(tmp_path)) is None
+
+    def test_relative_path_resolved(self, tmp_path):
+        git_objects = tmp_path / 'parent' / '.git' / 'modules' / 'sub'
+        git_objects.mkdir(parents=True)
+        sub_dir = tmp_path / 'parent' / 'sub'
+        sub_dir.mkdir()
+        (sub_dir / '.git').write_text('gitdir: ../.git/modules/sub\n')
+        result = _resolve_git_submodule(str(sub_dir))
+        assert result == str(git_objects)
+
+
+# ---------------------------------------------------------------------------
+# _find_root_git_dir
+# ---------------------------------------------------------------------------
+
+
+class TestFindRootGitDir:
+    def test_modules_subpath(self):
+        root, sub = _find_root_git_dir('/parent/.git/modules/child')
+        assert root == '/parent/.git'
+        assert sub == 'modules/child'
+
+    def test_nested_modules(self):
+        root, sub = _find_root_git_dir('/parent/.git/modules/a/modules/b')
+        assert root == '/parent/.git'
+        assert sub == 'modules/a/modules/b'
+
+    def test_bare_git_dir(self):
+        root, sub = _find_root_git_dir('/parent/.git')
+        assert root == '/parent/.git'
+        assert sub == ''
+
+    def test_no_git_component(self):
+        root, sub = _find_root_git_dir('/some/random/path')
+        assert root is None
+        assert sub is None
+
+    def test_deep_nesting(self):
+        root, sub = _find_root_git_dir('/repo/.git/modules/a/modules/b/modules/c')
+        assert root == '/repo/.git'
+        assert sub == 'modules/a/modules/b/modules/c'
+
+
+# ---------------------------------------------------------------------------
+# TestGitSubmoduleOverlay
+# ---------------------------------------------------------------------------
+
+
+class TestGitSubmoduleOverlay:
+    @pytest.fixture(autouse=True)
+    def _setup_workspace(self, tmp_path, monkeypatch):
+        """Set up a fake workspace directory with a proper .git/ structure."""
+        self.root = tmp_path / 'parent'
+        self.root.mkdir()
+        self.root_git = self.root / '.git'
+        self.root_git.mkdir()
+        self.workspace = self.root / 'sub'
+        self.workspace.mkdir()
+        monkeypatch.chdir(self.workspace)
+
+    def _make_submodule(self):
+        """Turn self.workspace into a submodule pointing to root .git/modules/sub."""
+        modules_dir = self.root_git / 'modules' / 'sub'
+        modules_dir.mkdir(parents=True)
+        (self.workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        return modules_dir
+
+    def test_normal_repo_no_git_mount(self):
+        """.git is a directory → no .git mount in args."""
+        (self.workspace / '.git').mkdir()
+        args = _host_overlay_args({}, [])
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+    def test_submodule_mounts_root_git(self):
+        """.git file with valid gitdir → root .git/ mounted."""
+        self._make_submodule()
+        args = _host_overlay_args({}, [])
+        # Default workspace is /app, depth=1 → mount at /.git
+        assert f'-v={self.root_git}:/.git' in args
+
+    def test_submodule_no_env_vars(self):
+        """Submodule mount emits no GIT_DIR/GIT_WORK_TREE/GIT_CEILING_DIRECTORIES."""
+        self._make_submodule()
+        args = _host_overlay_args({}, [])
+        assert not any('--env=GIT_DIR' in a for a in args)
+        assert not any('--env=GIT_WORK_TREE' in a for a in args)
+        assert not any('--env=GIT_CEILING' in a for a in args)
+
+    def test_submodule_only_one_arg(self):
+        """Submodule detection emits exactly one arg (the mount)."""
+        self._make_submodule()
+        args = _host_overlay_args({}, [])
+        git_args = [a for a in args if '.git' in a and a.startswith('-v=')]
+        assert len(git_args) == 1
+
+    def test_broken_gitdir_pointer_skipped(self):
+        """.git file pointing to nonexistent path → no mount."""
+        (self.workspace / '.git').write_text('gitdir: /nonexistent/path\n')
+        args = _host_overlay_args({}, [])
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+    def test_no_dot_git_skipped(self):
+        """No .git at all → no mount."""
+        (self.workspace / '.git').unlink(missing_ok=True)
+        args = _host_overlay_args({}, [])
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+    def test_non_gitdir_file_skipped(self):
+        """.git file without gitdir: prefix → no mount."""
+        (self.workspace / '.git').write_text('random content\n')
+        args = _host_overlay_args({}, [])
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+    def test_workspace_mount_submodule_via_dc(self, tmp_path):
+        """devcontainer_run_args: workspaceMount source has .git pointer → root git mounted."""
+        host_src = tmp_path / 'dc_parent' / 'sub'
+        host_src.mkdir(parents=True)
+        root_git = tmp_path / 'dc_parent' / '.git'
+        root_git.mkdir()
+        modules_dir = root_git / 'modules' / 'sub'
+        modules_dir.mkdir(parents=True)
+        (host_src / '.git').write_text(f'gitdir: {modules_dir}\n')
+        dc = {
+            'workspaceMount': f'source={host_src},target=/workspace,type=bind',
+            'workspaceFolder': '/workspace',
+        }
+        args = devcontainer_run_args(dc, {})
+        # workspace=/workspace, depth=1 → mount at /.git
+        assert f'-v={root_git}:/.git' in args
+        assert not any('--env=GIT_DIR' in a for a in args)
+
+    def test_workspace_mount_normal_repo_via_dc(self, tmp_path):
+        """devcontainer_run_args: workspaceMount source has .git directory → no mount."""
+        host_src = tmp_path / 'host_project'
+        host_src.mkdir()
+        (host_src / '.git').mkdir()
+        dc = {
+            'workspaceMount': f'source={host_src},target=/workspace,type=bind',
+            'workspaceFolder': '/workspace',
+        }
+        args = devcontainer_run_args(dc, {})
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+    def test_no_auto_resolve_flag_skips_host_overlay(self):
+        """--no-auto-resolve-git-submodules prevents mount in host overlay."""
+        self._make_submodule()
+        args = _host_overlay_args({'run.no_auto_resolve_git_submodules': True}, [])
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+    def test_no_auto_resolve_flag_skips_dc(self, tmp_path):
+        """--no-auto-resolve-git-submodules prevents mount in devcontainer_run_args."""
+        host_src = tmp_path / 'dc_parent' / 'sub'
+        host_src.mkdir(parents=True)
+        root_git = tmp_path / 'dc_parent' / '.git'
+        root_git.mkdir()
+        modules_dir = root_git / 'modules' / 'sub'
+        modules_dir.mkdir(parents=True)
+        (host_src / '.git').write_text(f'gitdir: {modules_dir}\n')
+        dc = {
+            'workspaceMount': f'source={host_src},target=/workspace,type=bind',
+            'workspaceFolder': '/workspace',
+        }
+        args = devcontainer_run_args(dc, {'run.no_auto_resolve_git_submodules': True})
+        assert not any('.git' in a and a.startswith('-v=') for a in args)
+
+
+# ---------------------------------------------------------------------------
+# _git_submodule_args
+# ---------------------------------------------------------------------------
+
+
+class TestGitSubmoduleArgs:
+    def test_shallow_workspace_mounts_at_root(self, tmp_path):
+        """Workspace at /app (depth 1), submod depth 1 → mount at /.git."""
+        root_git = tmp_path / 'parent' / '.git'
+        modules_dir = root_git / 'modules' / 'sub'
+        modules_dir.mkdir(parents=True)
+        workspace = tmp_path / 'parent' / 'sub'
+        workspace.mkdir()
+        (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        args = _git_submodule_args(str(workspace), '/app')
+        assert args == [f'-v={root_git}:/.git']
+
+    def test_deep_workspace_mounts_relative(self, tmp_path):
+        """Workspace at /a/b/c/d/e (depth 5), submod depth 2 → mount at /a/b/c/.git."""
+        root_git = tmp_path / 'parent' / '.git'
+        modules_dir = root_git / 'modules' / 'x' / 'y'
+        modules_dir.mkdir(parents=True)
+        workspace = tmp_path / 'parent' / 'x' / 'y'
+        workspace.mkdir(parents=True)
+        (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        args = _git_submodule_args(str(workspace), '/a/b/c/d/e')
+        # depth=2 (x/y), walk up /a/b/c/d/e by 2 → /a/b/c
+        assert args == [f'-v={root_git}:/a/b/c/.git']
+
+    def test_deep_workspace_shallow_submod_mounts_near_root(self, tmp_path):
+        """Workspace at /a/b/c (depth 3), submod depth 3 → mount at /.git."""
+        root_git = tmp_path / 'parent' / '.git'
+        modules_dir = root_git / 'modules' / 'x' / 'y' / 'z'
+        modules_dir.mkdir(parents=True)
+        workspace = tmp_path / 'parent' / 'x' / 'y' / 'z'
+        workspace.mkdir(parents=True)
+        (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        args = _git_submodule_args(str(workspace), '/a/b/c')
+        # depth=3, walk up /a/b/c by 3 → /
+        assert args == [f'-v={root_git}:/.git']
+
+    def test_submod_depth_exceeds_workspace_clamps_at_root(self, tmp_path):
+        """Submod depth > workspace depth → clamps at /.git (POSIX /../ at / = /)."""
+        root_git = tmp_path / 'parent' / '.git'
+        modules_dir = root_git / 'modules' / 'a' / 'b' / 'c'
+        modules_dir.mkdir(parents=True)
+        workspace = tmp_path / 'parent' / 'a' / 'b' / 'c'
+        workspace.mkdir(parents=True)
+        (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        args = _git_submodule_args(str(workspace), '/w')
+        # depth=3, walk up /w by 3 → / (PurePosixPath.parent stops at /)
+        assert args == [f'-v={root_git}:/.git']
+
+    def test_normal_repo_returns_empty(self, tmp_path):
+        workspace = tmp_path / 'project'
+        workspace.mkdir()
+        (workspace / '.git').mkdir()
+        assert _git_submodule_args(str(workspace), '/app') == []
+
+    def test_broken_pointer_returns_empty(self, tmp_path):
+        workspace = tmp_path / 'project'
+        workspace.mkdir()
+        (workspace / '.git').write_text('gitdir: /nonexistent/path\n')
+        assert _git_submodule_args(str(workspace), '/app') == []
+
+    def test_no_dot_git_returns_empty(self, tmp_path):
+        workspace = tmp_path / 'project'
+        workspace.mkdir()
+        assert _git_submodule_args(str(workspace), '/app') == []

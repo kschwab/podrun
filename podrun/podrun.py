@@ -9,7 +9,7 @@ podrun
 ######
 """
 
-__version__ = '1.0.1'
+__version__ = '1.0.0'
 __title__ = 'podrun'
 __uri__ = 'https://github.com/kschwab/podrun'
 __author__ = 'Kyle Schwab'
@@ -578,7 +578,7 @@ def _passthrough_has_exact(pt, value):
 def _passthrough_has_short_flag(pt, char):
     """Check if short flag *char* is present (handles combined flags like ``-it``)."""
     for a in pt:
-        if a.startswith('-') and not a.startswith('--'):
+        if a.startswith('-') and not a.startswith('--') and '=' not in a:
             if char in a[1:]:
                 return True
     return False
@@ -606,13 +606,16 @@ def _extract_passthrough_entrypoint(pt):
     return alt_entrypoint, filtered
 
 
-def _mount_target(mount_spec: str) -> Optional[str]:
-    """Extract the container target path from a ``--mount`` spec string."""
+def _parse_mount_spec(mount_spec: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse a ``--mount`` spec string into ``(source, target)``.
+
+    Handles standard key aliases: ``source``/``src`` and
+    ``target``/``dst``/``destination``.
+    """
     parts = dict(p.split('=', 1) for p in mount_spec.split(',') if '=' in p)
-    for key in ('target', 'dst', 'destination'):
-        if key in parts:
-            return parts[key]
-    return None
+    source = parts.get('source') or parts.get('src')
+    target = parts.get('target') or parts.get('dst') or parts.get('destination')
+    return source, target
 
 
 def _arg_mount_target(args: list, i: int) -> Tuple[Optional[str], int]:
@@ -624,9 +627,9 @@ def _arg_mount_target(args: list, i: int) -> Tuple[Optional[str], int]:
     arg = args[i]
     mount_m = re.match(r'^--mount=(.*)', arg)
     if mount_m:
-        return _mount_target(mount_m.group(1)), 1
+        return _parse_mount_spec(mount_m.group(1))[1], 1
     if arg == '--mount' and i + 1 < len(args):
-        return _mount_target(args[i + 1]), 2
+        return _parse_mount_spec(args[i + 1])[1], 2
     vol_m = re.match(r'^(-v|--volume)=(.*)', arg)
     if vol_m:
         parts = vol_m.group(2).split(':')
@@ -844,6 +847,34 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         # Opportunistic sudo setup (requires CAP_DAC_OVERRIDE to write sudoers)
         if command -v sudo > /dev/null 2>&1; then
           echo "{UNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers 2>/dev/null || true
+        fi
+
+        # Git submodule support: bridge core.worktree paths.
+        #
+        # When the workspace is a git submodule, the root .git/ is mounted
+        # at the correct relative position to the workspace (computed by
+        # podrun based on submodule depth).  Relative gitdir: pointers in
+        # nested .git files resolve correctly via the mount.
+        #
+        # However, nested submodule configs have core.worktree relative
+        # paths that resolve to the host layout path, not the container
+        # workspace.  A symlink bridges the gap.
+        #
+        # Self-contained: reads $PWD/.git, resolves the gitdir: pointer
+        # using cd to find the mounted .git, then creates the symlink.
+        if [ -f "$PWD/.git" ]; then
+          _gitdir_rel="$(sed -n 's/^gitdir: *//p' "$PWD/.git")"
+          _submod_path="${{_gitdir_rel##*.git/modules/}}"
+          if [ "$_submod_path" != "$_gitdir_rel" ] && [ -n "$_submod_path" ]; then
+            _git_prefix="${{_gitdir_rel%%/modules/*}}"
+            _git_dir="$(cd "$PWD/$_git_prefix" 2>/dev/null && pwd)" || true
+            if [ -d "$_git_dir" ]; then
+              _git_parent="${{_git_dir%/.git}}"
+              [ -z "$_git_parent" ] && _git_parent="/"
+              mkdir -p "$_git_parent/$(dirname "$_submod_path")"
+              ln -sfn "$PWD" "$_git_parent/$_submod_path"
+            fi
+          fi
         fi
 
         # Convenience symlink to workspace
@@ -1152,6 +1183,78 @@ def _interactive_overlay_args(ns, pt):
     return args
 
 
+def _resolve_git_submodule(workspace_src: str) -> Optional[str]:
+    """If workspace_src/.git is a submodule pointer file, return the resolved git dir.
+
+    Returns None if .git is a directory (normal repo) or doesn't exist.
+    """
+    dot_git = os.path.join(workspace_src, '.git')
+    if not os.path.isfile(dot_git):
+        return None
+    with open(dot_git) as f:
+        content = f.read().strip()
+    if not content.startswith('gitdir:'):
+        return None
+    rel_path = content[len('gitdir:') :].strip()
+    return str(pathlib.Path(dot_git).parent.joinpath(rel_path).resolve())
+
+
+def _find_root_git_dir(git_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """Find the root ``.git/`` directory from a resolved submodule git dir.
+
+    Git stores nested submodule git dirs under the root repo's ``.git/modules/``
+    tree.  This function walks up *git_dir* to find the enclosing ``.git``
+    directory component and returns ``(root_git_dir, subpath)`` where *subpath*
+    is the relative path from the root ``.git/`` to *git_dir*.
+
+    Returns ``(None, None)`` if no ``.git`` component is found.
+    """
+    parts = pathlib.PurePosixPath(git_dir).parts
+    for i, part in enumerate(parts):
+        if part == '.git':
+            root = str(pathlib.PurePosixPath(*parts[: i + 1]))
+            subpath = str(pathlib.PurePosixPath(*parts[i + 1 :])) if i + 1 < len(parts) else ''
+            return root, subpath
+    return None, None
+
+
+def _git_submodule_args(workspace_src: str, workspace_folder: str) -> list:
+    """Return podman args to mount the root ``.git/`` when *workspace_src* is a submodule.
+
+    The container mount target is computed dynamically based on the submodule
+    depth and the *workspace_folder* path.  The ``gitdir:`` relative pointer
+    in the ``.git`` file has a fixed number of ``../`` determined by the host
+    layout.  Walking up *workspace_folder* by the same count gives the correct
+    mount point so the pointer resolves inside the container.
+
+    The entrypoint creates a worktree bridge symlink so that ``core.worktree``
+    relative paths in nested submodule configs also resolve correctly.
+    No ``GIT_DIR``/``GIT_WORK_TREE`` env vars are needed.
+
+    Returns an empty list for normal repos or when the gitdir pointer is broken.
+    """
+    git_dir = _resolve_git_submodule(workspace_src)
+    if not git_dir or not os.path.isdir(git_dir):
+        return []
+    root_git, subpath = _find_root_git_dir(git_dir)
+    if not root_git or not subpath or not os.path.isdir(root_git):
+        return []
+    # subpath is like 'modules/simulation/plato/libs'; strip 'modules/' prefix
+    # to get the submodule's repo-relative path, then compute depth.
+    if not subpath.startswith('modules/'):
+        return []
+    submod_repo_path = subpath[len('modules/') :]
+    depth = len(pathlib.PurePosixPath(submod_repo_path).parts)
+    # Walk workspace_folder up by depth to find the container mount parent.
+    # PurePosixPath.parent stops at '/' (POSIX semantics), matching how
+    # ../../.. past / resolves to / in the container filesystem.
+    container_parent = pathlib.PurePosixPath(workspace_folder)
+    for _ in range(depth):
+        container_parent = container_parent.parent
+    container_git_mount = str(container_parent / '.git')
+    return [f'-v={root_git}:{container_git_mount}']
+
+
 def _host_overlay_args(ns, pt):
     """Build args for --host-overlay: overlay host system context onto container."""
     args = []
@@ -1168,6 +1271,8 @@ def _host_overlay_args(ns, pt):
         if workspace_folder not in _volume_mount_destinations(pt):
             args.append(f'-v={pathlib.Path.cwd()}:{workspace_folder}')
         args.append(f'-w={workspace_folder}')
+        if not ns.get('run.no_auto_resolve_git_submodules'):
+            args.extend(_git_submodule_args(str(pathlib.Path.cwd()), workspace_folder))
     if not _passthrough_has_exact(pt, '--env=TERM=xterm-256color'):
         args.append('--env=TERM=xterm-256color')
     if os.path.exists('/etc/localtime'):
@@ -1508,13 +1613,22 @@ def extract_podrun_config(devcontainer: dict) -> dict:
 def devcontainer_run_args(dc: dict, ns: dict) -> list:  # noqa: C901
     """Convert devcontainer.json top-level fields to podman run args.
 
-    Returns ``[]`` when the devcontainer CLI is driving
-    (``ns['internal.dc_from_cli']``), since it already emitted these args.
+    Returns only git-submodule args when the devcontainer CLI is driving
+    (``ns['internal.dc_from_cli']``), since the CLI already emitted the
+    standard dc fields but doesn't handle git submodule mounts.
     """
-    if ns.get('internal.dc_from_cli'):
-        return []
-
     args: list = []
+    workspace_mount = dc.get('workspaceMount')
+
+    # Git submodule: always emitted (devcontainer CLI doesn't handle this)
+    if not ns.get('run.no_auto_resolve_git_submodules'):
+        wm_source = _parse_mount_spec(workspace_mount)[0] if workspace_mount else None
+        workspace_folder = dc.get('workspaceFolder')
+        if wm_source and workspace_folder:
+            args.extend(_git_submodule_args(wm_source, workspace_folder))
+
+    if ns.get('internal.dc_from_cli'):
+        return args
 
     for mount in dc.get('mounts', []):
         if isinstance(mount, dict):
@@ -1538,7 +1652,6 @@ def devcontainer_run_args(dc: dict, ns: dict) -> list:  # noqa: C901
     for key, val in dc.get('containerEnv', {}).items():
         args.append(f'--env={key}={val}')
 
-    workspace_mount = dc.get('workspaceMount')
     if workspace_mount:
         args.append(f'--mount={workspace_mount}')
 
@@ -1979,6 +2092,7 @@ _RUN_CONFIG_MAP = {
     'autoReplace': 'run.auto_replace',
     'fuseOverlayfs': 'run.fuse_overlayfs',
     'dotFilesOverlay': 'run.dot_files_overlay',
+    'noAutoResolveGitSubmodules': 'run.no_auto_resolve_git_submodules',
     'exports': 'run.export',
 }
 
@@ -2041,9 +2155,8 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
 
     # workspace_folder override: workspaceMount target takes priority
     ws_mount = dc.get('workspaceMount')
-    if ws_mount and '=' in ws_mount:
-        parts = dict(p.split('=', 1) for p in ws_mount.split(',') if '=' in p)
-        target = parts.get('target', '')
+    if ws_mount:
+        _, target = _parse_mount_spec(ws_mount)
         if target:
             ns['dc.workspace_folder'] = target
 
@@ -2570,6 +2683,13 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         action='store_true',
         default=None,
         help='Mount host dotfiles into container (implies --user-overlay)',
+    )
+    opts.add_argument(
+        '--no-auto-resolve-git-submodules',
+        dest='run.no_auto_resolve_git_submodules',
+        action='store_true',
+        default=None,
+        help='Disable automatic git submodule resolution and mounting',
     )
     opts.add_argument(
         '--print-overlays',

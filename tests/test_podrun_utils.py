@@ -218,6 +218,13 @@ class TestPassthroughHasShortFlag:
     def test_ignores_long_flags(self):
         assert not _passthrough_has_short_flag(['--interactive'], 'i')
 
+    def test_ignores_value_flag_equals_form(self):
+        assert not _passthrough_has_short_flag(['-v=/path/containing/it'], 'i')
+        assert not _passthrough_has_short_flag(['-v=/path/containing/it'], 't')
+
+    def test_ignores_short_value_flag_with_equals(self):
+        assert not _passthrough_has_short_flag(['-l=value'], 'l')
+
 
 class TestExtractPassthroughEntrypoint:
     def test_equals_form(self):

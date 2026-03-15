@@ -113,6 +113,17 @@ class TestGenerateRunEntrypoint:
             content = f.read()
         assert f'touch {PODRUN_READY_PATH}' in content
 
+    def test_git_submodule_worktree_bridge(self):
+        """Entrypoint derives submodule path from .git file and creates worktree symlink."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        # Self-contained: reads $PWD/.git, resolves mount location, creates symlink
+        assert '[ -f "$PWD/.git" ]' in content
+        assert '.git/modules/' in content
+        assert 'cd "$PWD/$_git_prefix"' in content
+        assert 'ln -sfn "$PWD" "$_git_parent/$_submod_path"' in content
+
     def test_alt_entrypoint_handling(self):
         path = generate_run_entrypoint(_default_ns())
         with open(path) as f:

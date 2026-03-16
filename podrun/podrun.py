@@ -7,8 +7,22 @@
 """
 podrun
 ######
+
+A podman run superset with host identity overlays.
 """
 
+# To install latest version of podrun (script only):
+# wget -nv https://raw.githubusercontent.com/kschwab/podrun/main/podrun/podrun.py -O podrun && chmod a+x podrun
+
+# To install specific version of podrun (script only):
+# wget -nv https://raw.githubusercontent.com/kschwab/podrun/<VERSION>/podrun/podrun.py -O podrun && chmod a+x podrun
+
+# SemVer 2.0.0 (https://github.com/semver/semver/blob/master/semver.md)
+# Given a version number MAJOR.MINOR.PATCH, increment the:
+#  1. MAJOR version when you make incompatible API changes
+#  2. MINOR version when you add functionality in a backwards compatible manner
+#  3. PATCH version when you make backwards compatible bug fixes
+# Additional labels for pre-release and build metadata are available as extensions to the MAJOR.MINOR.PATCH format.
 __version__ = '1.0.0'
 __title__ = 'podrun'
 __uri__ = 'https://github.com/kschwab/podrun'

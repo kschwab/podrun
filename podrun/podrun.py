@@ -40,6 +40,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -324,7 +325,7 @@ def _default_podman_path():
     if env_path:
         resolved = shutil.which(env_path)
         if not resolved:
-            print(f"Error: {ENV_PODRUN_PODMAN_PATH}='{env_path}' not found.", file=sys.stderr)
+            print(f'Error: {ENV_PODRUN_PODMAN_PATH}={env_path!r} not found.', file=sys.stderr)
             sys.exit(1)
         return resolved
     if os.environ.get(ENV_PODRUN_PODMAN_REMOTE):
@@ -1710,7 +1711,6 @@ def _socket_is_alive(sock, pid_file):
 
 def _wait_for_socket(sock, timeout=10):
     """Block until the socket file appears or timeout."""
-    import time
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -2425,7 +2425,7 @@ def _normalize_bool_flags(argv: List[str], bool_flags: frozenset) -> List[str]:
                 if value.lower() in _BOOL_TRUE:
                     result.append(name)
                 elif value.lower() in _BOOL_FALSE:
-                    pass  # Remove the flag entirely
+                    pass
                 else:
                     result.append(arg)  # Unknown value, pass through as-is
                 continue
@@ -3832,7 +3832,7 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     # Set run.image for _env_args (image ref parsing for PODRUN_IMG_* env vars)
     ns['run.image'] = ctx.trailing_args[0]
 
-    # Default prompt banner to image name (matches old_podrun.py fallback chain)
+    # Default prompt banner to image name
     if not ns.get('run.prompt_banner'):
         ns['run.prompt_banner'] = ns['run.image']
 

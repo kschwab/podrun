@@ -8,6 +8,7 @@
     "customizations": {
         "podrun": {
             "hostOverlay": true,
+            "dotFilesOverlay": true,
             "login": true,
             "autoAttach": true,
             "podmanRemote": true,

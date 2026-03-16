@@ -671,7 +671,7 @@ class TestResolveConfig:
         assert r.ns.get('run.session') is True
 
     def test_overlay_implication_adhoc(self, monkeypatch):
-        """adhoc implies session → host+interactive → user."""
+        """adhoc implies session → host+interactive+dotfiles → user (all on)."""
         r = self._resolve(
             ['--no-devconfig', 'run', '--adhoc', 'alpine'],
             monkeypatch,
@@ -680,26 +680,59 @@ class TestResolveConfig:
         assert r.ns.get('run.session') is True
         assert r.ns.get('run.host_overlay') is True
         assert r.ns.get('run.interactive_overlay') is True
+        assert r.ns.get('run.dot_files_overlay') is True
         assert r.ns.get('run.user_overlay') is True
 
     def test_overlay_implication_session(self, monkeypatch):
-        """session implies host+interactive → user."""
+        """session implies host+interactive+dotfiles → user; adhoc stays off."""
         r = self._resolve(
             ['--no-devconfig', 'run', '--session', 'alpine'],
             monkeypatch,
         )
+        assert r.ns.get('run.adhoc') is None
         assert r.ns.get('run.session') is True
         assert r.ns.get('run.host_overlay') is True
         assert r.ns.get('run.interactive_overlay') is True
+        assert r.ns.get('run.dot_files_overlay') is True
         assert r.ns.get('run.user_overlay') is True
 
     def test_overlay_implication_host(self, monkeypatch):
-        """host-overlay implies user."""
+        """host-overlay implies user only; session/interactive/dotfiles stay off."""
         r = self._resolve(
             ['--no-devconfig', 'run', '--host-overlay', 'alpine'],
             monkeypatch,
         )
+        assert r.ns.get('run.adhoc') is None
+        assert r.ns.get('run.session') is None
         assert r.ns.get('run.host_overlay') is True
+        assert r.ns.get('run.interactive_overlay') is None
+        assert r.ns.get('run.dot_files_overlay') is None
+        assert r.ns.get('run.user_overlay') is True
+
+    def test_overlay_implication_dotfiles(self, monkeypatch):
+        """dot-files-overlay implies user only; host/session/interactive stay off."""
+        r = self._resolve(
+            ['--no-devconfig', 'run', '--dot-files-overlay', 'alpine'],
+            monkeypatch,
+        )
+        assert r.ns.get('run.adhoc') is None
+        assert r.ns.get('run.session') is None
+        assert r.ns.get('run.host_overlay') is None
+        assert r.ns.get('run.interactive_overlay') is None
+        assert r.ns.get('run.dot_files_overlay') is True
+        assert r.ns.get('run.user_overlay') is True
+
+    def test_overlay_implication_user_only(self, monkeypatch):
+        """user-overlay alone; nothing else implied."""
+        r = self._resolve(
+            ['--no-devconfig', 'run', '--user-overlay', 'alpine'],
+            monkeypatch,
+        )
+        assert r.ns.get('run.adhoc') is None
+        assert r.ns.get('run.session') is None
+        assert r.ns.get('run.host_overlay') is None
+        assert r.ns.get('run.interactive_overlay') is None
+        assert r.ns.get('run.dot_files_overlay') is None
         assert r.ns.get('run.user_overlay') is True
 
     def test_image_resolution_cli_wins(self, monkeypatch, tmp_project):

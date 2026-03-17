@@ -124,6 +124,25 @@ class TestParseConfigTokens:
         with pytest.raises(SystemExit):
             parse_config_tokens(['--no-devconfig', '--name', 'test'])
 
+    def test_volume_equals_form_not_consumed_as_version(self):
+        """-v=/host:/ctr is a volume mount, not --version."""
+        ns, pt = parse_config_tokens(['-v=/host/path:/ctr/path'])
+        assert ns.get('root.version') is None
+        assert '-v' in pt
+        assert '/host/path:/ctr/path' in pt
+
+    def test_volume_space_form_not_consumed_as_version(self):
+        """-v /host:/ctr (space-separated) is a volume mount, not --version."""
+        ns, pt = parse_config_tokens(['-v', '/host/path:/ctr/path'])
+        assert ns.get('root.version') is None
+        assert '-v' in pt
+        assert '/host/path:/ctr/path' in pt
+
+    def test_standalone_v_is_version(self):
+        """-v alone is --version."""
+        ns, pt = parse_config_tokens(['-v'])
+        assert ns.get('root.version') is True
+
 
 # ---------------------------------------------------------------------------
 # TestStripJsonc
@@ -820,8 +839,8 @@ class TestResolveConfig:
         # resolve_config doesn't set the /app default; _handle_run does
         assert r.ns.get('dc.workspace_folder') is None
 
-    def test_remote_env_from_devcontainer(self, monkeypatch, tmp_project):
-        """Top-level remoteEnv from devcontainer.json is picked up."""
+    def test_container_env_from_devcontainer(self, monkeypatch, tmp_project):
+        """Top-level containerEnv from devcontainer.json is picked up."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -829,12 +848,41 @@ class TestResolveConfig:
             json.dumps(
                 {
                     'image': 'alpine',
-                    'remoteEnv': {'FOO': 'bar', 'BAZ': 'qux'},
+                    'containerEnv': {'FOO': 'bar', 'BAZ': 'qux'},
                 }
             )
         )
         r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
-        assert r.ns['run.remote_env'] == {'FOO': 'bar', 'BAZ': 'qux'}
+        assert r.ns['run.container_env'] == {'FOO': 'bar', 'BAZ': 'qux'}
+
+    def test_podrun_customizations_vars_expanded(self, monkeypatch, tmp_project):
+        """Variables in customizations.podrun are expanded."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'containerEnv': {'FOO': 'bar', 'BAZ': 'qux'},
+                    'workspaceFolder': '/workspace',
+                    'customizations': {
+                        'podrun': {
+                            'exports': [
+                                '${localWorkspaceFolder}/.aws:/workspace/.aws',
+                            ],
+                            'name': '${localWorkspaceFolderBasename}-dev',
+                        }
+                    },
+                }
+            )
+        )
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns['dc.container_env'] == {'FOO': 'bar', 'BAZ': 'qux'}
+        project_dir = str(tmp_project)
+        exports = r.ns.get('run.export') or []
+        assert any(project_dir in e for e in exports)
+        assert r.ns['run.name'] == f'{tmp_project.name}-dev'
 
     def test_store_not_autodiscovered_in_resolve_config(self, monkeypatch):
         """Store auto-discovery is handled by _resolve_store, not resolve_config."""
@@ -1792,7 +1840,7 @@ class TestDevcontainerCliDetection:
         dc = {
             'image': 'alpine',
             'workspaceFolder': '/workspace',
-            'remoteEnv': {'FOO': 'bar'},
+            'containerEnv': {'FOO': 'bar'},
         }
         dc_file.write_text(json.dumps(dc))
         r = self._resolve(
@@ -1801,7 +1849,7 @@ class TestDevcontainerCliDetection:
         )
         # dc.* fields are populated for internal use (PODRUN_WORKDIR, etc.)
         assert r.ns.get('dc.workspace_folder') == '/workspace'
-        assert r.ns.get('dc.remote_env') == {'FOO': 'bar'}
+        assert r.ns.get('dc.container_env') == {'FOO': 'bar'}
         # But the internal flag is set to suppress arg emission
         assert r.ns.get('internal.dc_from_cli') is True
 
@@ -1854,8 +1902,8 @@ class TestVariableExpansionIntegration:
         expected_mount = f'--mount=type=bind,src={tmp_project}/data,dst=/data'
         assert expected_mount in pt
 
-    def test_remote_env_variable_expanded(self, monkeypatch, tmp_project):
-        """Variables in remoteEnv are expanded."""
+    def test_container_env_variable_expanded(self, monkeypatch, tmp_project):
+        """Variables in containerEnv are expanded."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -1863,12 +1911,12 @@ class TestVariableExpansionIntegration:
             json.dumps(
                 {
                     'image': 'alpine',
-                    'remoteEnv': {'PROJECT': '${localWorkspaceFolder}'},
+                    'containerEnv': {'PROJECT': '${localWorkspaceFolder}'},
                 }
             )
         )
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
-        assert r.ns['run.remote_env'] == {'PROJECT': str(tmp_project)}
+        assert r.ns['run.container_env'] == {'PROJECT': str(tmp_project)}
 
     def test_no_devconfig_skips_expansion(self, monkeypatch):
         """--no-devconfig produces no variable expansion errors."""

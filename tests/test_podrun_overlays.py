@@ -590,8 +590,8 @@ class TestEnvArgs:
         img_args = [a for a in args if 'PODRUN_IMG' in a]
         assert img_args == []
 
-    def test_remote_env(self):
-        ns = {'run.remote_env': {'FOO': 'bar', 'BAZ': 'qux'}}
+    def test_container_env(self):
+        ns = {'run.container_env': {'FOO': 'bar', 'BAZ': 'qux'}}
         args = _env_args(ns)
         assert '--env=FOO=bar' in args
         assert '--env=BAZ=qux' in args

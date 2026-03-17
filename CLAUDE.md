@@ -362,6 +362,99 @@ When writing new tests:
 5. `PODRUN_TMP` is already redirected to `tmp_path` — no need for class-level
    `_tmp_dir` fixtures unless adding extra mocking.
 
+#### Phase 2.12: Cross-Platform Support (Linux + Windows) ✓
+
+Make `pip install podrun` + `dev.containers.dockerPath: podrun` work on
+Windows, where podman is always `podman-remote` talking to a podman machine
+(WSL2 VM).
+**Status: Complete — all 1699 tests pass on Linux, 95% coverage maintained.**
+
+| Item | Notes |
+|---|---|
+| `_IS_WINDOWS` | `sys.platform == 'win32'` constant, checked at module level |
+| Conditional `pwd` import | `pwd` only imported on POSIX; `getpass` + `tempfile` added unconditionally |
+| Identity constants | Windows: `getpass.getuser()`, `os.path.expanduser('~')`, `PODRUN_UID`/`PODRUN_GID` env var overrides; POSIX: `os.getuid()`/`pwd` as before |
+| `_IS_WINDOWS` → `_is_remote()` cascade | `_is_remote()` returns True on Windows, activating all existing remote-mode guards (store, subids, overlay mounts) |
+| `_flags_cache_dir()` | Windows: `%LOCALAPPDATA%/podrun`; POSIX: `$XDG_CACHE_HOME/podrun` |
+| `_shell_quote()` | Cross-platform shell quoting: `shlex.quote` on POSIX, double-quote wrapping on Windows. Replaces all `shlex.quote` calls in `run_os_cmd` construction |
+| `_exec_or_subprocess()` | Windows: `subprocess.run` + `sys.exit`; POSIX: `os.execvpe`. Replaces all 3 `os.execvpe` call sites |
+| `_clean_stale_files()` | Cross-platform Python replacement for `find -mtime +1 -delete` |
+| `_PODRUN_STORES_DIR` | Windows: `tempfile.gettempdir()/podrun-stores`; defensive only (unreachable via `_is_remote`) |
+| `_podman_remote_args()` | Windows: skip Unix socket mounting, forward `CONTAINER_HOST` if set |
+| `_host_overlay_args()` | Windows: skip `--network=host` (conflicts with `--userns=keep-id` on podman machine; "host" means the VM, not Windows) |
+| `generate_rc_sh()` | Windows: `platform.processor()` + `os.cpu_count()` instead of `grep /proc/cpuinfo` |
+| `run_config_scripts()` | Windows: skip shell scripts with warning |
+| `_expand_tilde_prefix()` | Replaces `re.sub(r'^~', USER_HOME, ...)` — Windows `USER_HOME` has backslashes (`C:\Users\...`) that break regex replacement |
+| `_write_sha_file()` | Always overwrites (no `if not exists` guard); prevents stale files with wrong line endings |
+| All `open(..., 'w')` calls | Added `encoding='utf-8', newline='\n'` to all 3 write sites — prevents `\r\n` on Windows (scripts run inside Linux containers) |
+| `conftest.py` | Top-level `pytest.skip` on Windows (tests require Linux + podman binaries) |
+| `pyproject.toml` | Added `Operating System` classifiers for Linux, Windows 10, Windows 11 |
+
+Key decisions:
+- **`_is_remote()` is the cascade key** — returning True on Windows activates all existing remote-mode guards: `_apply_store` skips `_resolve_store`, `_handle_run` skips `_warn_missing_subids` and `_resolve_overlay_mounts`, `_filter_global_args` filters incompatible flags
+- **`--network=host` skipped on Windows** — on podman machine, "host network" means the WSL2 VM network (not Windows host), and it conflicts with `--userns=keep-id` (kernel refuses sysfs remount when user ns doesn't own network ns: `crun: mount 'sysfs' to 'sys': Operation not permitted`)
+- **`_expand_tilde_prefix()` replaces regex** — `re.sub(r'^~', USER_HOME, s)` crashes on Windows because `C:\Users\...` has `\U` which `re` interprets as an invalid escape sequence in the replacement string
+- **`_write_sha_file` always overwrites** — the `if not os.path.exists` guard caused stale files with wrong line endings to persist across the `newline='\n'` fix. Since files are content-addressed (SHA in filename) and `__version__` is embedded in script content, different podrun versions produce different hashes and never conflict. The I/O cost of always writing a few KB is negligible
+- **`newline='\n'` on all writes** — entrypoint scripts, rc.sh, and copy-staging descriptors all run inside Linux containers. Python's default text mode on Windows translates `\n` → `\r\n`, producing `#!/bin/sh\r` shebangs that Linux interprets as "file not found" (`catatonit: failed to exec pid1: No such file or directory`)
+- **Container-side paths are NOT changed** — `/.podrun/*`, `/home/{UNAME}`, entrypoint scripts all use POSIX string literals. `os.path` is only used for host-side paths. No `pathlib` migration needed
+- **Tests remain Linux-only** — the test suite depends on podman binaries, Unix permissions, and Linux-specific paths. `conftest.py` skips the entire suite on Windows
+
+Code that does NOT need Windows changes:
+
+| Area | Why it's fine |
+|------|---------------|
+| Entrypoint scripts | Run inside Linux containers, not on Windows host |
+| Container-side paths (`/.podrun/*`, `/home/{UNAME}`) | String literals, not `os.path` |
+| `/etc/localtime` mount | `os.path.exists` returns False on Windows — auto-skip |
+| X11 forwarding | `/tmp/.X11-unix` doesn't exist on Windows — auto-skip |
+| `_warn_missing_subids` | Gated by `_is_remote` — skipped on Windows |
+| Store lifecycle | Gated by `_apply_store` + `_is_remote` — skipped |
+| `os.chmod(path, 0o755)` | No-op for execute bit on Windows, doesn't crash |
+| `shutil.which('podman')` | Finds `podman.exe` on Windows automatically |
+
+### Windows + Podman Machine Setup Notes
+
+#### Corporate registry TLS certificates
+
+Podman machine (WSL2 VM) has its own certificate store, separate from Windows.
+`podman login` may succeed (uses Windows TLS stack) while `podman pull` fails
+with `x509: certificate signed by unknown authority` (uses VM's store).
+
+**Quick workaround — mark registry as insecure:**
+
+```bash
+# From PowerShell:
+podman machine ssh
+
+# Inside the podman machine:
+sudo mkdir -p /etc/containers/registries.conf.d
+sudo bash -c 'printf "[[registry]]\nlocation = \"your-registry.example.com\"\ninsecure = true\n" > /etc/containers/registries.conf.d/corp.conf'
+
+# Exit and restart the machine:
+exit
+podman machine stop
+podman machine start
+```
+
+**Proper fix — add the CA cert to the podman machine:**
+
+```bash
+podman machine ssh
+
+# If openssl is available:
+openssl s_client -connect your-registry.example.com:443 -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -outform PEM \
+  | sudo tee /etc/pki/ca-trust/source/anchors/corporate-ca.crt
+sudo update-ca-trust
+
+# Or pipe the cert from Windows:
+exit
+cat C:\path\to\corporate-ca.crt | podman machine ssh "sudo tee /etc/pki/ca-trust/source/anchors/corporate-ca.crt && sudo update-ca-trust"
+```
+
+Note: `update-ca-trust` is for Fedora CoreOS (default podman machine). Use
+`update-ca-certificates` for Debian/Ubuntu-based machines.
+
 ### Phase 3 — Live Testing + Bug Fixes
 
 Live container integration tests and bug fixes discovered during end-to-end

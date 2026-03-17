@@ -41,32 +41,44 @@ https://github.com/kschwab/podrun/blob/main/LICENSE.md"""
 
 import argparse
 import dataclasses
+import getpass
 import hashlib
 import json
 import os
 import pathlib
 import platform
-import pwd
 import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from typing import List, Optional, Tuple
+
+_IS_WINDOWS = sys.platform == 'win32'
+
+if not _IS_WINDOWS:
+    import pwd
 
 # ---------------------------------------------------------------------------
 # Identity and path constants
 # ---------------------------------------------------------------------------
 
-UID = os.getuid()
-GID = os.getgid()
-UNAME = pwd.getpwuid(UID).pw_name
-USER_HOME = pwd.getpwuid(UID).pw_dir
-
-PODRUN_TMP = os.path.join(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/podrun-{UID}'), 'podrun')
+if _IS_WINDOWS:
+    UID = int(os.environ.get('PODRUN_UID', '1000'))
+    GID = int(os.environ.get('PODRUN_GID', '1000'))
+    UNAME = getpass.getuser()
+    USER_HOME = os.path.expanduser('~')
+    PODRUN_TMP = os.path.join(tempfile.gettempdir(), f'podrun-{UNAME}', 'podrun')
+else:
+    UID = os.getuid()
+    GID = os.getgid()
+    UNAME = pwd.getpwuid(UID).pw_name
+    USER_HOME = pwd.getpwuid(UID).pw_dir
+    PODRUN_TMP = os.path.join(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/podrun-{UID}'), 'podrun')
 PODRUN_RC_PATH = '/.podrun/rc.sh'
 PODRUN_ENTRYPOINT_PATH = '/.podrun/run-entrypoint.sh'
 PODRUN_EXEC_ENTRY_PATH = '/.podrun/exec-entrypoint.sh'
@@ -186,8 +198,15 @@ def get_podman_version(podman_path):
 
 
 def _flags_cache_dir():
-    """Return ``$XDG_CACHE_HOME/podrun`` or ``~/.cache/podrun``."""
-    base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
+    """Return the platform-appropriate podrun cache directory.
+
+    Linux: ``$XDG_CACHE_HOME/podrun`` or ``~/.cache/podrun``
+    Windows: ``%LOCALAPPDATA%/podrun`` or ``~/podrun``
+    """
+    if _IS_WINDOWS:
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    else:
+        base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
     return os.path.join(base, 'podrun')
 
 
@@ -259,7 +278,7 @@ def _write_flags_cache(path, flags):
     }
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
             json.dump(data, f, indent=2)
     except OSError:
         pass
@@ -308,6 +327,23 @@ def load_podman_flags(podman_path=None):
 # ---------------------------------------------------------------------------
 
 
+def _shell_quote(s: str) -> str:
+    """Quote a string for the platform's shell.
+
+    On POSIX, delegates to ``shlex.quote`` (single-quote wrapping).
+    On Windows, wraps in double quotes with internal double-quotes escaped
+    (``cmd.exe`` convention).
+    """
+    if not _IS_WINDOWS:
+        return shlex.quote(s)
+    if not s:
+        return '""'
+    # If it contains no special characters, return as-is.
+    if not any(c in s for c in ' \t"&|<>^%'):
+        return s
+    return '"' + s.replace('"', '\\"') + '"'
+
+
 def run_os_cmd(cmd: str, env: Optional[dict] = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -317,6 +353,39 @@ def run_os_cmd(cmd: str, env: Optional[dict] = None) -> subprocess.CompletedProc
         universal_newlines=True,
         env=env,
     )
+
+
+def _exec_or_subprocess(cmd: List[str], env: dict) -> None:
+    """Replace the current process with *cmd*, or use subprocess on Windows.
+
+    On POSIX, calls ``os.execvpe`` (never returns).
+    On Windows, ``os.execvpe`` is unreliable — use ``subprocess.run`` instead.
+    """
+    if _IS_WINDOWS:
+        result = subprocess.run(cmd, env=env)
+        sys.exit(result.returncode)
+    else:
+        os.execvpe(cmd[0], cmd, env)
+
+
+def _clean_stale_files(directory: str, max_age_days: int = 1) -> None:
+    """Remove files older than *max_age_days* from *directory*.
+
+    Cross-platform replacement for ``find <dir> -mtime +N -delete``.
+    Silently ignores errors (missing directory, permission denied, etc.).
+    """
+    try:
+        cutoff = time.time() - max_age_days * 86400
+        for dirpath, _dirnames, filenames in os.walk(directory, topdown=False):
+            for name in filenames:
+                fpath = os.path.join(dirpath, name)
+                try:
+                    if os.path.getmtime(fpath) < cutoff:
+                        os.unlink(fpath)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def _default_podman_path():
@@ -366,10 +435,13 @@ def _default_podman_path():
 def _is_remote(podman_path: str) -> bool:
     """Return True when operating as a remote podman client.
 
-    True when the binary is ``podman-remote`` *or* when ``CONTAINER_HOST``
-    is set (which causes even the full ``podman`` binary to act as a remote
-    client with a reduced flag set).
+    True on Windows (podman is always remote via podman machine), when the
+    binary is ``podman-remote``, or when ``CONTAINER_HOST`` is set (which
+    causes even the full ``podman`` binary to act as a remote client with a
+    reduced flag set).
     """
+    if _IS_WINDOWS:
+        return True
     return os.path.basename(podman_path) == 'podman-remote' or bool(
         os.environ.get('CONTAINER_HOST')
     )
@@ -419,7 +491,13 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
 
     tokens: List[str] = []
     for path in script_paths:
-        out = run_os_cmd(shlex.quote(path), env=env)
+        if _IS_WINDOWS:
+            print(
+                f'podrun: warning: --config-script {path} skipped on Windows',
+                file=sys.stderr,
+            )
+            continue
+        out = run_os_cmd(_shell_quote(path), env=env)
         if out.returncode != 0:
             print(
                 f'Error: --config-script {path} failed (exit {out.returncode}):\n{out.stderr}',
@@ -430,7 +508,7 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
     return tokens
 
 
-def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]:
+def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]:  # noqa: C901
     """Parse config tokens through root + run parsers.
 
     Returns (config_ns_dict, podman_passthrough).
@@ -454,6 +532,24 @@ def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Disambiguate -v: on the root parser -v is --version (boolean), but
+    # podman run uses -v as --volume (value).  Config scripts commonly emit
+    # -v=<host>:<ctr> or -v <host>:<ctr>.  Extract these before parsing and
+    # inject them directly into passthrough output.
+    volume_passthrough: List[str] = []
+    remaining: List[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i].startswith('-v='):
+            volume_passthrough.extend(['-v', tokens[i][3:]])
+        elif tokens[i] == '-v' and i + 1 < len(tokens) and ':' in tokens[i + 1]:
+            volume_passthrough.extend(['-v', tokens[i + 1]])
+            i += 1
+        else:
+            remaining.append(tokens[i])
+        i += 1
+    tokens = remaining
 
     root = build_root_parser(flags)
 
@@ -493,9 +589,9 @@ def parse_config_tokens(tokens: List[str], flags=None) -> Tuple[dict, List[str]]
                 continue
             config_ns[k] = v
 
-    # Podman passthrough = unknowns from the run parser + any run.passthrough_args
+    # Podman passthrough = extracted volumes + unknowns + run.passthrough_args
     run_passthrough = run_dict.get('run.passthrough_args') or []
-    podman_passthrough = podman_passthrough + run_passthrough
+    podman_passthrough = volume_passthrough + podman_passthrough + run_passthrough
 
     return config_ns, podman_passthrough
 
@@ -563,15 +659,19 @@ def _parse_image_ref(image: str) -> Tuple[str, str, str]:
 
 
 def _write_sha_file(content: str, prefix: str, suffix: str) -> str:
-    """Write content to a SHA-named file in PODRUN_TMP.  Idempotent."""
+    """Write content to a SHA-named file in PODRUN_TMP.
+
+    Always overwrites — the files are small and avoiding staleness
+    (e.g. wrong line endings from a previous platform) is worth the
+    negligible I/O cost.
+    """
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:12]
     filename = f'{prefix}{content_hash}{suffix}'
     path = os.path.join(PODRUN_TMP, filename)
-    if not os.path.exists(path):
-        pathlib.Path(PODRUN_TMP).mkdir(parents=True, exist_ok=True)
-        with open(path, 'w') as f:
-            f.write(content)
-        os.chmod(path, 0o755)
+    pathlib.Path(PODRUN_TMP).mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(content)
+    os.chmod(path, 0o755)
     return path
 
 
@@ -673,6 +773,15 @@ def _volume_mount_destinations(*arg_lists) -> set:
 # ---------------------------------------------------------------------------
 
 
+def _expand_tilde_prefix(s: str, home: str) -> str:
+    """Replace a leading ``~`` or ``~/`` with *home*."""
+    if s == '~':
+        return home
+    if s.startswith('~/') or s.startswith('~\\'):
+        return home + s[1:]
+    return s
+
+
 def _expand_volume_tilde(args: list) -> list:
     """Expand ``~`` in ``-v``/``--volume`` arguments.
 
@@ -682,6 +791,7 @@ def _expand_volume_tilde(args: list) -> list:
     Handles both equals form (``-v=~/src:/dst``) and space-separated
     form (``-v``, ``~/src:/dst``) as produced by ``_PassthroughAction``.
     """
+    container_home = f'/home/{UNAME}'
     result = []
     i = 0
     while i < len(args):
@@ -692,10 +802,10 @@ def _expand_volume_tilde(args: list) -> list:
             flag = m.group(1)
             parts = m.group(2).split(':')
             if len(parts) >= 2:
-                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
-                parts[1] = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
+                parts[1] = _expand_tilde_prefix(parts[1], container_home)
             elif len(parts) == 1:
-                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
             result.append(f'{flag}={":".join(parts)}')
             i += 1
             continue
@@ -704,10 +814,10 @@ def _expand_volume_tilde(args: list) -> list:
             val = args[i + 1]
             parts = val.split(':')
             if len(parts) >= 2:
-                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
-                parts[1] = re.sub(r'^~', f'/home/{UNAME}', parts[1])
+                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
+                parts[1] = _expand_tilde_prefix(parts[1], container_home)
             elif len(parts) == 1:
-                parts[0] = re.sub(r'^~', USER_HOME, parts[0])
+                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
             result.append(arg)
             result.append(':'.join(parts))
             i += 2
@@ -722,14 +832,15 @@ def _expand_export_tilde(exports: list) -> list:
 
     Host ``~`` expands to USER_HOME, container ``~`` expands to ``/home/{UNAME}``.
     """
+    container_home = f'/home/{UNAME}'
     result = []
     for entry in exports:
         parts = entry.split(':')
         if len(parts) >= 2:
-            parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
-            parts[1] = re.sub(r'^~', USER_HOME, parts[1])
+            parts[0] = _expand_tilde_prefix(parts[0], container_home)
+            parts[1] = _expand_tilde_prefix(parts[1], USER_HOME)
         elif len(parts) == 1:
-            parts[0] = re.sub(r'^~', f'/home/{UNAME}', parts[0])
+            parts[0] = _expand_tilde_prefix(parts[0], container_home)
         result.append(':'.join(parts))
     return result
 
@@ -814,6 +925,67 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
             '          if command -v bash > /dev/null 2>&1; then\n'
             '            SHELL="$(command -v bash)"; export SHELL\n'
             '          fi\n'
+            '        fi'
+        )
+
+    # Build cap-drop + exec block (8-space indent to match template)
+    if caps_to_drop:
+        short_drop = ','.join(
+            '-' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop
+        )
+        long_drop = ','.join(
+            '-cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop
+        )
+        cap_names = ' '.join(
+            'cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop
+        )
+        cap_drop_block = (
+            '        # Drop bootstrap capabilities before exec.\n'
+            '        # Probe short names first (BusyBox), fall back to cap_ prefix (util-linux).\n'
+            '        # Drop from both inheritable and ambient sets so effective caps\n'
+            '        # are cleared after exec (ambient caps drive effective in userns).\n'
+            '        if command -v setpriv > /dev/null 2>&1; then\n'
+            f'          _drop="{short_drop}"\n'
+            '          if ! setpriv --inh-caps="$_drop" --ambient-caps="$_drop" true 2>/dev/null; then\n'
+            f'            _drop="{long_drop}"\n'
+            '          fi\n'
+            '          if [ $# -eq 0 ]; then\n'
+            '            exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" $SHELL\n'
+            '          else\n'
+            '            exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" "$@"\n'
+            '          fi\n'
+            '        elif command -v capsh > /dev/null 2>&1; then\n'
+            '          # capsh uses cap_xxx names; --delamb removes from ambient,\n'
+            '          # --drop removes from bounding.\n'
+            '          _capsh_args=""\n'
+            '          # shellcheck disable=SC2043\n'
+            f'          for _cap in {cap_names}; do\n'
+            '            _capsh_args="$_capsh_args --delamb=$_cap --drop=$_cap"\n'
+            '          done\n'
+            '          # shellcheck disable=SC2086\n'
+            '          if [ $# -eq 0 ]; then\n'
+            '            exec capsh $_capsh_args -- -c "exec $SHELL"\n'
+            '          else\n'
+            '            _quoted=""\n'
+            '            for _arg in "$@"; do\n'
+            '              _quoted="$_quoted \'$_arg\'"\n'
+            '            done\n'
+            '            exec capsh $_capsh_args -- -c "exec $_quoted"\n'
+            '          fi\n'
+            '        else\n'
+            '          if [ $# -eq 0 ]; then\n'
+            '            exec $SHELL\n'
+            '          else\n'
+            '            exec "$@"\n'
+            '          fi\n'
+            '        fi'
+        )
+    else:
+        cap_drop_block = (
+            '        if [ $# -eq 0 ]; then\n'
+            '          exec $SHELL\n'
+            '        else\n'
+            '          exec "$@"\n'
             '        fi'
         )
 
@@ -920,45 +1092,7 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
           set -- "$PODRUN_ALT_ENTRYPOINT" "$@"
         fi
 
-        # Drop bootstrap capabilities before exec.
-        # Probe short names first (BusyBox), fall back to cap_ prefix (util-linux).
-        # Drop from both inheritable and ambient sets so effective caps
-        # are cleared after exec (ambient caps drive effective in userns).
-        if command -v setpriv > /dev/null 2>&1; then
-          _drop="{','.join('-' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}"
-          if ! setpriv --inh-caps="$_drop" --ambient-caps="$_drop" true 2>/dev/null; then
-            _drop="{','.join('-cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}"
-          fi
-          if [ $# -eq 0 ]; then
-            exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" $SHELL
-          else
-            exec setpriv --inh-caps="$_drop" --ambient-caps="$_drop" "$@"
-          fi
-        elif command -v capsh > /dev/null 2>&1; then
-          # capsh uses cap_xxx names; --delamb removes from ambient,
-          # --drop removes from bounding.
-          _capsh_args=""
-          # shellcheck disable=SC2043
-          for _cap in {' '.join('cap_' + (c[4:] if c.startswith('CAP_') else c).lower() for c in caps_to_drop)}; do
-            _capsh_args="$_capsh_args --delamb=$_cap --drop=$_cap"
-          done
-          # shellcheck disable=SC2086
-          if [ $# -eq 0 ]; then
-            exec capsh $_capsh_args -- -c "exec $SHELL"
-          else
-            _quoted=""
-            for _arg in "$@"; do
-              _quoted="$_quoted '$_arg'"
-            done
-            exec capsh $_capsh_args -- -c "exec $_quoted"
-          fi
-        else
-          if [ $# -eq 0 ]; then
-            exec $SHELL
-          else
-            exec "$@"
-          fi
-        fi
+{cap_drop_block}
     ''')
     return _write_sha_file(script, 'entrypoint_', '.sh')
 
@@ -969,12 +1103,18 @@ def generate_rc_sh(ns: dict) -> str:
     Reads from the *ns* dict: ``run.prompt_banner``.
     """
     prompt_banner = ns.get('run.prompt_banner') or ns.get('run.image') or 'podrun'
-    cpu_name = run_os_cmd(
-        "grep -m 1 'model name[[:space:]]*:' /proc/cpuinfo"
-        " | cut -d ' ' -f 3- | sed 's/(R)/\u00ae/g; s/(TM)/\u2122/g;'"
-    ).stdout
-    cpu_vcount = run_os_cmd("grep -o 'processor[[:space:]]*:' /proc/cpuinfo | wc -l").stdout
-    cpu = f'{cpu_name.strip()} ({cpu_vcount.strip()} vCPU)'
+    if _IS_WINDOWS:
+        cpu_name = platform.processor() or 'Unknown CPU'
+        cpu_vcount = str(os.cpu_count() or 1)
+    else:
+        cpu_name = run_os_cmd(
+            "grep -m 1 'model name[[:space:]]*:' /proc/cpuinfo"
+            " | cut -d ' ' -f 3- | sed 's/(R)/\u00ae/g; s/(TM)/\u2122/g;'"
+        ).stdout.strip()
+        cpu_vcount = run_os_cmd(
+            "grep -o 'processor[[:space:]]*:' /proc/cpuinfo | wc -l"
+        ).stdout.strip()
+    cpu = f'{cpu_name} ({cpu_vcount} vCPU)'
     fl = 52
     cfl = fl + len(bytearray(cpu, sys.stdout.encoding or 'utf-8')) - len(cpu)
 
@@ -1275,7 +1415,10 @@ def _host_overlay_args(ns, pt):
     args = []
     if not _passthrough_has_flag(pt, '--hostname'):
         args.append(f'--hostname={platform.node()}')
-    if not _passthrough_has_flag(pt, '--network'):
+    # Skip --network=host on Windows: on podman machine "host" means the VM's
+    # network (not the Windows host), and it conflicts with --userns=keep-id
+    # (kernel refuses sysfs remount when user ns doesn't own network ns).
+    if not _IS_WINDOWS and not _passthrough_has_flag(pt, '--network'):
         args.append('--network=host')
     if not _passthrough_has_exact(pt, '--security-opt=seccomp=unconfined'):
         args.append('--security-opt=seccomp=unconfined')
@@ -1320,7 +1463,7 @@ def _copy_staging_args(items: list) -> list:
 
         # Write the target path descriptor
         target_file = os.path.join(staging_dir, '.podrun_target')
-        with open(target_file, 'w') as f:
+        with open(target_file, 'w', encoding='utf-8', newline='\n') as f:
             f.write(container_path)
 
         if os.path.isfile(host_path):
@@ -1400,8 +1543,17 @@ def _x11_args(ns):
 
 
 def _podman_remote_args(ns):
-    """Build args for podman-remote (rootless Podman socket passthrough)."""
+    """Build args for podman-remote (rootless Podman socket passthrough).
+
+    On Windows, podman machine handles the remote connection — skip Unix
+    socket mounting and just forward ``CONTAINER_HOST`` if set.
+    """
     args = []
+    if _IS_WINDOWS:
+        container_host = os.environ.get('CONTAINER_HOST')
+        if container_host:
+            args.append(f'--env=CONTAINER_HOST={container_host}')
+        return args
     store_socket = ns.get('run.store_socket')
     if store_socket and pathlib.Path(store_socket).exists():
         args.append(f'-v={store_socket}:{PODRUN_SOCKET_PATH}')
@@ -1420,9 +1572,9 @@ def _podman_remote_args(ns):
 
 
 def _env_args(ns):
-    """Build args for container environment variables and PODRUN_* env vars."""
+    """Build container environment and PODRUN_* environment variable args."""
     args = []
-    for key, val in (ns.get('run.remote_env') or {}).items():
+    for key, val in (ns.get('run.container_env') or {}).items():
         args.append(f'--env={key}={val}')
 
     # Canonical "inside a podrun container" marker.
@@ -1683,7 +1835,9 @@ def devcontainer_run_args(dc: dict, ns: dict) -> list:  # noqa: C901
 # Store management
 # ---------------------------------------------------------------------------
 
-_PODRUN_STORES_DIR = '/tmp/podrun-stores'
+_PODRUN_STORES_DIR = (
+    os.path.join(tempfile.gettempdir(), 'podrun-stores') if _IS_WINDOWS else '/tmp/podrun-stores'
+)
 
 
 def _store_hash(graphroot: str) -> str:
@@ -2115,7 +2269,7 @@ _RUN_CONFIG_MAP = {
 _DC_CONFIG_MAP = {
     'workspaceMount': 'dc.workspace_mount',
     'workspaceFolder': 'dc.workspace_folder',
-    'remoteEnv': 'dc.remote_env',
+    'containerEnv': 'dc.container_env',
     'image': 'dc.image',
 }
 
@@ -2157,7 +2311,13 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
             dc['workspaceFolder'] = _expand_devcontainer_vars(dc['workspaceFolder'], var_context)
         # Second pass: use resolved containerWorkspaceFolder for remaining fields
         var_context['containerWorkspaceFolder'] = dc.get('workspaceFolder', '')
-        for field in ('workspaceMount', 'mounts', 'runArgs', 'containerEnv', 'remoteEnv'):
+        for field in (
+            'workspaceMount',
+            'mounts',
+            'runArgs',
+            'containerEnv',
+            'customizations',
+        ):
             if field in dc:
                 dc[field] = _expand_devcontainer_vars(dc[field], var_context)
 
@@ -2327,10 +2487,10 @@ def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns):
     if ns.get('run.dot_files_overlay'):
         ns['run.user_overlay'] = True
 
-    # remoteEnv: resolved from dc in resolve_config → ns['dc.remote_env']
-    dc_remote_env = ns.get('dc.remote_env')
-    if dc_remote_env:
-        ns['run.remote_env'] = dc_remote_env
+    # containerEnv from devcontainer.json
+    dc_container_env = ns.get('dc.container_env')
+    if dc_container_env:
+        ns['run.container_env'] = dc_container_env
 
     # Image/command resolution: CLI trailing > devcontainer image
     dc_image = ns.get('dc.image')
@@ -2926,10 +3086,10 @@ def detect_container_state(
     """Returns ``"running"``, ``"stopped"``, or ``None``."""
     if not name:
         return None
-    gf = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
-    fmt = shlex.quote('{{.State.Status}}')
+    gf = ' '.join(_shell_quote(f) for f in global_flags) + ' ' if global_flags else ''
+    fmt = _shell_quote('{{.State.Status}}')
     result = run_os_cmd(
-        f'{shlex.quote(podman_path)} {gf}inspect --format={fmt} {shlex.quote(name)}'
+        f'{_shell_quote(podman_path)} {gf}inspect --format={fmt} {_shell_quote(name)}'
     )
     if result.returncode != 0:
         return None
@@ -3004,10 +3164,10 @@ def query_container_info(
 
     Returns ``(workdir, overlays)`` where each is ``''`` if not found.
     """
-    gf = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
-    fmt = shlex.quote('{{range .Config.Env}}{{println .}}{{end}}')
+    gf = ' '.join(_shell_quote(f) for f in global_flags) + ' ' if global_flags else ''
+    fmt = _shell_quote('{{range .Config.Env}}{{println .}}{{end}}')
     result = run_os_cmd(
-        f'{shlex.quote(podman_path)} {gf}inspect --format={fmt} {shlex.quote(name)}'
+        f'{_shell_quote(podman_path)} {gf}inspect --format={fmt} {_shell_quote(name)}'
     )
     workdir = ''
     overlays = ''
@@ -3204,11 +3364,11 @@ def print_help(subcmd, argv, podman_path):
         return
 
     if subcmd == 'run':
-        podman_cmd = f'{shlex.quote(podman_path)} run --help'
+        podman_cmd = f'{_shell_quote(podman_path)} run --help'
         replace_from, replace_to = 'podman run', 'podrun run'
         podrun_parser = build_root_parser()._run_subparser  # type: ignore[attr-defined]
     else:
-        podman_cmd = f'{shlex.quote(podman_path)} --help'
+        podman_cmd = f'{_shell_quote(podman_path)} --help'
         replace_from, replace_to = 'podman', 'podrun'
         podrun_parser = build_root_parser()
 
@@ -3237,7 +3397,7 @@ def print_version(podman_path=None):
     """Print podman and podrun versions."""
     if podman_path is None:
         podman_path = _default_podman_path() or 'podman'
-    result = run_os_cmd(f'{shlex.quote(podman_path)} --version')
+    result = run_os_cmd(f'{_shell_quote(podman_path)} --version')
     if result.returncode == 0:
         print(result.stdout.strip())
     print(f'podrun version {__version__}')
@@ -3257,7 +3417,7 @@ def _scrape_podman_help(podman_path, subcmd=None):
 
     Returns ``None`` on failure.
     """
-    cmd_parts = [shlex.quote(podman_path)]
+    cmd_parts = [_shell_quote(podman_path)]
     if subcmd:
         cmd_parts.append(subcmd)
     cmd_parts.append('--help')
@@ -3764,7 +3924,7 @@ def _exec_attach(ctx: 'PodrunContext', global_flags):
     if ns.get('root.print_cmd'):
         print(shlex.join(cmd))
         sys.exit(0)
-    os.execvpe(ctx.podman_path, cmd, os.environ.copy())
+    _exec_or_subprocess(cmd, os.environ.copy())
 
 
 def _filter_global_args(global_args: List[str], flags: PodmanFlags) -> List[str]:
@@ -3870,9 +4030,9 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
 
     replace_rm_cmd = None
     if action == 'replace':
-        pm = shlex.quote(ctx.podman_path)
-        gf_str = ' '.join(shlex.quote(f) for f in global_flags) + ' ' if global_flags else ''
-        replace_rm_cmd = f'{pm} {gf_str}rm -f {shlex.quote(ns["run.name"])}'
+        pm = _shell_quote(ctx.podman_path)
+        gf_str = ' '.join(_shell_quote(f) for f in global_flags) + ' ' if global_flags else ''
+        replace_rm_cmd = f'{pm} {gf_str}rm -f {_shell_quote(ns["run.name"])}'
         if not ns.get('root.print_cmd'):
             run_os_cmd(replace_rm_cmd)
         action = 'run'
@@ -3914,7 +4074,7 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
 
     # Clean stale files (>48h) from previous configs
     if ns.get('run.user_overlay'):
-        run_os_cmd(f'find {PODRUN_TMP} -mtime +1 -delete 2>/dev/null')
+        _clean_stale_files(PODRUN_TMP, max_age_days=1)
 
     if ns.get('root.print_cmd'):
         if replace_rm_cmd:
@@ -3922,7 +4082,7 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
         print(shlex.join(cmd))
         sys.exit(0)
 
-    os.execvpe(ctx.podman_path, cmd, os.environ.copy())
+    _exec_or_subprocess(cmd, os.environ.copy())
 
 
 # ---------------------------------------------------------------------------
@@ -3978,7 +4138,7 @@ def main(argv=None):
         if ns['root.print_cmd']:
             print(shlex.join(cmd))
             sys.exit(0)
-        os.execvpe(ctx.podman_path, cmd, os.environ.copy())
+        _exec_or_subprocess(cmd, os.environ.copy())
 
 
 if __name__ == '__main__':

@@ -4,8 +4,12 @@ import glob
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
+
+if sys.platform == 'win32':
+    pytest.skip('podrun tests require Linux', allow_module_level=True)
 
 import podrun.podrun as podrun_mod
 from podrun.podrun import (

@@ -491,12 +491,6 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
 
     tokens: List[str] = []
     for path in script_paths:
-        if _IS_WINDOWS:
-            print(
-                f'podrun: warning: --config-script {path} skipped on Windows',
-                file=sys.stderr,
-            )
-            continue
         out = run_os_cmd(_shell_quote(path), env=env)
         if out.returncode != 0:
             print(
@@ -2241,6 +2235,7 @@ _ROOT_CONFIG_MAP = {
     'localStore': 'root.local_store',
     'localStoreAutoInit': 'root.local_store_auto_init',
     'localStoreIgnore': 'root.local_store_ignore',
+    'noPodrunrc': 'root.no_podrunrc',
     'storageDriver': 'root.storage_driver',
 }
 
@@ -2451,6 +2446,22 @@ def _load_devcontainer(ns) -> Tuple[dict, dict]:
     return dc, podrun_cfg
 
 
+def _discover_podrunrc() -> Optional[str]:
+    """Glob ``~/.podrunrc*`` and return the single match, or None.
+
+    Exits with error if multiple matches are found.
+    """
+    candidates = [p for p in pathlib.Path(USER_HOME).glob('.podrunrc*') if not p.is_dir()]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        names = ', '.join(sorted(p.name for p in candidates))
+        print(f'Error: multiple ~/.podrunrc* files found: {names}', file=sys.stderr)
+        print('Only one is allowed. Remove extras and retry.', file=sys.stderr)
+        sys.exit(1)
+    return str(candidates[0])
+
+
 def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dict, list]:
     """Find and execute config scripts, return ``(script_ns, script_passthrough)``."""
     ns = ctx.ns
@@ -2469,12 +2480,15 @@ def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dic
     return parse_config_tokens(script_tokens, flags)
 
 
-def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns):
+def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns, rc_ns=None):
     """Apply run-subcommand-specific merges: overlays, image fallback, exports.
 
     All dc top-level fields are already resolved to ``ns['dc.*']`` by
     ``resolve_config`` before this function is called.
     """
+    if rc_ns is None:
+        rc_ns = {}
+
     # Overlay implication chain: adhoc→session→host+interactive+dotfiles→user
     if ns.get('run.adhoc'):
         ns['run.session'] = True
@@ -2497,17 +2511,18 @@ def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns):
     if not ctx.trailing_args and dc_image:
         ctx.trailing_args = [dc_image]
 
-    # Exports append: dc + script + cli, with tilde expansion
+    # Exports append: rc + dc + script + cli, with tilde expansion
+    rc_exports = rc_ns.get('run.export') or []
     dc_exports = dc_ns.get('run.export') or []
     script_exports = script_ns.get('run.export') or []
     cli_exports = ns.get('run.export') or []
-    combined_exports = dc_exports + script_exports + cli_exports
+    combined_exports = rc_exports + dc_exports + script_exports + cli_exports
     if combined_exports:
         ns['run.export'] = _expand_export_tilde(combined_exports)
 
 
-def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
-    """Three-way merge: CLI > config-script > devcontainer.json.
+def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa: C901
+    """Four-way merge: CLI > config-script > devcontainer.json > ~/.podrunrc*.
 
     Updates ctx.ns in place and attaches context.
     """
@@ -2526,20 +2541,31 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
     # Copy dc_from_cli from ns (set by _load_devcontainer) to ctx
     ctx.dc_from_cli = ns.get('internal.dc_from_cli', False)
 
-    # 4–5. Determine and execute config scripts
+    # 4. Discover and execute ~/.podrunrc* (lowest priority config)
+    rc_ns: dict = {}
+    rc_passthrough: list = []
+    no_podrunrc = ns.get('root.no_podrunrc') or podrun_cfg.get('noPodrunrc')
+    if not no_podrunrc:
+        rc_path = _discover_podrunrc()
+        if rc_path:
+            rc_tokens = run_config_scripts([rc_path], ctx=ctx)
+            rc_ns, rc_passthrough = parse_config_tokens(rc_tokens, flags)
+
+    # 5–6. Determine and execute config scripts
     script_ns, script_passthrough = _collect_script_config(ctx, podrun_cfg, flags)
 
-    # 6. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
+    # 7. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
     dc_ns = _devcontainer_to_ns(podrun_cfg)
     dc_run_args = devcontainer_run_args(dc, ns)
 
-    # 7. Merge scalars — _first(cli_ns, script_ns, dc_ns) per key
+    # 8. Merge scalars — _first(cli_ns, script_ns, dc_ns, rc_ns) per key
     #    List-append keys (run.export) are handled in _apply_run_specifics.
     _APPEND_KEYS = {'run.export'}
     all_keys = set()
     for k in ns:
         if k.startswith('root.') or k.startswith('run.'):
             all_keys.add(k)
+    all_keys.update(rc_ns.keys())
     all_keys.update(script_ns.keys())
     all_keys.update(dc_ns.keys())
 
@@ -2549,18 +2575,21 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':
         cli_val = ns.get(key)
         script_val = script_ns.get(key)
         dc_val = dc_ns.get(key)
-        merged = _first(cli_val, script_val, dc_val)
+        rc_val = rc_ns.get(key)
+        merged = _first(cli_val, script_val, dc_val, rc_val)
         if merged is not None:
             ns[key] = merged
 
-    # 8. Prepend podman args — DC run args first (lowest priority), then script,
+    # 9. Prepend podman args — rc first (lowest priority), then DC, script,
     #    then CLI passthrough (already in the list, highest priority).
     existing_passthrough = ns.get('run.passthrough_args') or []
-    ns['run.passthrough_args'] = dc_run_args + script_passthrough + existing_passthrough
+    ns['run.passthrough_args'] = (
+        rc_passthrough + dc_run_args + script_passthrough + existing_passthrough
+    )
 
-    # 9. Handle run specifics
+    # 10. Handle run specifics
     if ns.get('subcommand') == 'run':
-        _apply_run_specifics(ns, ctx, dc_ns, script_ns)
+        _apply_run_specifics(ns, ctx, dc_ns, script_ns, rc_ns)
 
     return ctx
 
@@ -2692,6 +2721,13 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         action='store_true',
         default=None,
         help='Skip devcontainer.json discovery',
+    )
+    opts.add_argument(
+        '--no-podrunrc',
+        dest='root.no_podrunrc',
+        action='store_true',
+        default=None,
+        help='Skip ~/.podrunrc* discovery',
     )
     opts.add_argument(
         '--completion',

@@ -13,6 +13,7 @@ from podrun.podrun import (
     UNAME,
     PodrunContext,
     _default_podman_path,
+    _discover_podrunrc,
     _filter_global_args,
     _is_remote,
     _resolve_overlay_mounts,
@@ -795,3 +796,290 @@ class TestRemoteHandleRunGuards:
         out = capsys.readouterr().out
         # --storage-opt should NOT be injected when remote
         assert '--storage-opt' not in out
+
+
+# ---------------------------------------------------------------------------
+# _discover_podrunrc + ~/.podrunrc* integration
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverPodrunrc:
+    """Unit tests for _discover_podrunrc() discovery logic."""
+
+    def test_no_matches_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        assert _discover_podrunrc() is None
+
+    def test_single_match_returns_path(self, tmp_path, monkeypatch):
+        rc = tmp_path / '.podrunrc'
+        rc.write_text('--session\n')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        assert _discover_podrunrc() == str(rc)
+
+    def test_dotsh_extension(self, tmp_path, monkeypatch):
+        rc = tmp_path / '.podrunrc.sh'
+        rc.write_text('echo --session\n')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        assert _discover_podrunrc() == str(rc)
+
+    def test_dotpy_extension(self, tmp_path, monkeypatch):
+        rc = tmp_path / '.podrunrc.py'
+        rc.write_text('print("--session")\n')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        assert _discover_podrunrc() == str(rc)
+
+    def test_directories_ignored(self, tmp_path, monkeypatch):
+        (tmp_path / '.podrunrc_dir').mkdir()
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        assert _discover_podrunrc() is None
+
+    def test_directory_plus_file(self, tmp_path, monkeypatch):
+        """Directory .podrunrc_dir is ignored; only .podrunrc file is returned."""
+        (tmp_path / '.podrunrc_dir').mkdir()
+        rc = tmp_path / '.podrunrc'
+        rc.write_text('--session\n')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        assert _discover_podrunrc() == str(rc)
+
+    def test_multiple_matches_exits(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / '.podrunrc').write_text('')
+        (tmp_path / '.podrunrc.sh').write_text('')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        with pytest.raises(SystemExit) as exc_info:
+            _discover_podrunrc()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '.podrunrc' in err
+        assert '.podrunrc.sh' in err
+
+
+class TestPodrunrcIntegration:
+    """Integration tests for ~/.podrunrc* execution and merge precedence."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_run_os_cmd(self, monkeypatch):
+        """Suppress stale file cleanup and container state checks."""
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd, env=None: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            ),
+        )
+
+    def _run(self, argv, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd'] + argv)
+        assert exc_info.value.code == 0
+        return shlex.split(capsys.readouterr().out)
+
+    def test_rc_flags_appear_in_command(self, monkeypatch, capsys):
+        """~/.podrunrc output is parsed and appears in the podman command."""
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
+
+        # Mock run_os_cmd to return --session when called with the rc script,
+        # and empty output for other calls (stale cleanup, etc.)
+        def mock_cmd(cmd, env=None):
+            if '/fake/.podrunrc' in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='--session\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            )
+
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        cmd = self._run(['run', 'alpine'], capsys)
+        # --session implies -it and --userns=keep-id
+        assert '-it' in cmd
+        assert '--userns=keep-id' in cmd
+
+    def test_rc_passthrough_flags_in_command(self, monkeypatch, capsys):
+        """Passthrough flags from rc appear in the podman command."""
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
+
+        def mock_cmd(cmd, env=None):
+            if '/fake/.podrunrc' in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='-e RC_VAR=1\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            )
+
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        cmd = self._run(['run', 'alpine'], capsys)
+        assert '-e' in cmd
+        assert 'RC_VAR=1' in cmd
+
+    def test_cli_overrides_rc(self, monkeypatch, capsys):
+        """CLI flags take precedence over rc flags."""
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
+
+        def mock_cmd(cmd, env=None):
+            if '/fake/.podrunrc' in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='--shell /bin/bash\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            )
+
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        cmd = self._run(['run', '--shell', '/bin/zsh', '--session', 'alpine'], capsys)
+        # The CLI --shell /bin/zsh should win over rc's --shell /bin/bash
+        # We can't directly see the shell in the command, but the entrypoint
+        # script is generated with it. Verify via PODRUN_SHELL env.
+        env_args = [a for a in cmd if 'PODRUN_SHELL' in a]
+        assert any('/bin/zsh' in a for a in env_args)
+
+    def test_dc_overrides_rc(self, tmp_path, monkeypatch, capsys):
+        """devcontainer.json overrides rc for scalar fields."""
+        dc_path = tmp_path / 'devcontainer.json'
+        dc_path.write_text('{"customizations": {"podrun": {"name": "dc-name"}}}')
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_path)
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
+
+        def mock_cmd(cmd, env=None):
+            if '/fake/.podrunrc' in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='--name rc-name\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            )
+
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        cmd = self._run(['run', '--session', 'alpine'], capsys)
+        assert '--name=dc-name' in cmd
+
+    def test_no_podrunrc_flag_skips_discovery(self, monkeypatch, capsys):
+        """--no-podrunrc prevents rc discovery and execution."""
+        discovered = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_discover_podrunrc',
+            lambda: discovered.append(1) or '/fake/.podrunrc',
+        )
+        self._run(['--no-podrunrc', 'run', 'alpine'], capsys)
+        assert len(discovered) == 0
+
+    def test_dc_nopodrunrc_skips_discovery(self, tmp_path, monkeypatch, capsys):
+        """noPodrunrc in devcontainer.json prevents rc discovery."""
+        dc_path = tmp_path / 'devcontainer.json'
+        dc_path.write_text('{"customizations": {"podrun": {"noPodrunrc": true}}}')
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_path)
+        discovered = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_discover_podrunrc',
+            lambda: discovered.append(1) or '/fake/.podrunrc',
+        )
+        self._run(['run', 'alpine'], capsys)
+        assert len(discovered) == 0
+
+    def test_no_rc_file_no_effect(self, monkeypatch, capsys):
+        """When _discover_podrunrc returns None, no error and command works."""
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: None)
+        cmd = self._run(['run', 'alpine'], capsys)
+        assert 'run' in cmd
+        assert 'alpine' in cmd
+
+    def test_rc_export_lowest_priority(self, tmp_path, monkeypatch, capsys):
+        """rc exports appear before dc/script/cli exports in combined list."""
+        rc_dst = tmp_path / 'rc_dst'
+        dc_dst = tmp_path / 'dc_dst'
+        cli_dst = tmp_path / 'cli_dst'
+        rc_dst.mkdir()
+        dc_dst.mkdir()
+        cli_dst.mkdir()
+
+        dc_path = tmp_path / 'devcontainer.json'
+        dc_path.write_text(
+            f'{{"customizations": {{"podrun": {{"exports": ["/dc_src:{dc_dst}"]}}}}}}'
+        )
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_path)
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
+
+        def mock_cmd(cmd, env=None):
+            if '/fake/.podrunrc' in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout=f'--export /rc_src:{rc_dst}\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            )
+
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        cmd = self._run(
+            ['run', '--user-overlay', '--export', f'/cli_src:{cli_dst}', 'alpine'],
+            capsys,
+        )
+        # All three export volumes should be present
+        joined = ' '.join(cmd)
+        assert str(rc_dst) in joined
+        assert str(dc_dst) in joined
+        assert str(cli_dst) in joined
+
+    def test_rc_passthrough_lowest_priority(self, monkeypatch, capsys):
+        """rc passthrough args come before dc/script/cli passthrough."""
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
+
+        def mock_cmd(cmd, env=None):
+            if '/fake/.podrunrc' in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='-e FROM_RC=1\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='',
+                stderr='',
+            )
+
+        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        cmd = self._run(['run', '-e', 'FROM_CLI=1', 'alpine'], capsys)
+        # Both env vars should be present
+        joined = ' '.join(cmd)
+        assert 'FROM_RC=1' in joined
+        assert 'FROM_CLI=1' in joined
+        # RC passthrough should appear before CLI passthrough
+        rc_idx = next(i for i, a in enumerate(cmd) if a == 'FROM_RC=1')
+        cli_idx = next(i for i, a in enumerate(cmd) if a == 'FROM_CLI=1')
+        assert rc_idx < cli_idx

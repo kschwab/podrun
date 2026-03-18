@@ -14,11 +14,11 @@
 | JSONC stripping | Ported | Same implementation |
 | devcontainer.json parsing + field mapping | Ported | `mounts`, `capAdd`, `securityOpt`, `privileged`, `init`, `runArgs` |
 | `customizations.podrun` extraction | Ported | Same behavior |
-| Three-way config merge (CLI > script > dc) | Updated | Now uses namespace-dict (`root.*`/`run.*` keys) instead of `Config` dataclass. Merge logic is cleaner but equivalent precedence. |
+| Four-way config merge (CLI > script > dc > rc) | Updated | Now uses namespace-dict (`root.*`/`run.*` keys) instead of `Config` dataclass. `~/.podrunrc*` is the lowest-priority config source. |
 | Config-script execution + token parsing | Updated | New `run_config_scripts()` + `parse_config_tokens()` replace `_expand_config_scripts()` + `_resolve_config_script()`. Scripts run through same root+run parsers. |
 | Overlay implication chain (adhoc->session->host+interactive->user) | Ported | In `resolve_config()` |
 | Image resolution from dc `image` field | Ported | Falls back to dc image when no CLI trailing args |
-| Export merging (dc + script + cli) | Ported | Append order preserved |
+| Export merging (rc + dc + script + cli) | Ported | Append order preserved |
 | Label-based dc config path (`devcontainer.config_file=`) | Ported | Same behavior |
 | `--no-devconfig` | Ported | Same behavior |
 | Local store init / destroy / info | Updated | Simplified signatures (take `store_dir: str` instead of `args` namespace). Same fs layout (graphroot + runroot symlink). |
@@ -311,6 +311,29 @@ Key decisions:
 - **`_filter_global_args()` is the single gate for binary flag compatibility** — the scraped flag cache for `podman-remote` has fewer global flags than `podman`. `_filter_global_args()` uses this as source of truth to drop unsupported flags (e.g. `--root`, `--storage-driver`) silently. Callers like `_apply_store`, `_resolve_overlay_mounts`, and config scripts inject flags without caring which binary is in use — filtering is centralized in `main()`.
 - **`_apply_store()` nested guard is semantic, not flag-related** — `_resolve_store` is skipped when nested because the store filesystem lives on the host (not about flag compatibility). `--local-store-destroy` still errors when nested. `--local-store-info` prints "disabled".
 - **`_is_nested()` detection unchanged** — primary via `PODRUN_CONTAINER` env var, fallback via `CONTAINER_HOST` + socket existence.
+
+#### Phase 2.13: `~/.podrunrc*` User Config Script ✓
+
+User-level config script with lowest precedence, auto-discovered and executed.
+**Status: Complete — tests in `tests/test_podrun_main.py`.**
+
+| Item | Notes |
+|---|---|
+| `_discover_podrunrc()` | Globs `~/.podrunrc*`, filters directories, errors on 2+ matches. Returns single path or None |
+| `--no-podrunrc` CLI flag | `dest='root.no_podrunrc'`, `action='store_true'`. Skips discovery |
+| `noPodrunrc` in DC config | `_ROOT_CONFIG_MAP` entry. `customizations.podrun.noPodrunrc: true` skips discovery |
+| `resolve_config()` four-way merge | Precedence: CLI > config-script > devcontainer.json > `~/.podrunrc*` |
+| `_apply_run_specifics()` rc exports | `rc_ns` parameter added. Export order: rc + dc + script + cli |
+| Windows `run_config_scripts()` skip removed | Blanket `_IS_WINDOWS` skip deleted — `cmd.exe` can execute `.bat`, `.py`, `.exe` natively |
+| `conftest.py` isolation | `_discover_podrunrc` patched to `lambda: None` in `_isolate` fixture |
+
+Key decisions:
+- **Precedence (lowest → highest):** `~/.podrunrc*` < `devcontainer.json` < `--config-script` < CLI
+- **Discovery:** `pathlib.Path(USER_HOME).glob('.podrunrc*')` with directory filtering. Accepts `.podrunrc`, `.podrunrc.sh`, `.podrunrc.py`, `.podrunrc.bat`, etc.
+- **Execution:** same `run_os_cmd` + `parse_config_tokens` path as `--config-script`
+- **Opt-out:** `--no-podrunrc` CLI flag OR `customizations.podrun.noPodrunrc: true` in devcontainer.json (either source)
+- **Passthrough order:** `rc_passthrough + dc_run_args + script_passthrough + existing_passthrough`
+- **Windows skip removal:** the blanket `_IS_WINDOWS` skip in `run_config_scripts()` was too aggressive — Windows `cmd.exe` can execute `.bat`, `.py`, and `.exe` natively via `run_os_cmd`
 
 ### Binary State Testing
 

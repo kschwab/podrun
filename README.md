@@ -1,73 +1,45 @@
 # podrun
 
-A podman run superset with host identity overlays. Adds overlay groups for
-user identity mapping, host context, and interactive containers, plus
-devcontainer.json support and container lifecycle management.
+A podman run superset with host identity overlays.
 
-## Installing Podrun
+- Maps your host identity (user, home directory, dotfiles) into containers
+- Reads `devcontainer.json` for reproducible project configs
+- Passes unrecognized flags straight to podman — drop-in replacement
 
-### From Source
+## Installing
 
-All commands below assume you are in the root of the checked-out repo.
+### pip (from PyPI or GitHub)
 
-Install:
 ```bash
-python3 -m pip install .
+python3 -m pip install podrun
 ```
 
-Development (editable install with test/lint dependencies):
-```bash
-python3 -m pip install -e '.[dev]'
-```
+Or install from GitHub directly:
 
-Run without installing:
-```bash
-python3 -m podrun [GLOBAL_OPTIONS] run [RUN_OPTIONS] IMAGE [COMMAND...]
-```
-
-### From GitHub
-
-To install latest version from GitHub:
 ```bash
 python3 -m pip install git+https://github.com/kschwab/podrun@main
 ```
 
-To install specific version from GitHub:
+### Editable dev install
+
 ```bash
-python3 -m pip install git+https://github.com/kschwab/podrun@<VERSION>
+git clone https://github.com/kschwab/podrun && cd podrun
+python3 -m pip install -e '.[dev]'
 ```
 
-### Script Only
+### Script only
 
-To install latest version of script:
 ```bash
 wget -nv https://raw.githubusercontent.com/kschwab/podrun/main/podrun/podrun.py -O podrun && chmod a+x podrun
 ```
 
-To install specific version of script:
-```bash
-wget -nv https://raw.githubusercontent.com/kschwab/podrun/<VERSION>/podrun/podrun.py -O podrun && chmod a+x podrun
-```
-
-## Uninstalling Podrun
+### Uninstalling
 
 ```bash
 python3 -m pip uninstall podrun -y
 ```
 
-## Usage
-
-```
-podrun [GLOBAL_OPTIONS] run [RUN_OPTIONS] [PODMAN_OPTIONS] IMAGE [COMMAND...]
-podrun [GLOBAL_OPTIONS] run [RUN_OPTIONS] [PODMAN_OPTIONS] -- [COMMAND...]
-```
-
-Podrun accepts all `podman run` flags alongside its own. Any unrecognized flags
-are passed through to podman directly. Use `podrun run --help` to see both
-podrun and podman options together. Use `podrun --help` for global options and
-available commands.
-
-### Examples
+## Quickstart
 
 Ad-hoc container (auto-removes on exit):
 
@@ -75,72 +47,52 @@ Ad-hoc container (auto-removes on exit):
 podrun run --adhoc ubuntu:24.04
 ```
 
-Persistent workspace (image survives exit):
+Persistent session:
 
 ```bash
-podrun run --workspace ubuntu:24.04
+podrun run --session --name mydev ubuntu:24.04
 ```
 
 Non-interactive command execution:
 
 ```bash
-podrun run --host-overlay ubuntu:24.04 -- make -j8
+podrun run --host-overlay ubuntu:24.04 make -j8
 ```
 
-Use zsh as the default shell:
+Shell override:
 
 ```bash
 podrun run --adhoc --shell zsh ubuntu:24.04
 ```
 
-Run with a login shell (sources `/etc/profile`):
-
-```bash
-podrun run --adhoc --login ubuntu:24.04
-```
-
 Dry run (print the podman command without executing):
 
 ```bash
-podrun run --adhoc --print-cmd ubuntu:24.04
+podrun --print-cmd run --adhoc ubuntu:24.04
 ```
 
 Named container with auto-attach:
 
 ```bash
-podrun run --workspace --name mydev --auto-attach ubuntu:24.04
-```
-
-Pass extra podman flags through:
-
-```bash
-podrun run --adhoc --gpus all -v /data:/data:ro ubuntu:24.04
-```
-
-Export container directories to the host:
-
-```bash
-# Export container's /opt/sdk/bin to ./local-sdk on the host
-podrun run --user-overlay --export /opt/sdk/bin:./local-sdk ubuntu:24.04
-
-# Multiple exports
-podrun run --user-overlay --export /opt/sdk/bin:./sdk --export /usr/share/data:./data ubuntu:24.04
+podrun run --session --name mydev --auto-attach ubuntu:24.04
 ```
 
 ## Documentation
 
 | Topic | Description |
 |-------|-------------|
-| [Overlays](docs/overlays.md) | Overlay groups, exports (reverse volumes), fuse-overlayfs |
-| [devcontainer.json](docs/devcontainer.md) | Devcontainer fields, config scripts, devcontainer CLI |
-| [Podrun Store](docs/store.md) | Project-local storage, auto-discovery, inline `--store` |
-| [Testing](docs/testing.md) | Test setup, markers, parallel execution, test images |
-| [Reference](docs/reference.md) | Full run options table, container lifecycle, subcommand passthrough, shell completion |
+| [Getting Started](docs/getting-started.md) | First session walkthrough |
+| [Overlays](docs/overlays.md) | Overlay groups, dotfiles, exports, fuse-overlayfs |
+| [Configuration](docs/configuration.md) | Config merge, devcontainer.json, scripts, podrunrc |
+| [Local Store](docs/local-store.md) | Project-local podman storage |
+| [Reference](docs/reference.md) | Flag tables, DC keys, env vars, completion |
+| [Testing](docs/testing.md) | Contributor testing guide |
 
 ## Requirements
 
 - Python >= 3.8
 - Podman (rootless)
+- Linux or Windows with [podman machine](https://docs.podman.io/en/latest/markdown/podman-machine.1.html)
 
 ## License
 

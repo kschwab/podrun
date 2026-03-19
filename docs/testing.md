@@ -2,76 +2,86 @@
 
 > Back to [README](../README.md) for install and quickstart.
 
-Install dev dependencies first (see [Installing from Source](../README.md#from-source)). All commands
-from the root of the repo.
-
-Tests are organized with pytest markers for filtering:
-
-| Marker | Description |
-|--------|-------------|
-| `live` | Live container integration tests (require podman) |
-| `devcontainer` | Devcontainer CLI integration tests (require podman + devcontainer) |
-
-Use `-m` to select or exclude markers.
-
-The `-n` flag controls both parallelism and test scope:
-
-| Flag | Images | Lint/devcontainer | Purpose |
-|------|--------|-------------------|---------|
-| `-n0` (default) | all 3 | included | full serial suite |
-| `-n1` | alpine | excluded | quick functional smoke |
-| `-n2` | alpine + ubuntu | excluded | moderate parallel coverage |
-| `-n3` | alpine + ubuntu + fedora | excluded | full parallel coverage |
+## Quick Start
 
 ```bash
-python3 -m pytest tests/ -n0 -v     # full suite (serial, all images + lint)
-python3 -m pytest tests/ -n1 -v     # smoke (alpine only, no lint)
-python3 -m pytest tests/ -n3 -v     # full parallel (all images, no lint)
+python3 -m pip install -e '.[dev]'
+python3 -m pytest tests/ -x -q
 ```
 
-Use `-m` to select or exclude markers:
-```bash
-python3 -m pytest tests/ -m "not live and not devcontainer" -v  # unit tests only
-python3 -m pytest tests/ -m live -v                              # live tests only
-```
+## Architecture
 
-Live and devcontainer tests automatically manage a
-[podrun store](store.md) under `.devcontainer/.podrun/store/` so
-they do not interfere with your system podman. Use `--registry` with any test
-command to pull through a registry mirror (e.g. behind a corporate proxy):
-```bash
-python3 -m pytest tests/ --registry=my-mirror.example.com -v
-```
+The test suite is unit tests that validate parsing, generation, assembly, and
+orchestration logic without running real containers. Tests are parameterized
+across available podman binaries (`podman` and `podman-remote`) to verify
+flag scraping and command building for both.
 
-## Parallel Execution
+## Key Fixtures
 
-When `-n` > 0, tests run via pytest-xdist with `--dist loadscope` (tests
-grouped by class, one class per worker). Each xdist worker gets its own
-isolated podman store so containers don't collide. Lint and devcontainer CLI
-tests are automatically deselected because they require serial execution.
+All fixtures are defined in `tests/conftest.py`:
 
-## Test Images
+| Fixture | Scope | Description |
+|---------|-------|-------------|
+| `_isolate` | function (autouse) | Universal test isolation: clears env vars (`PODRUN_PODMAN_REMOTE`, `PODRUN_CONTAINER`, `PODRUN_PODMAN_PATH`, `CONTAINER_HOST`), mocks `find_devcontainer_json` and `_default_store_dir` to return None, redirects `PODRUN_TMP` to `tmp_path` |
+| `podman_binary` | function (parameterized) | Runs the test once per available binary (`podman`, `podman-remote`); skips unavailable binaries; monkeypatches `_default_podman_path` |
+| `podman_only` | function | Restricts a test to the full `podman` binary (deselects `podman-remote` parameterizations) |
+| `requires_podman_remote` | function | Restricts a test to `podman-remote` (deselects `podman` parameterizations) |
+| `mock_run_os_cmd` | function | Monkeypatches `run_os_cmd` with a `Controller` supporting `set_return()` and `set_side_effect()` |
 
-Live tests exercise three distro images ranked by test value:
+## Test Files
 
-1. **alpine** — busybox/ash fallback paths, no bash
-2. **ubuntu** — bash, setpriv, dash as `/bin/sh`
-3. **fedora** — bash, gawk, capsh (mostly redundant with ubuntu)
+| File | Tests | Description |
+|------|-------|-------------|
+| `test_podrun_cli.py` | CLI flag parsing, equals-form flags, passthrough |
+| `test_podrun_utils.py` | Constants, `_parse_export`, `_parse_image_ref`, tilde expansion, passthrough introspection |
+| `test_podrun_config.py` | Config merge, devcontainer parsing, `resolve_config` |
+| `test_podrun_entrypoint.py` | `generate_run_entrypoint`, `generate_rc_sh`, `generate_exec_entrypoint` |
+| `test_podrun_overlays.py` | Overlay arg builders, dotfiles, caps, validate |
+| `test_podrun_state.py` | Container state detection, exec args, overlay command assembly |
+| `test_podrun_main.py` | `_handle_run` orchestration, `main()`, nested podrun, podrunrc |
+| `test_podrun_store_service.py` | Store service lifecycle, socket/PID management |
+| `test_podrun_completions.py` | Bash/zsh/fish completion generators |
+| `test_podrun_lint.py` | Ruff, mypy, shellcheck, vulture enforcement |
 
-The number of images tested scales with `-n`: `-n1` tests alpine only,
-`-n2` adds ubuntu, `-n3` (and `-n0`) tests all three.
+## Binary State Testing
 
-## Transient Podman Flakes
+The test suite is validated against all four podman binary installation states:
 
-Rootless podman has known race conditions that cause sporadic test failures
-(typically 2-4 per run out of ~600 tests). These are runtime races in podman
-itself, not test bugs. Symptoms:
+| State | How | Expected |
+|-------|-----|----------|
+| Both binaries | Default (both installed) | All tests pass, 0 skipped, coverage gate enforced |
+| podman only | Hide `podman-remote` | `[podman-remote]` params skipped, coverage gate relaxed |
+| podman-remote only | Hide `podman` | `[podman]` params skipped, coverage gate relaxed |
+| Neither | Hide both | All tests skipped, coverage gate relaxed |
 
-- `slirp4netns log file ... no such file or directory` — race between
-  container startup and slirp4netns network log creation
-- `getting exit code of container ... from DB: no such exit code` — race
-  between conmon writing the exit code to BoltDB and podman reading it
+The 95% coverage gate (enforced via `pytest-cov`) is automatically relaxed
+when any tests are skipped (incomplete binary set).
 
-Different tests fail each run and always pass on retry. These flakes are more
-frequent with parallel execution (`-n3`) due to shared podman infrastructure
-(`/run/user/<uid>/libpod/`, rootless pause process).
+## Writing New Tests
+
+1. **Do not** create per-file `_isolate` fixtures — `conftest.py` handles
+   isolation via the autouse `_isolate` fixture.
+2. Add `pytestmark = pytest.mark.usefixtures('podman_binary')` at module level
+   if the test file exercises code that depends on the resolved podman binary
+   or scraped flags.
+3. Use `@pytest.mark.usefixtures('podman_only')` on tests/classes that use
+   flags only available in full podman (e.g. `--root`, `--storage-driver`).
+4. For tests needing a `run_os_cmd` mock, request `mock_run_os_cmd` as a
+   fixture parameter — do not redefine it in test files.
+5. `PODRUN_TMP` is already redirected to `tmp_path` — no need for additional
+   temp directory fixtures.
+
+## Lint Enforcement
+
+The `test_podrun_lint.py` file enforces code quality:
+
+| Tool | Checks |
+|------|--------|
+| **ruff** | `ruff check` + `ruff format --check` on source and tests |
+| **mypy** | Type checking on `podrun/podrun.py` |
+| **shellcheck** | Entrypoint scripts at `--severity=warning`; completions at `--severity=error` |
+| **vulture** | Dead code detection on `podrun/podrun.py` |
+
+---
+
+See also: [Reference](reference.md) for the full flag table.

@@ -134,9 +134,9 @@ class TestUserOverlayArgs:
 
     def test_script_volume_mounts(self):
         args, _ = self._call()
-        assert f'-v=/tmp/ep.sh:{PODRUN_ENTRYPOINT_PATH}:ro' in args
-        assert f'-v=/tmp/rc.sh:{PODRUN_RC_PATH}:ro' in args
-        assert f'-v=/tmp/exec.sh:{PODRUN_EXEC_ENTRY_PATH}:ro' in args
+        assert f'-v=/tmp/ep.sh:{PODRUN_ENTRYPOINT_PATH}:ro,z' in args
+        assert f'-v=/tmp/rc.sh:{PODRUN_RC_PATH}:ro,z' in args
+        assert f'-v=/tmp/exec.sh:{PODRUN_EXEC_ENTRY_PATH}:ro,z' in args
 
     def test_env_rc_path(self):
         args, _ = self._call()
@@ -235,7 +235,7 @@ class TestHostOverlayArgs:
         ns = {'dc.workspace_folder': '/app'}
         args = _host_overlay_args(ns, [])
         cwd = str(pathlib.Path.cwd())
-        assert f'-v={cwd}:/app' in args
+        assert f'-v={cwd}:/app:z' in args
         assert '-w=/app' in args
 
     def test_workspace_skipped_when_w_in_passthrough(self):
@@ -259,7 +259,7 @@ class TestHostOverlayArgs:
         args = _host_overlay_args({}, [])
         assert '-w=/app' in args
         cwd = str(pathlib.Path.cwd())
-        assert f'-v={cwd}:/app' in args
+        assert f'-v={cwd}:/app:z' in args
 
     def test_localtime_mount(self):
         args = _host_overlay_args({}, [])
@@ -292,7 +292,7 @@ class TestDotFilesOverlayArgs:
         args = _dot_files_overlay_args({}, [])
         vimrc_args = [a for a in args if '.vimrc' in a]
         assert len(vimrc_args) == 1
-        assert ':ro' in vimrc_args[0]
+        assert ':ro,z' in vimrc_args[0]
 
     def test_skips_missing_files(self, tmp_path):
         args = _dot_files_overlay_args({}, [])
@@ -343,7 +343,7 @@ class TestDotFilesOverlayArgs:
         (tmp_path / '.vimrc').write_text('set nocp')
         (tmp_path / '.gitconfig').write_text('[user]')
         args = _dot_files_overlay_args({}, [])
-        ro_args = [a for a in args if a.endswith(':ro')]
+        ro_args = [a for a in args if a.endswith(':ro,z')]
         zero_args = [a for a in args if a.endswith(':0')]
         assert len(ro_args) == 1  # .vimrc
         assert len(zero_args) == 1  # .gitconfig
@@ -362,7 +362,7 @@ class TestCopyStagingArgs:
         args = _copy_staging_args([(str(f), '/home/user/.gitconfig')])
         assert len(args) == 1
         assert 'copy-staging' in args[0]
-        assert ':ro' in args[0]
+        assert ':ro,z' in args[0]
         # Verify staging content
         staging_path = args[0].split('=')[1].split(':')[0]
         assert open(os.path.join(staging_path, '.podrun_target')).read() == '/home/user/.gitconfig'
@@ -376,9 +376,9 @@ class TestCopyStagingArgs:
         args = _copy_staging_args([(str(d), '/home/user/.ssh')])
         assert len(args) == 2
         # First mount: staging dir
-        assert 'copy-staging' in args[0] and ':ro' in args[0]
+        assert 'copy-staging' in args[0] and ':ro,z' in args[0]
         # Second mount: data bind
-        assert '/data:ro' in args[1]
+        assert '/data:ro,z' in args[1]
         # Verify target file
         staging_path = args[0].split('=')[1].split(':')[0]
         assert open(os.path.join(staging_path, '.podrun_target')).read() == '/home/user/.ssh'
@@ -818,7 +818,7 @@ class TestGitSubmoduleOverlay:
         self._make_submodule()
         args = _host_overlay_args({}, [])
         # Default workspace is /app, depth=1 → mount at /.git
-        assert f'-v={self.root_git}:/.git' in args
+        assert f'-v={self.root_git}:/.git:z' in args
 
     def test_submodule_no_env_vars(self):
         """Submodule mount emits no GIT_DIR/GIT_WORK_TREE/GIT_CEILING_DIRECTORIES."""
@@ -868,7 +868,7 @@ class TestGitSubmoduleOverlay:
         }
         args = devcontainer_run_args(dc, {})
         # workspace=/workspace, depth=1 → mount at /.git
-        assert f'-v={root_git}:/.git' in args
+        assert f'-v={root_git}:/.git:z' in args
         assert not any('--env=GIT_DIR' in a for a in args)
 
     def test_workspace_mount_normal_repo_via_dc(self, tmp_path):
@@ -921,7 +921,7 @@ class TestGitSubmoduleArgs:
         workspace.mkdir()
         (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
         args = _git_submodule_args(str(workspace), '/app')
-        assert args == [f'-v={root_git}:/.git']
+        assert args == [f'-v={root_git}:/.git:z']
 
     def test_deep_workspace_mounts_relative(self, tmp_path):
         """Workspace at /a/b/c/d/e (depth 5), submod depth 2 → mount at /a/b/c/.git."""
@@ -933,7 +933,7 @@ class TestGitSubmoduleArgs:
         (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
         args = _git_submodule_args(str(workspace), '/a/b/c/d/e')
         # depth=2 (x/y), walk up /a/b/c/d/e by 2 → /a/b/c
-        assert args == [f'-v={root_git}:/a/b/c/.git']
+        assert args == [f'-v={root_git}:/a/b/c/.git:z']
 
     def test_deep_workspace_shallow_submod_mounts_near_root(self, tmp_path):
         """Workspace at /a/b/c (depth 3), submod depth 3 → mount at /.git."""
@@ -945,7 +945,7 @@ class TestGitSubmoduleArgs:
         (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
         args = _git_submodule_args(str(workspace), '/a/b/c')
         # depth=3, walk up /a/b/c by 3 → /
-        assert args == [f'-v={root_git}:/.git']
+        assert args == [f'-v={root_git}:/.git:z']
 
     def test_submod_depth_exceeds_workspace_clamps_at_root(self, tmp_path):
         """Submod depth > workspace depth → clamps at /.git (POSIX /../ at / = /)."""
@@ -957,7 +957,7 @@ class TestGitSubmoduleArgs:
         (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
         args = _git_submodule_args(str(workspace), '/w')
         # depth=3, walk up /w by 3 → / (PurePosixPath.parent stops at /)
-        assert args == [f'-v={root_git}:/.git']
+        assert args == [f'-v={root_git}:/.git:z']
 
     def test_normal_repo_returns_empty(self, tmp_path):
         workspace = tmp_path / 'project'

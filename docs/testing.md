@@ -30,8 +30,8 @@ All fixtures are defined in `tests/conftest.py`:
 
 ## Test Files
 
-| File | Tests | Description |
-|------|-------|-------------|
+| File | Tests |
+|------|-------|
 | `test_podrun_cli.py` | CLI flag parsing, equals-form flags, passthrough |
 | `test_podrun_utils.py` | Constants, `_parse_export`, `_parse_image_ref`, tilde expansion, passthrough introspection |
 | `test_podrun_config.py` | Config merge, devcontainer parsing, `resolve_config` |

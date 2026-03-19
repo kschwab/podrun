@@ -138,9 +138,9 @@ _OVERLAY_FIELDS = [
 # (resolved by _resolve_overlay_mounts via entrypoint copy-staging).
 _DOTFILES = [
     # Mount dot files
-    '-v=~/.emacs:~/.emacs:ro',
-    '-v=~/.emacs.d:~/.emacs.d:ro',
-    '-v=~/.vimrc:~/.vimrc:ro',
+    '-v=~/.emacs:~/.emacs:ro,z',
+    '-v=~/.emacs.d:~/.emacs.d:ro,z',
+    '-v=~/.vimrc:~/.vimrc:ro,z',
     # Copy dot files
     '-v=~/.ssh:~/.ssh:0',
     '-v=~/.gitconfig:~/.gitconfig:0',
@@ -1300,9 +1300,9 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
     for cap in BOOTSTRAP_CAPS:
         args.append(f'--cap-add={cap}')
     args.append(f'--entrypoint={PODRUN_ENTRYPOINT_PATH}')
-    args.append(f'-v={entrypoint_path}:{PODRUN_ENTRYPOINT_PATH}:ro')
-    args.append(f'-v={rc_path}:{PODRUN_RC_PATH}:ro')
-    args.append(f'-v={exec_entry_path}:{PODRUN_EXEC_ENTRY_PATH}:ro')
+    args.append(f'-v={entrypoint_path}:{PODRUN_ENTRYPOINT_PATH}:ro,z')
+    args.append(f'-v={rc_path}:{PODRUN_RC_PATH}:ro,z')
+    args.append(f'-v={exec_entry_path}:{PODRUN_EXEC_ENTRY_PATH}:ro,z')
     args.append(f'--env=ENV={PODRUN_RC_PATH}')
     for entry in ns.get('run.export') or []:
         container_path, host_path, _ = _parse_export(entry)
@@ -1317,7 +1317,7 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
             )
             sys.exit(1)
         staging_hash = hashlib.sha256(container_path.encode()).hexdigest()[:12]
-        args.append(f'-v={abs_host}:/.podrun/exports/{staging_hash}')
+        args.append(f'-v={abs_host}:/.podrun/exports/{staging_hash}:z')
     return args, caps_to_drop
 
 
@@ -1401,7 +1401,7 @@ def _git_submodule_args(workspace_src: str, workspace_folder: str) -> list:
     for _ in range(depth):
         container_parent = container_parent.parent
     container_git_mount = str(container_parent / '.git')
-    return [f'-v={root_git}:{container_git_mount}']
+    return [f'-v={root_git}:{container_git_mount}:z']
 
 
 def _host_overlay_args(ns, pt):
@@ -1421,7 +1421,7 @@ def _host_overlay_args(ns, pt):
     if not _passthrough_has_flag(pt, '-w') and not _passthrough_has_flag(pt, '--workdir'):
         workspace_folder = ns.get('dc.workspace_folder') or '/app'
         if workspace_folder not in _volume_mount_destinations(pt):
-            args.append(f'-v={pathlib.Path.cwd()}:{workspace_folder}')
+            args.append(f'-v={pathlib.Path.cwd()}:{workspace_folder}:z')
         args.append(f'-w={workspace_folder}')
         if not ns.get('run.no_auto_resolve_git_submodules'):
             args.extend(_git_submodule_args(str(pathlib.Path.cwd()), workspace_folder))
@@ -1464,11 +1464,11 @@ def _copy_staging_args(items: list) -> list:
             # File: copy into staging/data at build time (one mount)
             data_path = os.path.join(staging_dir, 'data')
             shutil.copy2(host_path, data_path)
-            args.append(f'-v={staging_dir}:{container_staging}:ro')
+            args.append(f'-v={staging_dir}:{container_staging}:ro,z')
         elif os.path.isdir(host_path):
             # Directory: bind-mount the host dir as staging/data (two mounts)
-            args.append(f'-v={staging_dir}:{container_staging}:ro')
-            args.append(f'-v={host_path}:{container_staging}/data:ro')
+            args.append(f'-v={staging_dir}:{container_staging}:ro,z')
+            args.append(f'-v={host_path}:{container_staging}/data:ro,z')
     return args
 
 
@@ -1647,9 +1647,9 @@ def print_overlays():
     print('    --passwd-entry=<user>:*:<uid>:<gid>:<user>:/home/<user>:/bin/sh')
     print(f'    --cap-add={",".join(BOOTSTRAP_CAPS)}  (dropped after entrypoint)')
     print(f'    --entrypoint={PODRUN_ENTRYPOINT_PATH}')
-    print(f'    -v=<run-entrypoint>:{PODRUN_ENTRYPOINT_PATH}:ro')
-    print(f'    -v=<rc.sh>:{PODRUN_RC_PATH}:ro')
-    print(f'    -v=<exec-entrypoint>:{PODRUN_EXEC_ENTRY_PATH}:ro')
+    print(f'    -v=<run-entrypoint>:{PODRUN_ENTRYPOINT_PATH}:ro,z')
+    print(f'    -v=<rc.sh>:{PODRUN_RC_PATH}:ro,z')
+    print(f'    -v=<exec-entrypoint>:{PODRUN_EXEC_ENTRY_PATH}:ro,z')
     print()
     print('  host (implies user):')
     print('    --user-overlay')

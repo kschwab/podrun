@@ -38,8 +38,8 @@ These flags apply to all subcommands and must appear before the subcommand:
 | `--shell SHELL` | Shell to use inside container (e.g. `bash`, `zsh`) |
 | `--login` / `--no-login` | Run shell as login shell (sources `/etc/profile`). `--no-login` explicitly disables. |
 | `--prompt-banner TEXT` | Custom prompt banner text |
-| `--auto-attach` | Auto attach to named container if already running |
-| `--auto-replace` | Auto replace named container if already exists |
+| `--auto-attach` | Exec into a running named container (no effect on stopped containers; see [Container Lifecycle](#container-lifecycle)) |
+| `--auto-replace` | Remove and recreate named container (running or stopped; see [Container Lifecycle](#container-lifecycle)) |
 | `--export SRC:DST[:0]` | Export container path to host (requires `--user-overlay`). Append `:0` for copy-only. May be repeated. |
 | `--fuse-overlayfs` | Use fuse-overlayfs for overlay mount program (see [Fuse-Overlayfs](overlays.md#fuse-overlayfs)) |
 
@@ -151,12 +151,41 @@ Set when the relevant overlay or option is active:
 
 ## Container Lifecycle
 
-When a `--name` is provided (or derived from the image), podrun checks for
-existing containers:
+When a `--name` is provided, podrun checks for existing containers:
 
-- **Running container**: prompts to attach or replace (or use `--auto-attach`
-  / `--auto-replace` to skip the prompt)
-- **Stopped container**: prompts to replace (or use `--auto-replace`)
+| Container state | `--auto-attach` | `--auto-replace` | Neither (interactive) |
+|---|---|---|---|
+| **Running** | Exec into container (attach) | Remove + re-run | Prompt: attach? replace? |
+| **Stopped** | Warning, then prompt | Remove + re-run | Prompt: replace? |
+| **Not found** | Create new | Create new | Create new |
+
+**Typical patterns:**
+
+- **`--adhoc`** containers are disposable (`--rm`). If you run the same
+  command while one is still running (e.g. detached), `--auto-attach` opens
+  another shell into it. This is the most common use of `--auto-attach`.
+
+- **`--session`** containers are intentionally persistent — they survive exit
+  so you can inspect state, check logs, or copy files out. Re-running the
+  same command prompts interactively. The prompt is the right default here:
+  you chose persistence for a reason.
+
+- **`--auto-replace`** is a start-time equivalent of `--rm`: it removes the
+  existing container and creates a new one. If you find yourself always
+  auto-replacing, `--adhoc` (which implies `--rm`) is likely a better fit.
+
+**Why podrun does not auto-start stopped containers:**
+
+Podman bakes the container's entrypoint, environment variables, volume
+mounts, and image layers at creation time. `podman start` re-runs a stopped
+container with that original frozen configuration — if anything changed since
+(CLI flags, config scripts, `~/.podrunrc`, image updates), the restarted
+container silently uses stale settings.
+
+To preserve state across container replacements, use `--export` to bind
+specific directories to the host. If you explicitly need to restart a
+stopped container with its original configuration, use `podman start <name>`
+directly.
 
 ## Subcommand Passthrough
 

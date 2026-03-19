@@ -39,14 +39,14 @@ For containers that survive exit, use `--session` with `--name`:
 podrun run --session --name mydev ubuntu:24.04
 ```
 
-Exit the container (`exit` or `Ctrl-D`), then re-attach:
+When you exit the shell, the container stops but is not removed. You can
+inspect its state (`podrun inspect mydev`), copy files out, or check logs.
+Re-running the same command will prompt you to replace the stopped container
+with a fresh one.
 
-```bash
-podrun run --session --name mydev --auto-attach ubuntu:24.04
-```
-
-`--auto-attach` skips the "attach or replace?" prompt and connects to the
-running container directly.
+Use `--export` to persist specific directories on the host so they survive
+container replacement (see
+[Overlays — Exports](overlays.md#exports-reverse-volumes)).
 
 ## Running Commands Non-Interactively
 
@@ -69,8 +69,7 @@ Create `.devcontainer.json` in your project root:
   "customizations": {
     "podrun": {
       "session": true,
-      "name": "myproject",
-      "autoAttach": true
+      "name": "myproject"
     }
   }
 }

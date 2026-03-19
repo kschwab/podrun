@@ -137,7 +137,6 @@ Supported variables:
     "podrun": {
       "name": "mydev",
       "session": true,
-      "autoAttach": true,
       "shell": "zsh",
       "promptBanner": "my-project",
       "dotFilesOverlay": true,

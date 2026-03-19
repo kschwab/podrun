@@ -478,8 +478,90 @@ cat C:\path\to\corporate-ca.crt | podman machine ssh "sudo tee /etc/pki/ca-trust
 Note: `update-ca-trust` is for Fedora CoreOS (default podman machine). Use
 `update-ca-certificates` for Debian/Ubuntu-based machines.
 
+#### Corporate proxy / TLS interception (Git, pip, Python)
+
+Corporate networks that perform TLS inspection replace upstream certificates
+with ones signed by an internal CA. This breaks any tool that uses its own
+certificate bundle instead of the Windows certificate store.
+
+**Git** — use the Windows native TLS stack (schannel) instead of OpenSSL:
+
+```powershell
+git config --global http.sslBackend schannel
+```
+
+**pip / Python** — Python's `ssl` module uses its own CA bundle, not the
+Windows store. Install `pip-system-certs` to bridge them (one-time bootstrap
+with trust bypass):
+
+```powershell
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pip-system-certs
+```
+
+After this, all `pip install` commands trust the corporate CA automatically.
+If `pip-system-certs` is not an option, the manual workaround is:
+
+```powershell
+pip config set global.trusted-host "pypi.org files.pythonhosted.org"
+```
+
+This skips TLS verification for PyPI entirely (less secure but functional).
+
 ### Phase 3 — Live Testing + Bug Fixes
 
 Live container integration tests and bug fixes discovered during end-to-end
 testing. Unit tests cover parsing, generation, and assembly logic; Phase 3
 validates the full podrun lifecycle against real podman.
+
+#### UID Collision in `/etc/passwd` ✓
+
+Images that ship a user with the same UID as the host user (e.g. ubuntu:24.04
+ships `ubuntu` at UID 1000) cause identity confusion. Two fixes applied:
+
+1. **UID collision removal** — the run-entrypoint sed removes `/etc/passwd`
+   entries where the UID matches but the username differs. Same for
+   `/etc/group` GID collisions.
+
+2. **Passwd entry fallback** — some podman versions silently ignore
+   `--passwd-entry` when the UID already exists in the image's `/etc/passwd`.
+   The entrypoint now checks whether an entry for our UID exists after
+   collision removal; if not, it appends one directly (same pattern already
+   used for `/etc/group`).
+
+#### Named Container State Management (design rationale)
+
+`handle_container_state()` determines the action when a `--name`d container
+already exists. The decision tree:
+
+| Container state | `--auto-attach` | `--auto-replace` | Neither (interactive) |
+|---|---|---|---|
+| **Running** | `podman exec` (attach) | Remove + re-run | Prompt: attach? replace? |
+| **Stopped** | Warning + fall through | Remove + re-run | Prompt: replace? |
+| **Not found** | Run (create new) | Run (create new) | Run (create new) |
+
+**Typical patterns:**
+
+- **`--adhoc`** containers are disposable (`--rm`). `--auto-attach` is the
+  natural companion — if the container is still running (detached, long-lived
+  process), open another shell into it.
+- **`--session`** containers are intentionally persistent — they survive exit
+  so the user can inspect state, check logs, or copy files out. The
+  interactive prompt is the right default: the user chose persistence for a
+  reason.
+- **`--auto-replace`** is a start-time equivalent of `--rm`: it removes the
+  old container and creates a fresh one. If a user is always auto-replacing,
+  `--adhoc` (which implies `--rm`) is likely a better fit.
+
+**Why stopped containers are not auto-started:**
+
+Podman bakes the container's entrypoint, env vars, volume mounts, and image
+layers at creation time. `podman start` re-runs a stopped container with
+that frozen configuration — if anything changed since (CLI flags, config
+scripts, `~/.podrunrc`, image updates), the restarted container silently
+uses stale settings. Entrypoint scripts are SHA-addressed under `PODRUN_TMP`
+and may have been cleaned by the stale file cleaner, breaking the container.
+
+For persistent state across replacements, use `--export` to bind host
+directories into the container. If a user explicitly needs to restart a
+stopped container with its original configuration, `podman start <name>`
+works directly.

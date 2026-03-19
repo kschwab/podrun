@@ -106,18 +106,20 @@ podrun run --adhoc ubuntu:24.04
 ## Session Overlay (`--session`)
 
 Implies `--host-overlay` + `--interactive-overlay` + `--dotfiles`. The
-standard mode for persistent development containers.
+standard mode for development containers.
 
-Use `--name` for a stable container name, and `--auto-attach` /
-`--auto-replace` for seamless reconnection:
+Use `--name` for a stable container name:
 
 ```bash
-# First run — creates the container
 podrun run --session --name mydev ubuntu:24.04
-
-# Later — auto-attaches to the running container
-podrun run --session --name mydev --auto-attach ubuntu:24.04
 ```
+
+When you exit, the container stops but is preserved — you can inspect it,
+copy files out, or check logs. Re-running the same command prompts you to
+replace the stopped container with a fresh one.
+
+If you want a disposable session that auto-cleans on exit, use `--adhoc`
+instead (implies `--session` + `--rm`).
 
 ## Ad-Hoc Overlay (`--adhoc`)
 

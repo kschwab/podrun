@@ -998,11 +998,17 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         #
         # Patch SHELL field in /etc/passwd (--passwd-entry creates the entry
         # with /bin/sh; update to the resolved shell path).
-        # Also ensure group entry exists (requires CAP_DAC_OVERRIDE).
+        #
+        # Ensure passwd/group entries exist: some podman versions silently
+        # ignore --passwd-entry when the UID already exists in the image,
+        # so we add the entry ourselves as a fallback.
         if command -v sed > /dev/null 2>&1; then
           sed -i "/^{UNAME}:/!{{ /^[^:]*:[^:]*:{UID}:/d; }}" /etc/passwd 2>/dev/null || true
           sed -i "/^{UNAME}:/!{{ /^[^:]*:[^:]*:[^:]*:{GID}:/d; }}" /etc/group 2>/dev/null || true
           sed -i "s|^\\({UNAME}:.*:\\)/bin/sh\\$|\\1$SHELL|" /etc/passwd 2>/dev/null || true
+        fi
+        if ! awk -v uid={UID} -F: '{{ if($3==uid){{found=1}} }} END{{exit !found}}' /etc/passwd 2>/dev/null; then
+          echo "{UNAME}:*:{UID}:{GID}:{UNAME}:/home/{UNAME}:$SHELL" >> /etc/passwd 2>/dev/null || true
         fi
         if ! awk -v gid={GID} -F: '{{ if($3==gid){{found=1}} }} END{{exit !found}}' /etc/group 2>/dev/null; then
           echo "{UNAME}:x:{GID}:" >> /etc/group 2>/dev/null || true

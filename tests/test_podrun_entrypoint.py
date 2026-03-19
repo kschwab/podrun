@@ -94,6 +94,15 @@ class TestGenerateRunEntrypoint:
         # group: delete lines NOT starting with our username that have our GID
         assert f'/^[^:]*:[^:]*:[^:]*:{GID}:/d' in content
 
+    def test_passwd_entry_fallback(self):
+        """Entrypoint adds passwd entry as fallback when --passwd-entry was ignored."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        # awk check for UID existence + echo fallback with $SHELL
+        assert f'-v uid={UID}' in content
+        assert f'{UNAME}:*:{UID}:{GID}:{UNAME}:/home/{UNAME}:$SHELL' in content
+
     def test_home_dir_creation(self):
         path = generate_run_entrypoint(_default_ns())
         with open(path) as f:

@@ -991,10 +991,17 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
 {shell_detect}
         PODRUN_SHELL="$SHELL"; export PODRUN_SHELL
 
+        # Remove image-shipped /etc/passwd entries that collide on UID but have
+        # a different username (e.g. ubuntu:24.04 ships 'ubuntu' at UID 1000).
+        # --passwd-entry appends our entry, but getpwuid returns the first match.
+        # Same treatment for /etc/group (GID collision).
+        #
         # Patch SHELL field in /etc/passwd (--passwd-entry creates the entry
         # with /bin/sh; update to the resolved shell path).
         # Also ensure group entry exists (requires CAP_DAC_OVERRIDE).
         if command -v sed > /dev/null 2>&1; then
+          sed -i "/^{UNAME}:/!{{ /^[^:]*:[^:]*:{UID}:/d; }}" /etc/passwd 2>/dev/null || true
+          sed -i "/^{UNAME}:/!{{ /^[^:]*:[^:]*:[^:]*:{GID}:/d; }}" /etc/group 2>/dev/null || true
           sed -i "s|^\\({UNAME}:.*:\\)/bin/sh\\$|\\1$SHELL|" /etc/passwd 2>/dev/null || true
         fi
         if ! awk -v gid={GID} -F: '{{ if($3==gid){{found=1}} }} END{{exit !found}}' /etc/group 2>/dev/null; then

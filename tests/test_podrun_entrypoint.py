@@ -83,6 +83,17 @@ class TestGenerateRunEntrypoint:
         assert str(UID) in content
         assert str(GID) in content
 
+    def test_uid_collision_removal(self):
+        """Entrypoint removes /etc/passwd entries with same UID but different username."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        # passwd: delete lines NOT starting with our username that have our UID
+        assert f'/^{UNAME}:/!' in content
+        assert f'/^[^:]*:[^:]*:{UID}:/d' in content
+        # group: delete lines NOT starting with our username that have our GID
+        assert f'/^[^:]*:[^:]*:[^:]*:{GID}:/d' in content
+
     def test_home_dir_creation(self):
         path = generate_run_entrypoint(_default_ns())
         with open(path) as f:

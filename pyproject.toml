@@ -32,7 +32,6 @@ classifiers = [
 dev = [
     "pytest",
     "pytest-xdist>=3.0",
-    "filelock",
     "pytest-cov",
     "ruff",
     "mypy",

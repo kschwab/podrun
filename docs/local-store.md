@@ -17,10 +17,13 @@ layers, and runtime state isolated from your system podman.
 
 ## Auto-Discovery
 
-Podrun walks upward from the current directory looking for
-`.devcontainer/.podrun/store/graphroot/`. When found, store flags
-(`--root`/`--runroot`/`--storage-driver`) are injected automatically for all
-subcommands — `run`, passthrough (`ps`, `images`, etc.):
+Podrun walks upward from the current directory looking for a project root.
+When `.devcontainer/` is found, the store path is
+`.devcontainer/.podrun/store/`. When `.devcontainer.json` is found instead,
+the store path is `.podrun/store/`. If the store's `graphroot/` directory
+exists, store flags (`--root`/`--runroot`/`--storage-driver`) are injected
+automatically for all subcommands — `run`, passthrough (`ps`, `images`,
+etc.):
 
 ```bash
 # Create a store (one-time)

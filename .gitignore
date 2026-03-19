@@ -7,6 +7,6 @@ build/
 *.whl
 .eggs/
 .coverage*
-.podrun-store/
+.podrun/store/
 .devcontainer/.podrun/store/
 .claude/config/

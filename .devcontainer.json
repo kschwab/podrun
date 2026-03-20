@@ -1,0 +1,13 @@
+{
+    "image": "fedora:43",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/podrun,type=bind,relabel=shared",
+    "workspaceFolder": "/podrun",
+    "customizations": {
+        "podrun": {
+            "login": true,
+            "hostOverlay": true,
+            "dotFilesOverlay": true,
+            "shell": "bash"
+        }
+    }
+}

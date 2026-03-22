@@ -182,21 +182,6 @@ class PodmanFlags:
 _loaded_flags: dict = {}
 
 
-def get_podman_version(podman_path):
-    """Parse version string from ``podman --version``."""
-    result = subprocess.run(
-        [podman_path, '--version'],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    if result.returncode != 0:
-        return None
-    # "podman version 5.4.0" → "5.4.0"
-    m = re.search(r'(\d+\.\d+\.\d+)', result.stdout)
-    return m.group(1) if m else None
-
-
 def _flags_cache_dir():
     """Return the platform-appropriate podrun cache directory.
 
@@ -210,15 +195,25 @@ def _flags_cache_dir():
     return os.path.join(base, 'podrun')
 
 
-def _flags_cache_path(version, podman_path='podman'):
-    """Return the cache file path for a given podman version.
+def _flags_cache_path(podman_path='podman'):
+    """Return the disk cache path for scraped podman flags.
 
-    Uses ``podman-remote`` in the filename when operating in remote mode
+    Cache key is derived from ``os.stat()`` on the binary — catches upgrades
+    without spawning a subprocess (~1 µs vs ~800 ms on Windows).  Falls back
+    to ``'unknown'`` if stat fails.
+
+    Uses ``podman-remote`` in the label when operating in remote mode
     (binary is ``podman-remote`` or ``CONTAINER_HOST`` is set), so the
     cache reflects the actual flag set rather than the binary name.
     """
     label = 'podman-remote' if _is_remote(podman_path) else 'podman'
-    return os.path.join(_flags_cache_dir(), f'{label}-{version}.json')
+    resolved = shutil.which(podman_path) if not os.path.isabs(podman_path) else podman_path
+    try:
+        st = os.stat(resolved or podman_path)
+        key = f'{label}-{st.st_mtime_ns}-{st.st_size}'
+    except OSError:
+        key = f'{label}-unknown'
+    return os.path.join(_flags_cache_dir(), f'{key}.json')
 
 
 def _scrape_all_flags(podman_path):
@@ -284,14 +279,41 @@ def _write_flags_cache(path, flags):
         pass
 
 
+def _clean_stale_cache(current_cache_path):
+    """Remove old .json cache files for the same binary label.
+
+    Called after writing a new cache file so that stale entries (from previous
+    stat keys) don't accumulate.  Only removes files matching the same label
+    (``podman`` or ``podman-remote``), leaving the other binary's cache intact.
+    Silently ignores errors.
+    """
+    cache_dir = os.path.dirname(current_cache_path)
+    current_basename = os.path.basename(current_cache_path)
+    is_remote = current_basename.startswith('podman-remote-')
+    try:
+        for f in os.listdir(cache_dir):
+            if not f.endswith('.json') or f == current_basename:
+                continue
+            # Only clean files with the same label (remote vs non-remote).
+            if f.startswith('podman-remote-') == is_remote:
+                try:
+                    os.remove(os.path.join(cache_dir, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def load_podman_flags(podman_path=None):
     """Load podman flags via in-memory cache, disk cache, or live scrape.
 
     Resolution chain:
     1. In-memory cache hit → return immediately
-    2. Disk cache for current podman version → read, store in memory, return
+    2. Disk cache (stat-based key) → read, store in memory, return
     3. Live scrape from ``podman_path --help`` → write cache, return
-    4. Podman not found → sys.exit(1)
+
+    The cache key is derived from ``os.stat()`` on the binary, so no
+    subprocess is needed on the warm-cache path.
 
     When *podman_path* is ``None``, resolves via ``_default_podman_path()``.
     Scraping works for both ``podman`` and ``podman-remote``.  The latter
@@ -304,13 +326,8 @@ def load_podman_flags(podman_path=None):
     if podman_path in _loaded_flags:
         return _loaded_flags[podman_path]
 
-    version = get_podman_version(podman_path)
-    if version is None:
-        print(f'Error: Could not determine podman version from {podman_path}', file=sys.stderr)
-        sys.exit(1)
-
-    # Try disk cache
-    cache_path = _flags_cache_path(version, podman_path)
+    # Stat-based cache lookup — no subprocess call on warm cache.
+    cache_path = _flags_cache_path(podman_path)
     flags = _read_flags_cache(cache_path)
     if flags is not None:
         _loaded_flags[podman_path] = flags
@@ -318,6 +335,8 @@ def load_podman_flags(podman_path=None):
 
     flags = _scrape_all_flags(podman_path)
     _write_flags_cache(cache_path, flags)
+    # Clean stale cache files from previous versions/stat keys.
+    _clean_stale_cache(cache_path)
     _loaded_flags[podman_path] = flags
     return flags
 
@@ -4276,21 +4295,19 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
 def main(argv=None):
     raw = argv if argv is not None else sys.argv[1:]
 
-    # Cleanup: early exit before any podman invocation.  Avoids podman
-    # subprocesses (version check, flag scraping) touching the store or
-    # regenerating the flags cache right before we delete them.
+    # Cleanup: early exit before any podman invocation.  Avoids flag
+    # scraping touching the store or regenerating the flags cache right
+    # before we delete them.
     if '--__cleanup__' in raw:
         _cleanup()
         sys.exit(0)
 
-    podman_path = _default_podman_path() or 'podman'
-
-    # Podman-not-found guard — fail early before parsing.
-    if get_podman_version(podman_path) is None:
-        print(f'Error: podman not found or not functional ({podman_path})', file=sys.stderr)
+    podman_path = _default_podman_path()
+    if podman_path is None:
+        print('Error: podman not found.', file=sys.stderr)
         sys.exit(1)
 
-    # Pre-load flags for the resolved binary (podman vs podman-remote).
+    # Stat-based flag loading — zero subprocess calls on warm cache.
     flags = load_podman_flags(podman_path)
     ctx = parse_args(raw, flags=flags)
     ctx.podman_path = podman_path

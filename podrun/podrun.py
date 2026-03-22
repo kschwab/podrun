@@ -388,6 +388,111 @@ def _clean_stale_files(directory: str, max_age_days: int = 1) -> None:
         pass
 
 
+def _cleanup():  # noqa: C901
+    """Remove all podrun-generated runtime artifacts.
+
+    Cleans PODRUN_TMP, flags cache, and idle store service runtime dirs.
+    Image stores (graphroot), images, and containers are not touched.
+    Store entries with active containers are skipped.
+    """
+    removed: list[str] = []
+    removed_entries: list[str] = []
+    failed: list[str] = []
+    # Stop idle store services and remove their runtime dirs.
+    # Skip entries where the socket still serves running containers —
+    # removing the socket would break nested podrun sessions.
+    if os.path.isdir(_PODRUN_STORES_DIR):
+        all_removed = True
+        had_entries = False
+        for name in os.listdir(_PODRUN_STORES_DIR):
+            entry = os.path.join(_PODRUN_STORES_DIR, name)
+            if not os.path.isdir(entry):
+                continue
+            had_entries = True
+            sock = os.path.join(entry, 'podman.sock')
+            pid_path = os.path.join(entry, 'podman.pid')
+            # Check if containers are running via the socket.
+            has_containers = False
+            if os.path.exists(sock):
+                try:
+                    r = subprocess.run(
+                        ['podman', '--url', f'unix://{sock}', 'ps', '-q'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    has_containers = r.returncode == 0 and r.stdout.strip() != ''
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if has_containers:
+                all_removed = False
+                print(
+                    f'Skipped: Store service entry (containers running): {entry}', file=sys.stderr
+                )
+                continue
+            # No active containers — stop service if alive, then remove.
+            if os.path.isfile(pid_path):
+                try:
+                    pid = int(open(pid_path).read().strip())  # noqa: SIM115
+                    os.kill(pid, signal.SIGTERM)
+                    print(f'Stopped: Store service (PID {pid}): {entry}', file=sys.stderr)
+                except (ValueError, OSError):
+                    pass
+            try:
+                shutil.rmtree(entry)
+            except PermissionError:
+                # Runroot dirs contain UID-mapped files from podman's user
+                # namespace — need `podman unshare` to remove them.
+                try:
+                    subprocess.run(
+                        ['podman', 'unshare', 'rm', '-rf', entry],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except OSError as e:
+                print(f'Error removing {entry}: {e}', file=sys.stderr)
+            if os.path.isdir(entry):
+                all_removed = False
+                failed.append(f'Store service entry: {entry}')
+            else:
+                removed_entries.append(entry)
+        if all_removed:
+            # All entries gone (or empty) — remove the parent dir.
+            try:
+                shutil.rmtree(_PODRUN_STORES_DIR)
+            except OSError:
+                pass
+            if had_entries and not os.path.isdir(_PODRUN_STORES_DIR):
+                removed.append(f'Store service runtime (sockets, PIDs): {_PODRUN_STORES_DIR}')
+        elif removed_entries:
+            removed.append(f'Store service entries: {", ".join(removed_entries)}')
+    # Remove generated content and cache.
+    cache_dir = _flags_cache_dir()
+    for label, d in (
+        ('Entrypoint scripts and staging', PODRUN_TMP),
+        ('Podman flags cache', cache_dir),
+    ):
+        if os.path.isdir(d) and os.listdir(d):
+            try:
+                shutil.rmtree(d)
+            except OSError as e:
+                print(f'Error removing {d}: {e}', file=sys.stderr)
+            if not os.path.isdir(d):
+                removed.append(f'{label}: {d}')
+            else:
+                failed.append(f'{label}: {d}')
+    for item in removed:
+        print(f'Removed {item}', file=sys.stderr)
+    for item in failed:
+        print(f'Failed to remove {item}', file=sys.stderr)
+    if removed and not failed:
+        print('All cleaned up.', file=sys.stderr)
+    elif not removed and not failed:
+        print('Nothing to clean.', file=sys.stderr)
+
+
 def _default_podman_path():
     """Resolve the default podman binary.
 
@@ -2757,6 +2862,13 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         default=None,
         help=argparse.SUPPRESS,
     )
+    opts.add_argument(
+        '--__cleanup__',
+        dest='root.cleanup',
+        action='store_true',
+        default=False,
+        help=argparse.SUPPRESS,
+    )
 
     # -- Store-related global flags (with translation) ------------------------
     opts.add_argument(
@@ -4161,6 +4273,9 @@ def main(argv=None):
         sys.exit(0)
     if ns['root.completion']:
         print_completion(ns['root.completion'])
+    if ns.get('root.cleanup'):
+        _cleanup()
+        sys.exit(0)
 
     # Help — pass the raw argv so print_help can check for --help before --
     print_help(ns['subcommand'], raw, podman_path)

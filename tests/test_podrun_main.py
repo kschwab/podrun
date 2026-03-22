@@ -18,6 +18,7 @@ from podrun.podrun import (
     _is_remote,
     _resolve_overlay_mounts,
     _warn_missing_subids,
+    _cleanup,
     main,
 )
 
@@ -1083,3 +1084,193 @@ class TestPodrunrcIntegration:
         rc_idx = next(i for i, a in enumerate(cmd) if a == 'FROM_RC=1')
         cli_idx = next(i for i, a in enumerate(cmd) if a == 'FROM_CLI=1')
         assert rc_idx < cli_idx
+
+
+# ---------------------------------------------------------------------------
+# _cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestCleanup:
+    def test_cleanup_removes_tmp(self, tmp_path, capsys):
+        """_cleanup removes PODRUN_TMP directory."""
+        # _isolate already redirects PODRUN_TMP to tmp_path.
+        script = tmp_path / 'test-entrypoint.sh'
+        script.write_text('#!/bin/sh\n')
+        assert tmp_path.exists()
+        _cleanup()
+        assert not tmp_path.exists()
+        err = capsys.readouterr().err
+        assert str(tmp_path) in err
+        assert 'Entrypoint scripts and staging' in err
+        assert 'All cleaned up.' in err
+
+    def test_cleanup_removes_cache(self, tmp_path, monkeypatch, capsys):
+        """_cleanup removes flags cache directory."""
+        cache_dir = tmp_path / 'fake-cache'
+        cache_dir.mkdir()
+        (cache_dir / 'podman-5.4.0.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache_dir))
+        # Ensure PODRUN_TMP doesn't exist so it doesn't confuse output.
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        _cleanup()
+        assert not cache_dir.exists()
+        err = capsys.readouterr().err
+        assert str(cache_dir) in err
+        assert 'Podman flags cache' in err
+
+    def test_cleanup_removes_stores_dir(self, tmp_path, monkeypatch, capsys):
+        """_cleanup removes idle store service entries."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'abc123'
+        entry.mkdir()
+        # PID file with a dead PID — os.kill will raise OSError.
+        (entry / 'podman.pid').write_text('999999999')
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        assert not stores.exists()
+        err = capsys.readouterr().err
+        assert str(stores) in err
+        assert 'Store service runtime' in err
+
+    def test_cleanup_stops_idle_service(self, tmp_path, monkeypatch, capsys):
+        """_cleanup SIGTERMs idle services (no containers) and removes dirs."""
+        import os
+        import signal
+
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'idle'
+        entry.mkdir()
+        # Socket exists but no containers running.
+        (entry / 'podman.sock').write_text('')
+        fake_pid = os.getpid()
+        (entry / 'podman.pid').write_text(str(fake_pid))
+        kills = []
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: kills.append((pid, sig)))
+        # Mock subprocess.run — ps -q returns empty (no containers).
+        monkeypatch.setattr(
+            podrun_mod.subprocess,
+            'run',
+            lambda *a, **kw: subprocess.CompletedProcess(
+                args=a, returncode=0, stdout='', stderr=''
+            ),
+        )
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        # Service should have been sent SIGTERM.
+        assert (fake_pid, signal.SIGTERM) in kills
+        # Entry and parent should be removed.
+        assert not entry.exists()
+        assert not stores.exists()
+        err = capsys.readouterr().err
+        assert f'Stopped: Store service (PID {fake_pid})' in err
+
+    def test_cleanup_skips_active_containers(self, tmp_path, monkeypatch, capsys):
+        """_cleanup skips store entries with running containers."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'active'
+        entry.mkdir()
+        (entry / 'podman.sock').write_text('')
+        (entry / 'podman.pid').write_text('12345')
+        # Mock subprocess.run — ps -q returns a container ID.
+        monkeypatch.setattr(
+            podrun_mod.subprocess,
+            'run',
+            lambda *a, **kw: subprocess.CompletedProcess(
+                args=a, returncode=0, stdout='abc123\n', stderr=''
+            ),
+        )
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        # Entry should still exist — containers are running.
+        assert entry.exists()
+        err = capsys.readouterr().err
+        assert 'Skipped: Store service entry (containers running)' in err
+        assert str(entry) in err
+
+    def test_cleanup_unshare_fallback(self, tmp_path, monkeypatch, capsys):
+        """_cleanup falls back to podman unshare rm -rf on PermissionError."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'mapped'
+        entry.mkdir()
+        (entry / 'podman.pid').write_text('999999999')
+
+        real_rmtree = shutil.rmtree
+        first_call = [True]
+
+        def fake_rmtree(path, **kw):
+            # First call (on entry) raises PermissionError; later calls succeed.
+            if first_call[0] and str(path) == str(entry):
+                first_call[0] = False
+                raise PermissionError(13, 'Permission denied', str(path))
+            real_rmtree(path, **kw)
+
+        monkeypatch.setattr(shutil, 'rmtree', fake_rmtree)
+
+        # Mock subprocess.run to simulate `podman unshare rm -rf` success.
+        def fake_run(*args, **kw):
+            cmd = args[0] if args else kw.get('args', [])
+            if 'unshare' in cmd:
+                real_rmtree(str(entry), ignore_errors=True)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', fake_run)
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        # Entry should be gone after unshare fallback.
+        assert not entry.exists()
+        err = capsys.readouterr().err
+        assert 'Store service runtime' in err
+        assert 'Failed' not in err
+
+    def test_cleanup_noop_when_empty(self, tmp_path, monkeypatch, capsys):
+        """_cleanup prints 'Nothing to clean.' when no dirs exist."""
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'nonexistent2'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent3'))
+        _cleanup()
+        err = capsys.readouterr().err
+        assert 'Nothing to clean.' in err
+
+    def test_cleanup_reports_failure(self, tmp_path, monkeypatch, capsys):
+        """_cleanup prints error and 'Failed to remove' when rmtree fails."""
+        target = tmp_path / 'stubborn'
+        target.mkdir()
+        (target / 'file').write_text('data')
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(target))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+
+        # Raise PermissionError so the directory persists.
+        def fake_rmtree(path, **kw):
+            raise PermissionError(13, 'Permission denied', path)
+
+        monkeypatch.setattr(shutil, 'rmtree', fake_rmtree)
+        _cleanup()
+        err = capsys.readouterr().err
+        assert 'Error removing' in err
+        assert 'Permission denied' in err
+        assert 'Failed to remove' in err
+        assert str(target) in err
+        assert 'All cleaned up.' not in err
+
+    def test_cleanup_flag_hidden(self, capsys):
+        """--__cleanup__ does not appear in --help output."""
+        from podrun.podrun import build_root_parser, load_podman_flags
+
+        flags = load_podman_flags()
+        parser = build_root_parser(flags)
+        help_text = parser.format_help()
+        assert '__cleanup__' not in help_text

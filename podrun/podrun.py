@@ -176,6 +176,7 @@ class PodmanFlags:
     subcommands: frozenset
     run_value_flags: frozenset
     run_boolean_flags: frozenset
+    bool_short_to_long: dict = dataclasses.field(default_factory=dict)  # e.g. {'-d': '--detach'}
 
 
 # In-memory cache keyed by podman_path.
@@ -222,7 +223,7 @@ def _scrape_all_flags(podman_path):
     if global_result is None:
         raise RuntimeError(f'Failed to scrape {podman_path} --help')
 
-    global_value, global_bool, subcmds = global_result
+    global_value, global_bool, subcmds, global_stl = global_result
     # Filter out 'help' — podman lists it but we don't register it as a subparser.
     subcmds.discard('help')
 
@@ -230,7 +231,10 @@ def _scrape_all_flags(podman_path):
     if run_result is None:
         raise RuntimeError(f'Failed to scrape {podman_path} run --help')
 
-    run_value, run_bool, _ = run_result
+    run_value, run_bool, _, run_stl = run_result
+
+    # Merge short→long mappings from both global and run scopes.
+    bool_short_to_long = {**global_stl, **run_stl}
 
     return PodmanFlags(
         global_value_flags=frozenset(global_value),
@@ -238,6 +242,7 @@ def _scrape_all_flags(podman_path):
         subcommands=frozenset(subcmds),
         run_value_flags=frozenset(run_value),
         run_boolean_flags=frozenset(run_bool),
+        bool_short_to_long=bool_short_to_long,
     )
 
 
@@ -252,6 +257,7 @@ def _read_flags_cache(path):
             subcommands=frozenset(data['subcommands']),
             run_value_flags=frozenset(data['run_value_flags']),
             run_boolean_flags=frozenset(data['run_boolean_flags']),
+            bool_short_to_long=data.get('bool_short_to_long', {}),
         )
     except (OSError, KeyError, json.JSONDecodeError):
         return None
@@ -270,6 +276,7 @@ def _write_flags_cache(path, flags):
         'subcommands': sorted(flags.subcommands),
         'run_value_flags': sorted(flags.run_value_flags),
         'run_boolean_flags': sorted(flags.run_boolean_flags),
+        'bool_short_to_long': flags.bool_short_to_long,
     }
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2750,21 +2757,30 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
 _BOOL_TRUE = frozenset({'true', '1'})
 _BOOL_FALSE = frozenset({'false', '0'})
 _BOOL_VALUES = _BOOL_TRUE | _BOOL_FALSE
+_BOOL_PT_PREFIX = '--__bool_pt__'
 
 
-def _normalize_bool_flags(argv: List[str], bool_flags: frozenset) -> List[str]:
+def _normalize_bool_flags(
+    argv: List[str], bool_flags: frozenset, short_to_long: Optional[dict] = None
+) -> List[str]:
     """Normalize boolean flag value forms for argparse compatibility.
 
     Podman boolean flags accept ``--flag=true``, ``--flag=false``,
     ``--flag true``, and ``--flag false``.  Argparse registers them with
-    ``nargs=0`` which rejects explicit values.  This normalizes:
+    ``nargs=0`` which rejects explicit values.
 
-    - ``--flag=true`` / ``--flag true``  → ``--flag``
-    - ``--flag=false`` / ``--flag false`` → removed
+    Explicit-value forms are rewritten to a ``--__bool_pt__flag=value`` variant
+    that argparse handles with ``nargs=1`` (same dest, same ordering).
+    After parsing, :func:`_strip_pt_bool_flags` converts them back to
+    ``--flag=value`` in the passthrough list.
 
-    For short flags (``-x``), only the equals form (``-x=true``) is handled;
-    the space form is too ambiguous (``-d true`` — is ``true`` the image?).
+    Short flags with explicit values (``-d=true``) are translated to their
+    long form via *short_to_long* (e.g. ``-d=false`` → ``--__bool_pt__detach=false``).
+
+    For short flags, only the equals form is handled; the space form is too
+    ambiguous (``-d true`` — is ``true`` the image?).
     """
+    stl = short_to_long or {}
     result: List[str] = []
     skip_next = False
     for i, arg in enumerate(argv):
@@ -2773,23 +2789,54 @@ def _normalize_bool_flags(argv: List[str], bool_flags: frozenset) -> List[str]:
             continue
         if '=' in arg:
             name, _, value = arg.partition('=')
-            if name in bool_flags:
-                if value.lower() in _BOOL_TRUE:
-                    result.append(name)
-                elif value.lower() in _BOOL_FALSE:
-                    pass
-                else:
-                    result.append(arg)  # Unknown value, pass through as-is
+            if name in bool_flags and value.lower() in _BOOL_VALUES:
+                # Resolve short flag to long form for the __bool_pt__ variant.
+                long_name = stl.get(name, name) if not name.startswith('--') else name
+                pt_name = _BOOL_PT_PREFIX + long_name.lstrip('-')
+                result.append(f'{pt_name}={value}')
                 continue
         if arg in bool_flags and arg.startswith('--'):
             # Space form: ``--flag true`` / ``--flag false``
             if i + 1 < len(argv) and argv[i + 1].lower() in _BOOL_VALUES:
-                if argv[i + 1].lower() in _BOOL_TRUE:
-                    result.append(arg)
-                # else: false — skip both flag and value
+                pt_name = _BOOL_PT_PREFIX + arg[2:]
+                result.append(f'{pt_name}={argv[i + 1]}')
                 skip_next = True
                 continue
         result.append(arg)
+    return result
+
+
+def _strip_pt_bool_flags(args: List[str]) -> List[str]:
+    """Convert ``--__bool_pt__flag value`` pairs back to ``--flag=value``.
+
+    Called after argparse to restore the original flag names in passthrough
+    lists.  Handles both the space form (``['--__bool_pt__flag', 'val']``)
+    produced by ``_PassthroughAction`` and any equals form that might
+    survive.
+    """
+    result: List[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith(_BOOL_PT_PREFIX):
+            real_name = '--' + arg[len(_BOOL_PT_PREFIX) :]
+            if '=' in arg:
+                # --__bool_pt__flag=value (shouldn't normally happen after
+                # _PassthroughAction, but handle defensively)
+                _, _, val = arg.partition('=')
+                real_name_base = '--' + arg[len(_BOOL_PT_PREFIX) :].split('=', 1)[0]
+                result.append(f'{real_name_base}={val}')
+            elif i + 1 < len(args):
+                # Space form from _PassthroughAction: --__bool_pt__flag value
+                result.append(f'{real_name}={args[i + 1]}')
+                i += 2
+                continue
+            else:
+                # Trailing --__bool_pt__flag with no value (shouldn't happen)
+                result.append(real_name)
+        else:
+            result.append(arg)
+        i += 1
     return result
 
 
@@ -2961,6 +3008,16 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
             nargs=0,
             help=argparse.SUPPRESS,
         )
+        # Explicit-value variant: --__bool_pt__flag=value (nargs=1) for
+        # --flag=true/false forms rewritten by _normalize_bool_flags.
+        if flag.startswith('--'):
+            opts.add_argument(
+                _BOOL_PT_PREFIX + flag[2:],
+                action=_PassthroughAction,
+                dest='podman_global_args',
+                nargs=1,
+                help=argparse.SUPPRESS,
+            )
 
     # -- Subparsers for routing -----------------------------------------------
     subs = parser.add_subparsers(dest='subcommand', title='Available Commands', required=False)
@@ -3153,6 +3210,16 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
             nargs=0,
             help=argparse.SUPPRESS,
         )
+        # Explicit-value variant: --__bool_pt__flag=value (nargs=1) for
+        # --flag=true/false forms rewritten by _normalize_bool_flags.
+        if flag.startswith('--'):
+            opts.add_argument(
+                _BOOL_PT_PREFIX + flag[2:],
+                action=_PassthroughAction,
+                dest='run.passthrough_args',
+                nargs=1,
+                help=argparse.SUPPRESS,
+            )
 
     # -- IMAGE [COMMAND [ARG...]] boundary ------------------------------------
     # REMAINDER stops flag parsing at the first positional so that command
@@ -3227,16 +3294,24 @@ def parse_args(argv: List[str], flags=None) -> PodrunContext:
         flags = load_podman_flags()
 
     # Normalize --bool=true/false and --bool true/false before argparse sees
-    # them.  Argparse registers boolean flags with nargs=0 which rejects the
-    # explicit-value forms that podman/Docker accept.
+    # them.  Explicit-value forms are rewritten to --__bool_pt__flag=value variants
+    # that argparse handles via nargs=1.  _strip_pt_bool_flags() restores
+    # them after parsing so downstream code sees clean flag names.
     all_bool_flags = flags.global_boolean_flags | flags.run_boolean_flags
-    flag_section = _normalize_bool_flags(flag_section, all_bool_flags)
+    flag_section = _normalize_bool_flags(flag_section, all_bool_flags, flags.bool_short_to_long)
 
     # Single-pass parse: root parser handles global flags + subcommand routing;
     # real subparsers (run/store) handle subcommand-specific flags.
     root = build_root_parser(flags)
     ns_raw, unknowns = root.parse_known_args(flag_section)
     ns = vars(ns_raw)
+
+    # Strip __bool_pt__ prefix from passthrough — restores --flag=value form
+    # in the original argv order.
+    if ns.get('run.passthrough_args'):
+        ns['run.passthrough_args'] = _strip_pt_bool_flags(ns['run.passthrough_args'])
+    if ns.get('podman_global_args'):
+        ns['podman_global_args'] = _strip_pt_bool_flags(ns['podman_global_args'])
 
     subcmd = ns['subcommand']
     trailing_args = []
@@ -3610,7 +3685,7 @@ def print_version(podman_path=None):
 # ---------------------------------------------------------------------------
 
 
-def _scrape_podman_help(podman_path, subcmd=None):
+def _scrape_podman_help(podman_path, subcmd=None):  # noqa: C901
     """Scrape ``podman [subcmd] --help`` and return (value_flags, bool_flags, subcommands).
 
     *value_flags*: flags that take an argument (e.g. ``--env``, ``-e``).
@@ -3630,6 +3705,7 @@ def _scrape_podman_help(podman_path, subcmd=None):
     value_flags = set()
     bool_flags = set()
     subcommands = set()
+    bool_short_to_long: dict = {}
     in_commands = False
 
     for line in result.stdout.splitlines():
@@ -3653,12 +3729,15 @@ def _scrape_podman_help(podman_path, subcmd=None):
             line,
         )
         if m:
-            bucket = value_flags if m.group('val_type') else bool_flags
+            is_bool = not m.group('val_type')
+            bucket = bool_flags if is_bool else value_flags
             bucket.add(m.group('long'))
             if m.group('short'):
                 bucket.add(m.group('short'))
+                if is_bool:
+                    bool_short_to_long[m.group('short')] = m.group('long')
 
-    return value_flags, bool_flags, subcommands
+    return value_flags, bool_flags, subcommands, bool_short_to_long
 
 
 # ---------------------------------------------------------------------------

@@ -849,6 +849,55 @@ def _extract_passthrough_entrypoint(pt):
     return alt_entrypoint, filtered
 
 
+def _extract_passthrough_user(pt):
+    """Extract and remove ``--user``/``-u`` from passthrough args.
+
+    Returns ``(user_value, filtered_pt)``.  Handles all forms produced by
+    ``_PassthroughAction``: ``['--user', 'VAL']`` and ``['-u', 'VAL']``.
+    """
+    user_value = None
+    filtered = []
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        if arg == '--user' and i + 1 < len(pt):
+            user_value = pt[i + 1]
+            i += 2
+            continue
+        elif arg == '-u' and i + 1 < len(pt):
+            user_value = pt[i + 1]
+            i += 2
+            continue
+        else:
+            filtered.append(arg)
+        i += 1
+    return user_value, filtered
+
+
+def _validate_passthrough_user(user_value: str) -> None:
+    """Validate that a ``--user`` value matches the host identity.
+
+    Accepts: ``{UID}``, ``{UID}:{GID}``, ``{UNAME}``, ``{UNAME}:{GID}``.
+    Exits with an error if the value conflicts.
+    """
+    valid = {
+        str(UID),
+        f'{UID}:{GID}',
+        UNAME,
+        f'{UNAME}:{GID}',
+    }
+    if user_value in valid:
+        return
+    print(
+        f'Error: --user={user_value} conflicts with --user-overlay.\n'
+        f'user-overlay maps host identity ({UNAME}, uid={UID}, gid={GID}).\n'
+        f'Accepted values: {UID}, {UID}:{GID}, {UNAME}, {UNAME}:{GID}\n'
+        'Remove --user-overlay or adjust --user to match.',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _parse_mount_spec(mount_spec: str) -> Tuple[Optional[str], Optional[str]]:
     """Parse a ``--mount`` spec string into ``(source, target)``.
 
@@ -1450,6 +1499,11 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
     args = []
     if not _passthrough_has_flag(pt, '--userns'):
         args.append('--userns=keep-id')
+    # Explicit --user ensures Config.User in `podman inspect` reports the
+    # mapped UID, not 0:0.  Without this, podman-remote (Windows) and tools
+    # like VS Code's devcontainer CLI that read Config.User to determine
+    # the container user would incorrectly use root.
+    args.append(f'--user={UID}:{GID}')
     if not _passthrough_has_flag(pt, '--passwd-entry'):
         args.append(f'--passwd-entry={UNAME}:*:{UID}:{GID}:{UNAME}:/home/{UNAME}:/bin/sh')
     caps_to_drop = compute_caps_to_drop(pt)
@@ -1761,27 +1815,16 @@ def _env_args(ns):
 
 
 def _validate_overlay_args(ns):
-    """Error on args that conflict with enabled overlays."""
+    """Error on args that conflict with enabled overlays.
+
+    Note: ``--user``/``-u`` validation is handled separately by
+    :func:`_extract_passthrough_user` + :func:`_validate_passthrough_user`
+    in :func:`build_overlay_run_command`, which also translates matching
+    values to the canonical ``--user={UID}:{GID}`` form.
+    """
     if not ns.get('run.user_overlay'):
         return
     all_args = ns.get('run.passthrough_args') or []
-
-    for arg in all_args:
-        if arg.startswith('--userns'):
-            continue
-        if (
-            arg == '--user'
-            or arg.startswith('--user=')
-            or arg == '-u'
-            or (arg.startswith('-u') and not arg.startswith('--') and len(arg) > 2)
-        ):
-            print(
-                f'Error: {arg} conflicts with --user-overlay.\n'
-                'user-overlay maps host identity via --userns=keep-id and --passwd-entry.\n'
-                'Remove --user-overlay or remove the --user flag.',
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
     for arg in all_args:
         m = re.match(r'--userns=(.*)', arg)
@@ -1800,6 +1843,7 @@ def print_overlays():
     print()
     print('  user:')
     print('    --userns=keep-id')
+    print('    --user=<uid>:<gid>')
     print('    --passwd-entry=<user>:*:<uid>:<gid>:<user>:/home/<user>:/bin/sh')
     print(f'    --cap-add={",".join(BOOTSTRAP_CAPS)}  (dropped after entrypoint)')
     print(f'    --entrypoint={PODRUN_ENTRYPOINT_PATH}')
@@ -3548,6 +3592,14 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
     alt_entrypoint = None
     if ns.get('run.user_overlay'):
         alt_entrypoint, pt = _extract_passthrough_entrypoint(pt)
+
+    # --user extraction — when user-overlay is active, extract any --user/-u
+    # from passthrough, validate it matches the host identity, and let
+    # _user_overlay_args inject the canonical --user={UID}:{GID}.
+    if ns.get('run.user_overlay'):
+        user_value, pt = _extract_passthrough_user(pt)
+        if user_value is not None:
+            _validate_passthrough_user(user_value)
 
     # Generate entrypoints and build user overlay args
     if ns.get('run.user_overlay'):

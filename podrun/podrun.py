@@ -411,12 +411,17 @@ def _cleanup():  # noqa: C901
             had_entries = True
             sock = os.path.join(entry, 'podman.sock')
             pid_path = os.path.join(entry, 'podman.pid')
-            # Check if containers are running via the socket.
-            has_containers = False
-            if os.path.exists(sock):
+            # Check if any containers exist (running or stopped).
+            # Stopped containers still depend on the runroot for restart.
+            # Primary check: overlay-containers/ subdirs on disk (works even
+            # when the store service is down — the common case for stopped
+            # containers).  Fallback: query via socket if the service is up.
+            containers_dir = os.path.join(entry, 'overlay-containers')
+            has_containers = os.path.isdir(containers_dir) and bool(os.listdir(containers_dir))
+            if not has_containers and os.path.exists(sock):
                 try:
                     r = subprocess.run(
-                        ['podman', '--url', f'unix://{sock}', 'ps', '-q'],
+                        ['podman', '--url', f'unix://{sock}', 'ps', '-qa'],
                         capture_output=True,
                         text=True,
                         timeout=5,
@@ -426,9 +431,7 @@ def _cleanup():  # noqa: C901
                     pass
             if has_containers:
                 all_removed = False
-                print(
-                    f'Skipped: Store service entry (containers running): {entry}', file=sys.stderr
-                )
+                print(f'Skipped: Store service entry (containers exist): {entry}', file=sys.stderr)
                 continue
             # No active containers — stop service if alive, then remove.
             if os.path.isfile(pid_path):
@@ -1107,10 +1110,19 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         # Ensure passwd/group entries exist: some podman versions silently
         # ignore --passwd-entry when the UID already exists in the image,
         # so we add the entry ourselves as a fallback.
+        #
+        # IMPORTANT: Do NOT use sed -i.  Podman bind-mounts a generated
+        # /etc/passwd into the container (--passwd-entry).  sed -i replaces
+        # the file with a new inode, breaking the bind mount.  Podman's
+        # exec -u resolution reads through the original mount, so it would
+        # see the old (pre-sed) content while processes inside the container
+        # see the new file.  Writing back via cat preserves the inode.
         if command -v sed > /dev/null 2>&1; then
-          sed -i "/^{UNAME}:/!{{ /^[^:]*:[^:]*:{UID}:/d; }}" /etc/passwd 2>/dev/null || true
-          sed -i "/^{UNAME}:/!{{ /^[^:]*:[^:]*:[^:]*:{GID}:/d; }}" /etc/group 2>/dev/null || true
-          sed -i "s|^\\({UNAME}:.*:\\)/bin/sh\\$|\\1$SHELL|" /etc/passwd 2>/dev/null || true
+          _t=$(mktemp)
+          sed "/^{UNAME}:/!{{ /^[^:]*:[^:]*:{UID}:/d; }}" /etc/passwd > "$_t" 2>/dev/null && cat "$_t" > /etc/passwd || true
+          sed "/^{UNAME}:/!{{ /^[^:]*:[^:]*:[^:]*:{GID}:/d; }}" /etc/group > "$_t" 2>/dev/null && cat "$_t" > /etc/group || true
+          sed "s|^\\({UNAME}:.*:\\)/bin/sh\\$|\\1$SHELL|" /etc/passwd > "$_t" 2>/dev/null && cat "$_t" > /etc/passwd || true
+          rm -f "$_t"
         fi
         if ! awk -v uid={UID} -F: '{{ if($3==uid){{found=1}} }} END{{exit !found}}' /etc/passwd 2>/dev/null; then
           echo "{UNAME}:*:{UID}:{GID}:{UNAME}:/home/{UNAME}:$SHELL" >> /etc/passwd 2>/dev/null || true
@@ -3498,7 +3510,17 @@ def build_passthrough_command(ctx: PodrunContext) -> List[str]:
     cmd = [ctx.podman_path]
     cmd.extend(ns.get('podman_global_args') or [])
     cmd.append(ns['subcommand'])
-    cmd.extend(ctx.subcmd_passthrough_args)
+    # Translate -u root → -u 0.  With --userns=keep-id, podman resolves
+    # usernames by reading /etc/passwd from outside the container's mount
+    # namespace, which may not see entrypoint modifications.  Numeric UIDs
+    # bypass the lookup entirely.
+    args = list(ctx.subcmd_passthrough_args)
+    for i, arg in enumerate(args):
+        if arg in ('-u', '--user') and i + 1 < len(args) and args[i + 1] == 'root':
+            args[i + 1] = '0'
+        elif arg in ('-u=root', '--user=root'):
+            args[i] = arg.replace('root', '0', 1)
+    cmd.extend(args)
     if ctx.explicit_command:
         cmd.append('--')
         cmd.extend(ctx.explicit_command)
@@ -4254,6 +4276,13 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
 def main(argv=None):
     raw = argv if argv is not None else sys.argv[1:]
 
+    # Cleanup: early exit before any podman invocation.  Avoids podman
+    # subprocesses (version check, flag scraping) touching the store or
+    # regenerating the flags cache right before we delete them.
+    if '--__cleanup__' in raw:
+        _cleanup()
+        sys.exit(0)
+
     podman_path = _default_podman_path() or 'podman'
 
     # Podman-not-found guard — fail early before parsing.
@@ -4273,9 +4302,6 @@ def main(argv=None):
         sys.exit(0)
     if ns['root.completion']:
         print_completion(ns['root.completion'])
-    if ns.get('root.cleanup'):
-        _cleanup()
-        sys.exit(0)
 
     # Help — pass the raw argv so print_help can check for --help before --
     print_help(ns['subcommand'], raw, podman_path)

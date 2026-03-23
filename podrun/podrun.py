@@ -837,6 +837,23 @@ def yes_no_prompt(prompt_msg: str, answer_default: bool, is_interactive: bool) -
     return answer[:1] == 'y'
 
 
+def _split_path_colon(entry: str) -> list:
+    """Split on ``:`` while preserving Windows drive letters (``C:\\``)."""
+    parts = entry.split(':')
+    merged: list = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        # Single letter followed by a part starting with \ or / is a drive letter.
+        if len(p) == 1 and p.isalpha() and i + 1 < len(parts) and parts[i + 1][:1] in ('\\', '/'):
+            merged.append(p + ':' + parts[i + 1])
+            i += 2
+        else:
+            merged.append(p)
+            i += 1
+    return merged
+
+
 def _parse_export(entry: str):
     """Parse an export entry into ``(container_path, host_path, copy_only)``.
 
@@ -845,7 +862,7 @@ def _parse_export(entry: str):
         container_path:host_path        — strict (rm + symlink)
         container_path:host_path:0      — copy-only (populate host dir, skip rm/symlink)
     """
-    parts = entry.split(':')
+    parts = _split_path_colon(entry)
     if len(parts) == 3 and parts[2] == '0':
         return parts[0], parts[1], True
     if len(parts) == 2:
@@ -1012,10 +1029,10 @@ def _arg_mount_target(args: list, i: int) -> Tuple[Optional[str], int]:
         return _parse_mount_spec(args[i + 1])[1], 2
     vol_m = re.match(r'^(-v|--volume)=(.*)', arg)
     if vol_m:
-        parts = vol_m.group(2).split(':')
+        parts = _split_path_colon(vol_m.group(2))
         return (parts[1] if len(parts) >= 2 else None), 1
     if arg in ('-v', '--volume') and i + 1 < len(args):
-        parts = args[i + 1].split(':')
+        parts = _split_path_colon(args[i + 1])
         return (parts[1] if len(parts) >= 2 else None), 2
     return None, 1
 
@@ -1047,6 +1064,20 @@ def _expand_tilde_prefix(s: str, home: str) -> str:
     return s
 
 
+def _expand_tilde_spec(spec: str, first_home: str, second_home: str) -> str:
+    """Expand ``~`` in a colon-separated path spec (``part0:part1[:rest]``).
+
+    *first_home* is used for ``parts[0]``, *second_home* for ``parts[1]``.
+    """
+    parts = _split_path_colon(spec)
+    if len(parts) >= 2:
+        parts[0] = _expand_tilde_prefix(parts[0], first_home)
+        parts[1] = _expand_tilde_prefix(parts[1], second_home)
+    elif len(parts) == 1:
+        parts[0] = _expand_tilde_prefix(parts[0], first_home)
+    return ':'.join(parts)
+
+
 def _expand_volume_tilde(args: list) -> list:
     """Expand ``~`` in ``-v``/``--volume`` arguments.
 
@@ -1065,26 +1096,13 @@ def _expand_volume_tilde(args: list) -> list:
         m = re.match(r'^(-v|--volume)=(.*)', arg)
         if m:
             flag = m.group(1)
-            parts = m.group(2).split(':')
-            if len(parts) >= 2:
-                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
-                parts[1] = _expand_tilde_prefix(parts[1], container_home)
-            elif len(parts) == 1:
-                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
-            result.append(f'{flag}={":".join(parts)}')
+            result.append(f'{flag}={_expand_tilde_spec(m.group(2), USER_HOME, container_home)}')
             i += 1
             continue
         # Space form: -v ~/src:/dst or --volume ~/src:/dst
         if arg in ('-v', '--volume') and i + 1 < len(args):
-            val = args[i + 1]
-            parts = val.split(':')
-            if len(parts) >= 2:
-                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
-                parts[1] = _expand_tilde_prefix(parts[1], container_home)
-            elif len(parts) == 1:
-                parts[0] = _expand_tilde_prefix(parts[0], USER_HOME)
             result.append(arg)
-            result.append(':'.join(parts))
+            result.append(_expand_tilde_spec(args[i + 1], USER_HOME, container_home))
             i += 2
             continue
         result.append(arg)
@@ -1098,16 +1116,7 @@ def _expand_export_tilde(exports: list) -> list:
     Host ``~`` expands to USER_HOME, container ``~`` expands to ``/home/{UNAME}``.
     """
     container_home = f'/home/{UNAME}'
-    result = []
-    for entry in exports:
-        parts = entry.split(':')
-        if len(parts) >= 2:
-            parts[0] = _expand_tilde_prefix(parts[0], container_home)
-            parts[1] = _expand_tilde_prefix(parts[1], USER_HOME)
-        elif len(parts) == 1:
-            parts[0] = _expand_tilde_prefix(parts[0], container_home)
-        result.append(':'.join(parts))
-    return result
+    return [_expand_tilde_spec(e, container_home, USER_HOME) for e in exports]
 
 
 # ---------------------------------------------------------------------------
@@ -1807,13 +1816,13 @@ def _extract_copy_staging(args: list) -> Tuple[list, list]:
         # Equals form
         m = re.match(r'^(-v=|--volume=)(.+)$', arg)
         if m:
-            parts = m.group(2).split(':')
+            parts = _split_path_colon(m.group(2))
             if len(parts) >= 3 and parts[-1] == '0':
                 items.append((parts[0], parts[1]))
                 continue
         # Space form
         if arg in ('-v', '--volume') and i + 1 < len(args):
-            parts = args[i + 1].split(':')
+            parts = _split_path_colon(args[i + 1])
             if len(parts) >= 3 and parts[-1] == '0':
                 items.append((parts[0], parts[1]))
                 skip = True
@@ -4464,7 +4473,7 @@ def _resolve_overlay_mounts(ctx: 'PodrunContext'):  # noqa: C901
         m = re.match(r'^(-v=|--volume=)(.+)$', arg)
         if m:
             spec = m.group(2)
-            parts = spec.split(':')
+            parts = _split_path_colon(spec)
             if len(parts) >= 3 and parts[-1] in ('O', '0'):
                 host_path = parts[0]
                 container_path = parts[1]
@@ -4485,7 +4494,7 @@ def _resolve_overlay_mounts(ctx: 'PodrunContext'):  # noqa: C901
         # Space form: -v /host:/ctr:O or -v /host:/ctr:0
         if arg in ('-v', '--volume') and i + 1 < len(pt):
             spec = pt[i + 1]
-            parts = spec.split(':')
+            parts = _split_path_colon(spec)
             if len(parts) >= 3 and parts[-1] in ('O', '0'):
                 host_path = parts[0]
                 container_path = parts[1]

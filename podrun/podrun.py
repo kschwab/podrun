@@ -439,11 +439,19 @@ def _cleanup():  # noqa: C901
             pid_path = os.path.join(entry, 'podman.pid')
             # Check if any containers exist (running or stopped).
             # Stopped containers still depend on the runroot for restart.
-            # Primary check: overlay-containers/ subdirs on disk (works even
-            # when the store service is down — the common case for stopped
-            # containers).  Fallback: query via socket if the service is up.
+            # Primary check: overlay-containers/ subdirs containing
+            # userdata/config.json on disk (works even when the store
+            # service is down).  Bare subdirs without config.json are
+            # stale metadata left after container removal and are ignored.
+            # Fallback: query via socket if the service is up.
             containers_dir = os.path.join(entry, 'overlay-containers')
-            has_containers = os.path.isdir(containers_dir) and bool(os.listdir(containers_dir))
+            has_containers = False
+            if os.path.isdir(containers_dir):
+                for cdir in os.listdir(containers_dir):
+                    cfg = os.path.join(containers_dir, cdir, 'userdata', 'config.json')
+                    if os.path.isfile(cfg):
+                        has_containers = True
+                        break
             if not has_containers and os.path.exists(sock):
                 try:
                     r = subprocess.run(
@@ -468,7 +476,7 @@ def _cleanup():  # noqa: C901
                 except (ValueError, OSError):
                     pass
             try:
-                shutil.rmtree(entry)
+                shutil.rmtree(entry, ignore_errors=False)
             except PermissionError:
                 # Runroot dirs contain UID-mapped files from podman's user
                 # namespace — need `podman unshare` to remove them.
@@ -480,8 +488,20 @@ def _cleanup():  # noqa: C901
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     pass
-            except OSError as e:
-                print(f'Error removing {entry}: {e}', file=sys.stderr)
+                # Retry: unshare may have removed UID-mapped files but left
+                # regular files/dirs behind.
+                if os.path.isdir(entry):
+                    try:
+                        shutil.rmtree(entry)
+                    except OSError as e:
+                        print(f'Error removing {entry}: {e}', file=sys.stderr)
+            except OSError:
+                # Race: file disappeared between listing and unlink (e.g.
+                # store service removed its socket during shutdown).  Retry.
+                try:
+                    shutil.rmtree(entry)
+                except OSError as e:
+                    print(f'Error removing {entry}: {e}', file=sys.stderr)
             if os.path.isdir(entry):
                 all_removed = False
                 failed.append(f'Store service entry: {entry}')
@@ -1206,12 +1226,23 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
           echo "{UNAME}:x:{GID}:" >> /etc/group 2>/dev/null || true
         fi
 
-        # Create home directory and populate from /etc/skel
-        # (requires CAP_DAC_OVERRIDE for /etc/skel access, CAP_CHOWN for ownership)
-        # Uses -xdev to skip bind-mounted files/dirs (different filesystem).
+        # Create home directory and populate from /etc/skel.
+        # Skip entries whose destination is a bind mount (different device)
+        # so user-mounted files (e.g. -v ~/.bashrc:/home/user/.bashrc) are
+        # preserved.
         mkdir -p /home/{UNAME}
         if [ -d /etc/skel ]; then
-          cp -a /etc/skel/. /home/{UNAME}/ 2>/dev/null || true
+          _home_dev=$(stat -c %d /home/{UNAME} 2>/dev/null) || _home_dev=""
+          for _entry in /etc/skel/* /etc/skel/.[!.]* /etc/skel/..?*; do
+            [ -e "$_entry" ] || continue
+            _base="${{_entry##*/}}"
+            _dest="/home/{UNAME}/$_base"
+            if [ -e "$_dest" ] && [ -n "$_home_dev" ]; then
+              _dest_dev=$(stat -c %d "$_dest" 2>/dev/null) || _dest_dev="$_home_dev"
+              [ "$_dest_dev" != "$_home_dev" ] && continue
+            fi
+            cp -a "$_entry" "/home/{UNAME}/" 2>/dev/null || true
+          done
         fi
         find /home/{UNAME} -xdev -exec chown {UID}:{GID} {{}} + 2>/dev/null || true
 
@@ -2183,31 +2214,38 @@ def _store_init(store_dir: str) -> None:
         )
         sys.exit(1)
 
-    # Symlink store_dir/runroot → /tmp/podrun-stores/<hash>/
-    runroot_link = store_path / 'runroot'
-    if runroot_link.is_symlink() or runroot_link.exists():
-        runroot_link.unlink()
-    runroot_link.symlink_to(runroot_target)
+    _ensure_runroot_symlink(store_path, runroot_target)
+
+
+def _ensure_runroot_symlink(store_path: pathlib.Path, runroot: str) -> None:
+    """Create or update the convenience symlink store_dir/runroot → runroot."""
+    link = store_path / 'runroot'
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(runroot)
+    except OSError:
+        pass
 
 
 def _store_print_info(store_dir: str) -> None:
     """Print summary information about a podrun store."""
     store_path = pathlib.Path(store_dir).resolve()
-    rel_store = os.path.relpath(store_path)
+    display = str(store_path)
     graphroot = store_path / 'graphroot'
 
     if not graphroot.is_dir():
-        print(f'Local store: {rel_store} (not initialized)')
+        print(f'Local store: {display} (not initialized)')
         return
 
-    runroot_link = store_path / 'runroot'
-    runroot_target = os.readlink(str(runroot_link)) if runroot_link.is_symlink() else '?'
-    runroot_exists = os.path.isdir(runroot_target) if runroot_target != '?' else False
+    graphroot_str = str(graphroot)
+    runroot = _runroot_path(graphroot_str)
+    runroot_exists = os.path.isdir(runroot)
 
-    print(f'Local store: {rel_store}')
-    print(f'  graphroot:  {rel_store}/graphroot')
+    print(f'Local store: {display}')
+    print(f'  graphroot: {graphroot_str}')
     runroot_status = '' if runroot_exists else '  (missing — will be created on use)'
-    print(f'  runroot:    {rel_store}/runroot → {runroot_target}{runroot_status}')
+    print(f'    runroot: {runroot}{runroot_status}')
 
 
 def _stop_store_service(graphroot: str) -> None:
@@ -2362,6 +2400,8 @@ def _resolve_store(ctx: 'PodrunContext') -> Tuple[List[str], dict]:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    _ensure_runroot_symlink(store_path, runroot)
 
     # Conflict check: error if podman_global_args already has --root/--runroot
     pga = ns.get('podman_global_args') or []

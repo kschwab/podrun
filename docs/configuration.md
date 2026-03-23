@@ -97,6 +97,8 @@ within the devcontainer.json source.
 | `localStoreIgnore` | bool | `--local-store-ignore` |
 | `storageDriver` | string | `--storage-driver` (podman global) |
 | `configScript` | string or list | `--config-script` |
+| `nfsRemediate` | string | `--nfs-remediate` |
+| `nfsRemediatePath` | string | `--nfs-remediate-path` |
 
 `customizations.podrun` values override top-level fields, and CLI flags
 override both.

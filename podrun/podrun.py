@@ -87,6 +87,25 @@ PODRUN_SOCKET_PATH = '/.podrun/podman/podman.sock'
 PODRUN_CONTAINER_HOST = f'unix://{PODRUN_SOCKET_PATH}'
 BOOTSTRAP_CAPS = ['CAP_DAC_OVERRIDE', 'CAP_CHOWN', 'CAP_FOWNER', 'CAP_SETPCAP']
 
+_NFS_REMEDIATE_DEFAULT_BASE = '/opt/podman-local-storage'
+_NETWORK_FS_TYPES = frozenset(
+    {
+        'nfs',
+        'nfs4',
+        'cifs',
+        'smb',
+        'smbfs',
+        'afs',
+        'gfs',
+        'gfs2',
+        'gpfs',
+        'lustre',
+        'panfs',
+        'glusterfs',
+        'ceph',
+    }
+)
+
 # ---------------------------------------------------------------------------
 # PODRUN_* environment variable names
 #
@@ -599,6 +618,55 @@ def _is_remote(podman_path: str) -> bool:
     return os.path.basename(podman_path) == 'podman-remote' or bool(
         os.environ.get('CONTAINER_HOST')
     )
+
+
+def _is_network_fs(path: str) -> bool:  # noqa: C901
+    """Return True when *path* resides on a network filesystem.
+
+    Walks up to the nearest existing ancestor, then checks filesystem type
+    via ``stat -f -c '%T'`` (preferred) and ``df -T`` (fallback).  Returns
+    True if the detected type is in :data:`_NETWORK_FS_TYPES` or contains
+    ``'nfs'``.  Returns False gracefully when the commands are unavailable
+    (e.g. on Windows).
+    """
+    check = pathlib.Path(path)
+    while not check.exists():
+        parent = check.parent
+        if parent == check:
+            return False
+        check = parent
+    check_str = str(check)
+    # Primary: stat -f -c '%T'
+    try:
+        result = subprocess.run(
+            ['stat', '-f', '-c', '%T', check_str],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            fs_type = result.stdout.strip().lower()
+            if fs_type in _NETWORK_FS_TYPES or 'nfs' in fs_type:
+                return True
+            return False
+    except FileNotFoundError:
+        pass
+    # Fallback: df -T
+    try:
+        result = subprocess.run(
+            ['df', '-T', check_str],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    fs_type = parts[1].lower()
+                    if fs_type in _NETWORK_FS_TYPES or 'nfs' in fs_type:
+                        return True
+    except FileNotFoundError:
+        pass
+    return False
 
 
 def _warn_missing_subids():
@@ -2440,6 +2508,151 @@ def _resolve_store(ctx: 'PodrunContext') -> Tuple[List[str], dict]:  # noqa: C90
     return flags, {}
 
 
+def _is_vacant_store(storage_dir: pathlib.Path) -> bool:
+    """Return True if *storage_dir* is a vacant podman store.
+
+    A "vacant" store is scaffolding created by commands like ``podman ps``
+    but contains no pulled images.  Detection: podman creates a
+    ``{driver}-images/`` directory (e.g. ``overlay-images/``) on first
+    image pull.  If no such directory exists, the store is vacant.
+    """
+    try:
+        for entry in storage_dir.iterdir():
+            if entry.is_dir() and entry.name.endswith('-images'):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _nfs_remediate(ctx: 'PodrunContext') -> None:  # noqa: C901
+    """Detect/remediate NFS-mounted podman storage by symlinking to local disk.
+
+    Called from ``main()`` between ``resolve_config()`` and ``_apply_store()``.
+    No-op when running as a remote client or nested inside a podrun container.
+    The default mode ``error`` detects NFS and reports it; other modes take
+    corrective action.
+    """
+    ns = ctx.ns
+    mode = ns.get('root.nfs_remediate') or 'init'
+    if _is_remote(ctx.podman_path):
+        return
+    if os.environ.get(ENV_PODRUN_CONTAINER):
+        return
+
+    storage_dir = pathlib.Path(USER_HOME) / '.local' / 'share' / 'containers' / 'storage'
+    base = ns.get('root.nfs_remediate_path') or _NFS_REMEDIATE_DEFAULT_BASE
+    user_store = pathlib.Path(base) / UNAME
+
+    # Already a symlink — check target matches.
+    if storage_dir.is_symlink():
+        target = str(pathlib.Path(os.readlink(str(storage_dir))).resolve())
+        expected = str(user_store.resolve()) if user_store.exists() else str(user_store)
+        if target == expected:
+            return
+        print(
+            f'Warning: {storage_dir} is already a symlink to {target} (expected {user_store})',
+            file=sys.stderr,
+        )
+        return
+
+    # Not on a network filesystem — nothing to do.
+    if not _is_network_fs(str(storage_dir)):
+        return
+
+    # Error mode: detect NFS and report, take no action.
+    if mode == 'error':
+        print(
+            f'Error: {storage_dir} is on a network filesystem.\n'
+            f'  Podman storage is incompatible with NFS. Use --nfs-remediate=init\n'
+            f'  to create a symlink to local disk, or see podrun docs for other modes.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Ensure base directory exists (may need sudo for /opt).
+    base_path = pathlib.Path(base)
+    if not base_path.is_dir():
+        ret = subprocess.run(
+            ['sudo', 'mkdir', '-p', str(base_path)],
+            capture_output=True,
+            text=True,
+        )
+        if ret.returncode != 0:
+            print(
+                f'Error: failed to create {base_path} (sudo mkdir failed).\n'
+                f'  {ret.stderr.strip()}\n'
+                f'  Hint: use --nfs-remediate-path to specify a writable directory.',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        subprocess.run(
+            ['sudo', 'chmod', '1777', str(base_path)],
+            capture_output=True,
+            text=True,
+        )
+
+    # Ensure user subdirectory exists.
+    user_store.mkdir(parents=True, exist_ok=True)
+
+    # Handle existing real directory.
+    # Vacant stores (scaffolding from e.g. `podman ps` but no images) are
+    # removed silently — they have no data worth preserving.
+    if storage_dir.is_dir():
+        if _is_vacant_store(storage_dir):
+            shutil.rmtree(str(storage_dir))
+        elif mode == 'init':
+            print(
+                f'Error: {storage_dir} exists as a real directory on NFS.\n'
+                f'  Use --nfs-remediate=mv to move contents, or --nfs-remediate=rm to remove.',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif mode == 'mv':
+            print(f'Moving {storage_dir} contents to {user_store} ...', file=sys.stderr)
+            for item in storage_dir.iterdir():
+                dest = user_store / item.name
+                if dest.exists():
+                    print(f'  skip (exists): {item.name}', file=sys.stderr)
+                    continue
+                print(f'  moving: {item.name}', file=sys.stderr)
+                shutil.move(str(item), str(dest))
+            shutil.rmtree(str(storage_dir))
+        elif mode == 'rm':
+            print(f'Removing {storage_dir} ...', file=sys.stderr)
+            shutil.rmtree(str(storage_dir))
+        elif mode == 'prompt':
+            is_interactive = sys.stdin.isatty()
+            if not is_interactive:
+                print(
+                    f'Error: {storage_dir} exists as a real directory on NFS.\n'
+                    f'  Non-interactive session — use --nfs-remediate=mv or --nfs-remediate=rm.',
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f'\n{storage_dir} exists as a real directory on NFS.', file=sys.stderr)
+            if yes_no_prompt('Move contents to local storage?', True, True):
+                print(f'Moving {storage_dir} contents to {user_store} ...', file=sys.stderr)
+                for item in storage_dir.iterdir():
+                    dest = user_store / item.name
+                    if dest.exists():
+                        print(f'  skip (exists): {item.name}', file=sys.stderr)
+                        continue
+                    print(f'  moving: {item.name}', file=sys.stderr)
+                    shutil.move(str(item), str(dest))
+                shutil.rmtree(str(storage_dir))
+            elif yes_no_prompt('Remove existing storage?', False, True):
+                shutil.rmtree(str(storage_dir))
+            else:
+                print('Cancelled.', file=sys.stderr)
+                sys.exit(0)
+
+    # Ensure parent directory exists and create symlink.
+    storage_dir.parent.mkdir(parents=True, exist_ok=True)
+    storage_dir.symlink_to(user_store)
+    print(f'Created symlink: {storage_dir} -> {user_store}', file=sys.stderr)
+
+
 def _apply_store(ctx: 'PodrunContext') -> None:
     """Resolve store, prepend flags, and handle store-only exits.
 
@@ -2490,6 +2703,8 @@ _ROOT_CONFIG_MAP = {
     'localStoreIgnore': 'root.local_store_ignore',
     'noPodrunrc': 'root.no_podrunrc',
     'storageDriver': 'root.storage_driver',
+    'nfsRemediate': 'root.nfs_remediate',
+    'nfsRemediatePath': 'root.nfs_remediate_path',
 }
 
 _RUN_CONFIG_MAP = {
@@ -2987,6 +3202,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         prog='podrun',
         description='A podman run superset with host identity overlays.',
         add_help=False,
+        allow_abbrev=False,
     )
     opts = parser.add_argument_group('Options')
 
@@ -3087,6 +3303,23 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         help='Remove project-local store before proceeding',
     )
 
+    # -- NFS remediation flags ------------------------------------------------
+    opts.add_argument(
+        '--nfs-remediate',
+        dest='root.nfs_remediate',
+        default=None,
+        choices=['error', 'init', 'mv', 'rm', 'prompt'],
+        metavar='MODE',
+        help='NFS storage detection/remediation mode (default: init)',
+    )
+    opts.add_argument(
+        '--nfs-remediate-path',
+        dest='root.nfs_remediate_path',
+        metavar='DIR',
+        default=None,
+        help='Base path for NFS-remediated storage (default: /opt/podman-local-storage)',
+    )
+
     # -- Podman global value flags (passthrough) ------------------------------
     for flag in sorted(flags.global_value_flags):
         if flag in _PODRUN_HANDLED_ROOT_FLAGS:
@@ -3151,6 +3384,7 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     parser = subs.add_parser(
         'run',
         add_help=False,
+        allow_abbrev=False,
         description='Additional run options for host identity overlays.',
     )
     opts = parser.add_argument_group('Options')
@@ -4515,6 +4749,9 @@ def main(argv=None):
     # Config resolution (three-way merge: CLI > config-script > devcontainer.json)
     ctx = resolve_config(ctx)
     ns = ctx.ns
+
+    # NFS remediation — before _apply_store and any storage-touching cmd
+    _nfs_remediate(ctx)
 
     # Store resolution (destroy, resolve, info — all handled inside)
     _apply_store(ctx)

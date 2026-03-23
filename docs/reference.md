@@ -20,6 +20,8 @@ These flags apply to all subcommands and must appear before the subcommand:
 | `--local-store-auto-init` | Auto-create store if missing (uses `--local-store` or auto-discovered path) |
 | `--local-store-info` | Print store information and exit |
 | `--local-store-destroy` | Remove project-local store before proceeding |
+| `--nfs-remediate MODE` | NFS storage detection/remediation mode: `init` (default), `error`, `mv`, `rm`, `prompt` |
+| `--nfs-remediate-path DIR` | Base path for NFS-remediated storage (default: `/opt/podman-local-storage`) |
 
 ## Run Flags
 
@@ -91,6 +93,8 @@ Keys in `customizations.podrun` of `devcontainer.json`:
 | `localStoreIgnore` | bool | `--local-store-ignore` |
 | `storageDriver` | string | `--storage-driver` (podman global) |
 | `configScript` | string or list | `--config-script` |
+| `nfsRemediate` | string | `--nfs-remediate` |
+| `nfsRemediatePath` | string | `--nfs-remediate-path` |
 
 ## Top-Level Devcontainer Fields
 
@@ -188,6 +192,54 @@ To preserve state across container replacements, use `--export` to bind
 specific directories to the host. If you explicitly need to restart a
 stopped container with its original configuration, use `podman start <name>`
 directly.
+
+## NFS Storage Remediation
+
+On hosts with NFS-mounted home directories, podman's default storage
+(`~/.local/share/containers/storage`) lives on NFS, which is incompatible
+with the overlay storage driver. Podrun detects this automatically and
+creates a symlink to local disk by default. Use `--nfs-remediate` to select
+a different mode:
+
+```bash
+podrun version                          # default (init): create symlink if clean
+podrun --nfs-remediate error version    # detect only, error if NFS
+podrun --nfs-remediate mv version       # move existing storage to local disk
+podrun --nfs-remediate rm version       # remove existing storage, start fresh
+podrun --nfs-remediate prompt version   # interactive choice
+```
+
+| Mode | Storage absent | Storage is real directory | Already symlinked |
+|---|---|---|---|
+| `error` | Error + exit 1 | Error + exit 1 | No-op |
+| `init` | Create symlink | Error + exit 1 | No-op |
+| `mv` | Create symlink | Move contents to local, replace with symlink | No-op |
+| `rm` | Create symlink | Remove directory, replace with symlink | No-op |
+| `prompt` | Create symlink | Interactive prompt (mv/rm/cancel) | No-op |
+
+**Vacant stores** (scaffolding created by e.g. `podman ps` but containing no
+pulled images) are treated as "storage absent" — removed silently before
+symlink creation. Detection: no `{driver}-images/` directory exists.
+
+The symlink target is `{base}/{username}` where the base defaults to
+`/opt/podman-local-storage` (override with `--nfs-remediate-path`). The base
+directory is created with `sudo mkdir -p` + sticky bit if it doesn't exist.
+
+Both flags can be set in devcontainer.json:
+
+```jsonc
+{
+  "customizations": {
+    "podrun": {
+      "nfsRemediate": "init",
+      "nfsRemediatePath": "/scratch/podman-local-storage"
+    }
+  }
+}
+```
+
+Skipped automatically when running as a remote client (podman-remote, Windows)
+or inside a nested podrun container.
 
 ## Subcommand Passthrough
 

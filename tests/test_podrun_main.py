@@ -9,23 +9,29 @@ import pytest
 
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
+    ENV_PODRUN_CONTAINER,
     ENV_PODRUN_PODMAN_PATH,
     ENV_PODRUN_PODMAN_REMOTE,
     PodmanFlags,
     UNAME,
     PodrunContext,
+    _NFS_REMEDIATE_DEFAULT_BASE,
     _clean_stale_cache,
     _default_podman_path,
     _discover_podrunrc,
     _filter_global_args,
     _flags_cache_path,
+    _is_network_fs,
     _is_remote,
+    _is_vacant_store,
+    _nfs_remediate,
     _resolve_overlay_mounts,
     _warn_missing_subids,
     _write_flags_cache,
     _cleanup,
     load_podman_flags,
     main,
+    parse_args,
 )
 
 
@@ -1496,3 +1502,540 @@ class TestStatBasedCache:
     def test_main_no_version_guard(self, monkeypatch, podman_path):
         """main() does not call get_podman_version (function removed)."""
         assert not hasattr(podrun_mod, 'get_podman_version')
+
+
+# ---------------------------------------------------------------------------
+# NFS remediation
+# ---------------------------------------------------------------------------
+
+
+class TestNfsRemediate:
+    """Tests for _nfs_remediate and _is_network_fs."""
+
+    @staticmethod
+    def _ctx(ns, podman_path='podman'):
+        ctx = PodrunContext(
+            ns=ns,
+            trailing_args=[],
+            explicit_command=[],
+            raw_argv=[],
+            subcmd_passthrough_args=[],
+        )
+        ctx.podman_path = podman_path
+        return ctx
+
+    # -- Flag parsing ---------------------------------------------------------
+
+    def test_flag_error(self):
+        ctx = parse_args(['--nfs-remediate', 'error', 'version'])
+        assert ctx.ns['root.nfs_remediate'] == 'error'
+
+    def test_flag_init(self):
+        ctx = parse_args(['--nfs-remediate', 'init', 'version'])
+        assert ctx.ns['root.nfs_remediate'] == 'init'
+
+    def test_flag_mv(self):
+        ctx = parse_args(['--nfs-remediate=mv', 'version'])
+        assert ctx.ns['root.nfs_remediate'] == 'mv'
+
+    def test_flag_rm(self):
+        ctx = parse_args(['--nfs-remediate', 'rm', 'version'])
+        assert ctx.ns['root.nfs_remediate'] == 'rm'
+
+    def test_flag_prompt(self):
+        ctx = parse_args(['--nfs-remediate', 'prompt', 'version'])
+        assert ctx.ns['root.nfs_remediate'] == 'prompt'
+
+    def test_flag_absent_defaults_to_init(self):
+        """Absent flag → None at parse time, 'init' at runtime."""
+        ctx = parse_args(['version'])
+        assert ctx.ns['root.nfs_remediate'] is None
+        # _nfs_remediate treats None as 'init' via `or 'init'` fallback
+
+    def test_flag_custom_path(self):
+        ctx = parse_args(['--nfs-remediate-path', '/scratch', '--nfs-remediate', 'init', 'version'])
+        assert ctx.ns['root.nfs_remediate_path'] == '/scratch'
+
+    def test_flag_invalid_choice(self):
+        with pytest.raises(SystemExit):
+            parse_args(['--nfs-remediate', 'bogus', 'version'])
+
+    # -- DC config mapping ----------------------------------------------------
+
+    def test_dc_config_nfs_remediate(self, tmp_path, monkeypatch):
+        dc_path = tmp_path / 'devcontainer.json'
+        dc_path.write_text('{"customizations": {"podrun": {"nfsRemediate": "init"}}}')
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: str(dc_path)
+        )
+        ctx = parse_args(['version'])
+        from podrun.podrun import resolve_config
+
+        ctx = resolve_config(ctx)
+        assert ctx.ns.get('root.nfs_remediate') == 'init'
+
+    def test_dc_config_nfs_remediate_path(self, tmp_path, monkeypatch):
+        dc_path = tmp_path / 'devcontainer.json'
+        dc_path.write_text('{"customizations": {"podrun": {"nfsRemediatePath": "/scratch"}}}')
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: str(dc_path)
+        )
+        ctx = parse_args(['version'])
+        from podrun.podrun import resolve_config
+
+        ctx = resolve_config(ctx)
+        assert ctx.ns.get('root.nfs_remediate_path') == '/scratch'
+
+    # -- Skip conditions ------------------------------------------------------
+
+    def test_skip_when_remote(self, monkeypatch):
+        """No-op when using podman-remote."""
+        ns = {'root.nfs_remediate': 'init'}
+        _nfs_remediate(self._ctx(ns, podman_path='podman-remote'))
+        # Should return without error (remote skips remediation)
+
+    def test_skip_when_nested(self, monkeypatch):
+        """No-op when inside a podrun container."""
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        ns = {'root.nfs_remediate': 'init'}
+        _nfs_remediate(self._ctx(ns))
+
+    def test_skip_when_not_network_fs(self, tmp_path, monkeypatch):
+        """No-op when storage is on local filesystem."""
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: False)
+        ns = {'root.nfs_remediate': 'init'}
+        _nfs_remediate(self._ctx(ns))
+        assert not storage_dir.exists()
+
+    # -- Already symlinked ----------------------------------------------------
+
+    def test_idempotent_correct_symlink(self, tmp_path, monkeypatch):
+        """No-op when already symlinked to the expected target."""
+        base = tmp_path / 'local-storage'
+        user_store = base / UNAME
+        user_store.mkdir(parents=True)
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.parent.mkdir(parents=True)
+        storage_dir.symlink_to(user_store)
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+
+    def test_different_symlink_warns(self, tmp_path, monkeypatch, capsys):
+        """Warning when symlinked to a different target."""
+        other = tmp_path / 'other-target'
+        other.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.parent.mkdir(parents=True)
+        storage_dir.symlink_to(other)
+        base = tmp_path / 'local-storage'
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert 'Warning' in capsys.readouterr().err
+
+    # -- Easy case: storage absent + NFS → create symlink ---------------------
+
+    def test_creates_symlink_when_absent(self, tmp_path, monkeypatch, capsys):
+        """Creates symlink when storage dir doesn't exist and FS is NFS."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+        assert storage_dir.resolve() == (base / UNAME).resolve()
+        assert 'Created symlink' in capsys.readouterr().err
+
+    # -- Mode: error (NFS detected → error, no action) -----------------------
+
+    def test_error_mode_exits_on_nfs(self, tmp_path, monkeypatch, capsys):
+        """error mode detects NFS and exits without taking action."""
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'error'}
+        with pytest.raises(SystemExit):
+            _nfs_remediate(self._ctx(ns))
+        err = capsys.readouterr().err
+        assert 'network filesystem' in err
+        assert not storage_dir.exists()
+
+    def test_error_mode_noop_on_local_fs(self, tmp_path, monkeypatch):
+        """error mode does nothing when FS is local."""
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: False)
+        ns = {'root.nfs_remediate': 'error'}
+        _nfs_remediate(self._ctx(ns))
+
+    # -- Vacant store (scaffolding only) ---------------------------------------
+
+    def test_vacant_store_removed_silently(self, tmp_path, monkeypatch, capsys):
+        """Vacant store (no *-images dir) is removed and symlinked."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        # Simulate podman scaffolding (no overlay-images dir)
+        (storage_dir / 'overlay').mkdir()
+        (storage_dir / 'storage.lock').write_text('')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+        assert 'Created symlink' in capsys.readouterr().err
+
+    def test_vacant_store_removed_in_mv_mode(self, tmp_path, monkeypatch, capsys):
+        """mv mode also removes vacant stores silently (nothing to move)."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'storage.lock').write_text('')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'mv', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+
+    # -- Mode: init (non-vacant existing dir → error) -------------------------
+
+    def test_init_mode_errors_on_non_vacant_dir(self, tmp_path, monkeypatch):
+        """init mode errors when storage has real data."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()  # marks store as non-vacant
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(base)}
+        with pytest.raises(SystemExit):
+            _nfs_remediate(self._ctx(ns))
+
+    # -- Mode: mv (existing dir → move + symlink) ----------------------------
+
+    def test_mv_mode_moves_contents(self, tmp_path, monkeypatch, capsys):
+        """mv mode moves contents and creates symlink."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        (storage_dir / 'some-file.txt').write_text('data')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'mv', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        user_store = base / UNAME
+        assert storage_dir.is_symlink()
+        assert (user_store / 'overlay-images').is_dir()
+        assert (user_store / 'some-file.txt').read_text() == 'data'
+        assert 'Moving' in capsys.readouterr().err
+
+    def test_mv_mode_skips_existing_items(self, tmp_path, monkeypatch, capsys):
+        """mv mode skips items that already exist at destination."""
+        base = tmp_path / 'local-storage'
+        user_store = base / UNAME
+        user_store.mkdir(parents=True)
+        (user_store / 'existing').write_text('keep')
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        (storage_dir / 'existing').write_text('discard')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'mv', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert (user_store / 'existing').read_text() == 'keep'
+        assert 'skip (exists)' in capsys.readouterr().err
+
+    # -- Mode: rm (existing dir → remove + symlink) --------------------------
+
+    def test_rm_mode_removes_dir(self, tmp_path, monkeypatch, capsys):
+        """rm mode removes storage dir and creates symlink."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        (storage_dir / 'data').write_text('bye')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'rm', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+        assert 'Removing' in capsys.readouterr().err
+
+    # -- Mode: prompt (interactive) -------------------------------------------
+
+    def test_prompt_non_interactive_errors(self, tmp_path, monkeypatch):
+        """prompt mode errors in non-interactive session."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        monkeypatch.setattr(podrun_mod.sys.stdin, 'isatty', lambda: False)
+        ns = {'root.nfs_remediate': 'prompt', 'root.nfs_remediate_path': str(base)}
+        with pytest.raises(SystemExit):
+            _nfs_remediate(self._ctx(ns))
+
+    def test_prompt_move_accepted(self, tmp_path, monkeypatch, capsys):
+        """prompt mode: user accepts move."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        (storage_dir / 'item').write_text('x')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        monkeypatch.setattr(podrun_mod.sys.stdin, 'isatty', lambda: True)
+        monkeypatch.setattr(
+            podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: 'Move' in msg
+        )
+        ns = {'root.nfs_remediate': 'prompt', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+        assert (base / UNAME / 'item').read_text() == 'x'
+
+    def test_prompt_remove_accepted(self, tmp_path, monkeypatch, capsys):
+        """prompt mode: user declines move, accepts remove."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        monkeypatch.setattr(podrun_mod.sys.stdin, 'isatty', lambda: True)
+        # First prompt (Move?) → No, second prompt (Remove?) → Yes
+        responses = iter([False, True])
+        monkeypatch.setattr(
+            podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: next(responses)
+        )
+        ns = {'root.nfs_remediate': 'prompt', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+
+    def test_prompt_cancelled(self, tmp_path, monkeypatch):
+        """prompt mode: user declines both → exit 0."""
+        base = tmp_path / 'local-storage'
+        base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        monkeypatch.setattr(podrun_mod.sys.stdin, 'isatty', lambda: True)
+        monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
+        ns = {'root.nfs_remediate': 'prompt', 'root.nfs_remediate_path': str(base)}
+        with pytest.raises(SystemExit) as exc_info:
+            _nfs_remediate(self._ctx(ns))
+        assert exc_info.value.code == 0
+
+    # -- Custom path ----------------------------------------------------------
+
+    def test_custom_path(self, tmp_path, monkeypatch, capsys):
+        """--nfs-remediate-path overrides the default base."""
+        custom_base = tmp_path / 'custom-store'
+        custom_base.mkdir()
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(custom_base)}
+        _nfs_remediate(self._ctx(ns))
+        assert storage_dir.is_symlink()
+        assert storage_dir.resolve() == (custom_base / UNAME).resolve()
+
+    # -- Default path constant ------------------------------------------------
+
+    def test_default_base_constant(self):
+        assert _NFS_REMEDIATE_DEFAULT_BASE == '/opt/podman-local-storage'
+
+    # -- Sudo failure ---------------------------------------------------------
+
+    def test_sudo_failure_helpful_error(self, tmp_path, monkeypatch, capsys):
+        """Helpful error when sudo mkdir fails."""
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        # Use a base path that doesn't exist and mock subprocess.run to fail
+        fake_base = '/nonexistent/nfs-store'
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': fake_base}
+
+        orig_run = subprocess.run
+
+        def mock_run(cmd, **kwargs):
+            if cmd[:2] == ['sudo', 'mkdir']:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stdout='',
+                    stderr='sudo: permission denied',
+                )
+            return orig_run(cmd, **kwargs)
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', mock_run)
+        with pytest.raises(SystemExit):
+            _nfs_remediate(self._ctx(ns))
+        err = capsys.readouterr().err
+        assert '--nfs-remediate-path' in err
+
+    # -- _is_vacant_store -----------------------------------------------------
+
+    def test_is_vacant_store_empty_dir(self, tmp_path):
+        d = tmp_path / 'storage'
+        d.mkdir()
+        assert _is_vacant_store(d) is True
+
+    def test_is_vacant_store_scaffolding(self, tmp_path):
+        """Scaffolding from 'podman ps' (no *-images dir) is vacant."""
+        d = tmp_path / 'storage'
+        d.mkdir()
+        (d / 'overlay').mkdir()
+        (d / 'overlay' / 'l').mkdir()
+        (d / 'storage.lock').write_text('')
+        (d / 'libpod').mkdir()
+        (d / 'libpod' / 'bolt_state.db').write_bytes(b'\x00' * 100)
+        assert _is_vacant_store(d) is True
+
+    def test_is_vacant_store_with_images(self, tmp_path):
+        """Store with overlay-images/ is non-vacant."""
+        d = tmp_path / 'storage'
+        d.mkdir()
+        (d / 'overlay-images').mkdir()
+        assert _is_vacant_store(d) is False
+
+    def test_is_vacant_store_vfs_images(self, tmp_path):
+        """Store with vfs-images/ is non-vacant (driver-agnostic)."""
+        d = tmp_path / 'storage'
+        d.mkdir()
+        (d / 'vfs-images').mkdir()
+        assert _is_vacant_store(d) is False
+
+    # -- _is_network_fs -------------------------------------------------------
+
+    def test_is_network_fs_local(self, tmp_path, monkeypatch):
+        """Local filesystem returns False."""
+        assert _is_network_fs(str(tmp_path)) is False
+
+    def test_is_network_fs_nonexistent_walks_up(self, tmp_path):
+        """Non-existent path walks up to existing ancestor."""
+        deep = tmp_path / 'a' / 'b' / 'c'
+        result = _is_network_fs(str(deep))
+        assert result is False  # tmp_path is local
+
+    def test_is_network_fs_stat_returns_nfs(self, tmp_path, monkeypatch):
+        """stat reporting NFS returns True."""
+
+        def mock_run(cmd, **kwargs):
+            if cmd[0] == 'stat':
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout='nfs\n', stderr=''
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout='', stderr='')
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', mock_run)
+        assert _is_network_fs(str(tmp_path)) is True
+
+    def test_is_network_fs_stat_fails_df_fallback_nfs(self, tmp_path, monkeypatch):
+        """df -T fallback detects NFS when stat fails."""
+
+        def mock_run(cmd, **kwargs):
+            if cmd[0] == 'stat':
+                return subprocess.CompletedProcess(args=cmd, returncode=1, stdout='', stderr='err')
+            if cmd[0] == 'df':
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='Filesystem     Type  Size  Used Avail Use% Mounted on\nserver:/vol  nfs4   50G   20G   30G  40% /home\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout='', stderr='')
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', mock_run)
+        assert _is_network_fs(str(tmp_path)) is True
+
+    def test_is_network_fs_stat_fails_df_local(self, tmp_path, monkeypatch):
+        """df -T fallback returns False for local fs."""
+
+        def mock_run(cmd, **kwargs):
+            if cmd[0] == 'stat':
+                return subprocess.CompletedProcess(args=cmd, returncode=1, stdout='', stderr='err')
+            if cmd[0] == 'df':
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='Filesystem     Type  Size\n/dev/sda1      ext4  100G\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout='', stderr='')
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', mock_run)
+        assert _is_network_fs(str(tmp_path)) is False
+
+    def test_is_network_fs_both_commands_missing(self, tmp_path, monkeypatch):
+        """Returns False when both stat and df are missing."""
+
+        def mock_run(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', mock_run)
+        assert _is_network_fs(str(tmp_path)) is False
+
+    def test_is_network_fs_root_walk(self):
+        """Walks to root when path is purely non-existent."""
+        result = _is_network_fs('/nonexistent/deep/path')
+        assert isinstance(result, bool)
+
+    def test_sudo_chmod_runs_on_success(self, tmp_path, monkeypatch, capsys):
+        """sudo chmod 1777 runs after successful sudo mkdir."""
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        fake_base = tmp_path / 'needs-sudo'
+        ns = {'root.nfs_remediate': 'init', 'root.nfs_remediate_path': str(fake_base)}
+        sudo_calls = []
+        orig_run = subprocess.run
+
+        def mock_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == 'sudo':
+                sudo_calls.append(cmd)
+                if cmd[1] == 'mkdir':
+                    fake_base.mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+            return orig_run(cmd, **kwargs)
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', mock_run)
+        _nfs_remediate(self._ctx(ns))
+        assert any(c[1] == 'chmod' for c in sudo_calls)
+
+    def test_prompt_move_skip_existing(self, tmp_path, monkeypatch, capsys):
+        """prompt mode: move skips items that already exist at destination."""
+        base = tmp_path / 'local-storage'
+        user_store = base / UNAME
+        user_store.mkdir(parents=True)
+        (user_store / 'existing').write_text('keep')
+        storage_dir = tmp_path / '.local' / 'share' / 'containers' / 'storage'
+        storage_dir.mkdir(parents=True)
+        (storage_dir / 'overlay-images').mkdir()
+        (storage_dir / 'existing').write_text('discard')
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', str(tmp_path))
+        monkeypatch.setattr(podrun_mod, '_is_network_fs', lambda p: True)
+        monkeypatch.setattr(podrun_mod.sys.stdin, 'isatty', lambda: True)
+        monkeypatch.setattr(
+            podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: 'Move' in msg
+        )
+        ns = {'root.nfs_remediate': 'prompt', 'root.nfs_remediate_path': str(base)}
+        _nfs_remediate(self._ctx(ns))
+        assert (user_store / 'existing').read_text() == 'keep'
+        assert 'skip (exists)' in capsys.readouterr().err

@@ -13,7 +13,10 @@ from podrun.podrun import (
     _PODRUN_STORES_DIR,
     _apply_store,
     _default_store_dir,
+    _ensure_runroot_symlink,
     _flags_cache_path,
+    _normalize_bool_flags,
+    _strip_pt_bool_flags,
     _resolve_store,
     _runroot_path,
     _scrape_podman_help,
@@ -472,6 +475,144 @@ class TestPassthroughAction:
         parser = build_root_parser()
         ns = vars(parser.parse_known_args(['--remote'])[0])
         assert ns.get('podman_global_args') or [] == ['--remote']
+
+
+# ---------------------------------------------------------------------------
+# TestNormalizeBoolFlags
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeBoolFlags:
+    """Tests for _normalize_bool_flags boolean flag normalization."""
+
+    FLAGS = frozenset({'--sig-proxy', '--init', '-d'})
+    STL = {'-d': '--detach'}  # short→long mapping
+
+    def test_true_equals_form_rewritten(self):
+        argv = _normalize_bool_flags(['--init=true'], self.FLAGS)
+        assert argv == ['--__bool_pt__init=true']
+
+    def test_true_1_equals_form_rewritten(self):
+        argv = _normalize_bool_flags(['--init=1'], self.FLAGS)
+        assert argv == ['--__bool_pt__init=1']
+
+    def test_true_space_form_rewritten(self):
+        argv = _normalize_bool_flags(['--init', 'true'], self.FLAGS)
+        assert argv == ['--__bool_pt__init=true']
+
+    def test_true_1_space_form_rewritten(self):
+        argv = _normalize_bool_flags(['--init', '1'], self.FLAGS)
+        assert argv == ['--__bool_pt__init=1']
+
+    def test_false_equals_form_rewritten(self):
+        argv = _normalize_bool_flags(['--sig-proxy=false'], self.FLAGS)
+        assert argv == ['--__bool_pt__sig-proxy=false']
+
+    def test_false_0_equals_form_rewritten(self):
+        argv = _normalize_bool_flags(['--sig-proxy=0'], self.FLAGS)
+        assert argv == ['--__bool_pt__sig-proxy=0']
+
+    def test_false_space_form_rewritten(self):
+        argv = _normalize_bool_flags(['--sig-proxy', 'false'], self.FLAGS)
+        assert argv == ['--__bool_pt__sig-proxy=false']
+
+    def test_false_0_space_form_rewritten(self):
+        argv = _normalize_bool_flags(['--sig-proxy', '0'], self.FLAGS)
+        assert argv == ['--__bool_pt__sig-proxy=0']
+
+    def test_bare_flag_unchanged(self):
+        argv = _normalize_bool_flags(['--init'], self.FLAGS)
+        assert argv == ['--init']
+
+    def test_non_bool_flag_passthrough(self):
+        argv = _normalize_bool_flags(['--name', 'foo'], self.FLAGS)
+        assert argv == ['--name', 'foo']
+
+    def test_short_flag_equals_true(self):
+        argv = _normalize_bool_flags(['-d=true'], self.FLAGS, self.STL)
+        assert argv == ['--__bool_pt__detach=true']
+
+    def test_short_flag_equals_false(self):
+        argv = _normalize_bool_flags(['-d=false'], self.FLAGS, self.STL)
+        assert argv == ['--__bool_pt__detach=false']
+
+    def test_short_flag_no_mapping_uses_short_name(self):
+        """Short flag without a mapping falls back to the short name."""
+        flags = frozenset({'--init', '-x'})
+        argv = _normalize_bool_flags(['-x=true'], flags)
+        assert argv == ['--__bool_pt__x=true']  # -x → --__bool_pt__x (no long form)
+
+    def test_short_flag_space_not_consumed(self):
+        """Short flags don't consume the next arg (too ambiguous)."""
+        argv = _normalize_bool_flags(['-d', 'true'], self.FLAGS, self.STL)
+        assert argv == ['-d', 'true']
+
+    def test_mixed_args_preserved(self):
+        argv = ['--sig-proxy=false', '--init=true', '-e', 'FOO=bar', 'ubuntu']
+        result = _normalize_bool_flags(argv, self.FLAGS)
+        assert result == [
+            '--__bool_pt__sig-proxy=false',
+            '--__bool_pt__init=true',
+            '-e',
+            'FOO=bar',
+            'ubuntu',
+        ]
+
+    def test_case_insensitive_values(self):
+        argv = _normalize_bool_flags(['--init=True'], self.FLAGS)
+        assert argv == ['--__bool_pt__init=True']
+        argv = _normalize_bool_flags(['--init=FALSE'], self.FLAGS)
+        assert argv == ['--__bool_pt__init=FALSE']
+
+    def test_unknown_value_left_as_is(self):
+        """Non-boolean value after = is left in argv (not a bool value)."""
+        argv = _normalize_bool_flags(['--init=maybe'], self.FLAGS)
+        assert argv == ['--init=maybe']
+
+    def test_empty_argv(self):
+        argv = _normalize_bool_flags([], self.FLAGS)
+        assert argv == []
+
+
+class TestStripPtBoolFlags:
+    """Tests for _strip_pt_bool_flags passthrough restoration."""
+
+    def test_space_form(self):
+        """--__bool_pt__flag value → --flag=value"""
+        args = ['--__bool_pt__sig-proxy', 'false']
+        assert _strip_pt_bool_flags(args) == ['--sig-proxy=false']
+
+    def test_space_form_true(self):
+        args = ['--__bool_pt__init', 'true']
+        assert _strip_pt_bool_flags(args) == ['--init=true']
+
+    def test_equals_form(self):
+        """--__bool_pt__flag=value → --flag=value (defensive)"""
+        args = ['--__bool_pt__sig-proxy=false']
+        assert _strip_pt_bool_flags(args) == ['--sig-proxy=false']
+
+    def test_mixed_with_regular_flags(self):
+        args = ['-e', 'FOO=bar', '--__bool_pt__sig-proxy', 'false', '--init', '-v=/a:/b']
+        result = _strip_pt_bool_flags(args)
+        assert result == ['-e', 'FOO=bar', '--sig-proxy=false', '--init', '-v=/a:/b']
+
+    def test_ordering_preserved(self):
+        """Multiple __bool_pt__ flags maintain their relative order."""
+        args = ['--__bool_pt__init', 'true', '-e', 'X=1', '--__bool_pt__sig-proxy', 'false']
+        result = _strip_pt_bool_flags(args)
+        assert result == ['--init=true', '-e', 'X=1', '--sig-proxy=false']
+
+    def test_no_pt_flags(self):
+        args = ['--init', '-e', 'FOO=bar', 'alpine']
+        assert _strip_pt_bool_flags(args) == args
+
+    def test_empty(self):
+        assert _strip_pt_bool_flags([]) == []
+
+    def test_trailing_pt_flag_no_value(self):
+        """Trailing __bool_pt__ flag with no value (edge case)."""
+        args = ['--__bool_pt__init']
+        assert _strip_pt_bool_flags(args) == ['--init']
 
 
 # ---------------------------------------------------------------------------
@@ -997,17 +1138,19 @@ class TestScrapePodmanHelp:
     def test_scrape_run_value_flags(self, podman_binary):
         result = _scrape_podman_help(podman_binary, subcmd='run')
         assert result is not None
-        value_flags, bool_flags, _ = result
+        value_flags, bool_flags, _, short_to_long = result
         assert '--env' in value_flags
         assert '-e' in value_flags
         assert '--volume' in value_flags
         assert '--name' in value_flags
         assert '--rm' in bool_flags
+        # Short→long mapping for boolean flags
+        assert short_to_long.get('-d') == '--detach'
 
     def test_scrape_global(self, podman_binary):
         result = _scrape_podman_help(podman_binary)
         assert result is not None
-        value_flags, bool_flags, subcommands = result
+        value_flags, bool_flags, subcommands, _short_to_long = result
         assert '--log-level' in value_flags
         assert 'run' in subcommands
         assert 'ps' in subcommands
@@ -1645,6 +1788,18 @@ class TestBuildRunCommand:
         cmd = build_run_command(r)
         assert '--root' not in cmd
         assert cmd == ['podman', 'run', 'alpine']
+
+    def test_sig_proxy_false_preserved(self):
+        """--sig-proxy=false must survive parsing and appear in final command."""
+        r = parse_args(['run', '--sig-proxy=false', 'alpine'])
+        cmd = build_run_command(r)
+        assert '--sig-proxy=false' in cmd
+
+    def test_sig_proxy_false_space_form_preserved(self):
+        """--sig-proxy false (space form) must survive parsing."""
+        r = parse_args(['run', '--sig-proxy', 'false', 'alpine'])
+        cmd = build_run_command(r)
+        assert '--sig-proxy=false' in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -2663,6 +2818,26 @@ class TestStoreInit:
 
 
 # ---------------------------------------------------------------------------
+# TestEnsureRunrootSymlink
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureRunrootSymlink:
+    def test_read_only_store_dir(self, tmp_path):
+        """OSError on symlink creation is silently ignored."""
+        store_path = tmp_path / 'store'
+        store_path.mkdir()
+        store_path.chmod(0o444)
+        try:
+            _ensure_runroot_symlink(store_path, '/tmp/target')
+            # Should not raise — verify symlink was not created
+            store_path.chmod(0o755)
+            assert not (store_path / 'runroot').exists()
+        finally:
+            store_path.chmod(0o755)
+
+
+# ---------------------------------------------------------------------------
 # TestStorePrintInfo
 # ---------------------------------------------------------------------------
 
@@ -2683,6 +2858,31 @@ class TestStorePrintInfo:
         _store_print_info(str(store_dir))
         out = capsys.readouterr().out
         assert 'not initialized' in out
+
+    def test_displays_absolute_paths(self, tmp_path, capsys):
+        """Store info should display absolute paths, not relative."""
+        store_dir = str(tmp_path / 'store')
+        _store_init(store_dir)
+        _store_print_info(store_dir)
+        out = capsys.readouterr().out
+        resolved = str(pathlib.Path(store_dir).resolve())
+        assert resolved in out
+        assert '../' not in out
+
+    def test_runroot_without_symlink(self, tmp_path, capsys):
+        """Runroot is resolved via _runroot_path, not the store/runroot symlink."""
+        store_dir = str(tmp_path / 'store')
+        _store_init(store_dir)
+        # Remove the symlink — simulates stores created before symlink logic
+        runroot_link = tmp_path / 'store' / 'runroot'
+        if runroot_link.is_symlink():
+            runroot_link.unlink()
+        _store_print_info(store_dir)
+        out = capsys.readouterr().out
+        graphroot_str = str(pathlib.Path(store_dir).resolve() / 'graphroot')
+        expected_runroot = _runroot_path(graphroot_str)
+        assert expected_runroot in out
+        assert '?' not in out
 
 
 # ---------------------------------------------------------------------------
@@ -2712,6 +2912,30 @@ class TestResolveStore:
         assert flags == []
         assert ns.get('root.local_store') is None
 
+    def test_env_var_fallback(self, init_store, monkeypatch):
+        """PODRUN_LOCAL_STORE env var used when no explicit --local-store."""
+        monkeypatch.setenv('PODRUN_LOCAL_STORE', init_store)
+        ns = {}
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
+        assert len(flags) == 6
+        assert ns['root.local_store'] == init_store
+
+    def test_env_var_lower_than_cli(self, init_store, tmp_path, monkeypatch):
+        """--local-store CLI flag takes precedence over PODRUN_LOCAL_STORE."""
+        other_store = str(tmp_path / 'other')
+        monkeypatch.setenv('PODRUN_LOCAL_STORE', other_store)
+        ns = {'root.local_store': init_store}
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
+        assert flags[1] == str(pathlib.Path(init_store).resolve() / 'graphroot')
+
+    def test_env_var_higher_than_auto_discovery(self, init_store, monkeypatch):
+        """PODRUN_LOCAL_STORE takes precedence over _default_store_dir."""
+        monkeypatch.setenv('PODRUN_LOCAL_STORE', init_store)
+        monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: '/should/not/be/used')
+        ns = {}
+        flags, _ = _resolve_store(_ctx_from_ns(ns))
+        assert flags[1] == str(pathlib.Path(init_store).resolve() / 'graphroot')
+
     def test_explicit_initialized_store(self, init_store):
         """Initialized store → 6-element flags list."""
         ns = {'root.local_store': init_store}
@@ -2733,6 +2957,19 @@ class TestResolveStore:
         ns = {'root.local_store': init_store}
         flags, _ = _resolve_store(_ctx_from_ns(ns))
         assert flags[3].startswith(_PODRUN_STORES_DIR + '/')
+
+    def test_creates_runroot_symlink_on_resolve(self, init_store):
+        """_resolve_store creates store/runroot symlink if missing."""
+        # Remove the symlink created by _store_init
+        runroot_link = pathlib.Path(init_store) / 'runroot'
+        if runroot_link.is_symlink():
+            runroot_link.unlink()
+        assert not runroot_link.exists()
+        ns = {'root.local_store': init_store}
+        _resolve_store(_ctx_from_ns(ns))
+        assert runroot_link.is_symlink()
+        graphroot_str = str(pathlib.Path(init_store).resolve() / 'graphroot')
+        assert os.readlink(str(runroot_link)) == _runroot_path(graphroot_str)
 
     def test_uninitialized_no_auto_init_returns_empty(self, uninit_store):
         """Uninitialized store without auto-init → empty, clears local_store."""
@@ -3502,9 +3739,9 @@ class TestStoreDestroyIntegration:
     """Verify --local-store-destroy through main().
 
     Integration tests mock ``_store_destroy`` at the module level so that
-    ``main()`` can still call ``get_podman_version`` / ``subprocess.run``
-    normally.  The mock performs a simple ``shutil.rmtree`` to simulate
-    store removal without invoking podman.
+    ``main()`` can still call ``subprocess.run`` normally.  The mock
+    performs a simple ``shutil.rmtree`` to simulate store removal without
+    invoking podman.
     """
 
     @staticmethod
@@ -3640,32 +3877,54 @@ class TestStoreDestroyIntegration:
 
 
 class TestFlagsCachePath:
-    def test_default_uses_podman_basename(self):
-        path = _flags_cache_path('5.4.2')
-        assert path.endswith('podman-5.4.2.json')
+    def test_default_uses_stat_key(self):
+        path = _flags_cache_path()
+        # Stat-based: podman-{mtime_ns}-{size}.json or podman-unknown.json
+        basename = os.path.basename(path)
+        assert basename.startswith('podman-') or basename.startswith('podman-remote-')
+        assert basename.endswith('.json')
 
-    def test_podman_remote_basename(self):
-        path = _flags_cache_path('5.4.2', podman_path='/usr/bin/podman-remote')
-        assert path.endswith('podman-remote-5.4.2.json')
+    def test_podman_remote_basename(self, tmp_path):
+        fake = tmp_path / 'podman-remote'
+        fake.write_text('fake')
+        path = _flags_cache_path(podman_path=str(fake))
+        assert os.path.basename(path).startswith('podman-remote-')
 
-    def test_bare_podman_name(self):
-        path = _flags_cache_path('5.4.2', podman_path='podman')
-        assert path.endswith('podman-5.4.2.json')
+    def test_stat_key_contains_mtime_and_size(self, tmp_path):
+        fake = tmp_path / 'podman'
+        fake.write_text('x' * 42)
+        st = os.stat(str(fake))
+        path = _flags_cache_path(podman_path=str(fake))
+        assert f'{st.st_mtime_ns}-{st.st_size}' in os.path.basename(path)
 
-    def test_absolute_podman_path(self):
-        path = _flags_cache_path('5.4.2', podman_path='/usr/bin/podman')
-        assert path.endswith('podman-5.4.2.json')
+    def test_nonexistent_binary_uses_unknown(self):
+        path = _flags_cache_path(podman_path='/no/such/binary')
+        assert 'unknown' in os.path.basename(path)
 
-    def test_no_collision(self):
-        p1 = _flags_cache_path('5.4.2', podman_path='podman')
-        p2 = _flags_cache_path('5.4.2', podman_path='podman-remote')
+    def test_no_collision_podman_vs_remote(self, tmp_path):
+        fake_podman = tmp_path / 'podman'
+        fake_podman.write_text('a')
+        fake_remote = tmp_path / 'podman-remote'
+        fake_remote.write_text('a')
+        p1 = _flags_cache_path(podman_path=str(fake_podman))
+        p2 = _flags_cache_path(podman_path=str(fake_remote))
         assert p1 != p2
 
-    def test_container_host_makes_podman_use_remote_label(self, monkeypatch):
+    def test_stat_change_changes_path(self, tmp_path):
+        fake = tmp_path / 'podman'
+        fake.write_text('v1')
+        path1 = _flags_cache_path(podman_path=str(fake))
+        fake.write_text('v1-longer')
+        path2 = _flags_cache_path(podman_path=str(fake))
+        assert path1 != path2
+
+    def test_container_host_makes_podman_use_remote_label(self, monkeypatch, tmp_path):
         """When CONTAINER_HOST is set, podman binary gets the remote cache label."""
         monkeypatch.setenv('CONTAINER_HOST', 'unix:///run/podman/podman.sock')
-        path = _flags_cache_path('5.4.2', podman_path='/usr/bin/podman')
-        assert path.endswith('podman-remote-5.4.2.json')
+        fake = tmp_path / 'podman'
+        fake.write_text('fake')
+        path = _flags_cache_path(podman_path=str(fake))
+        assert os.path.basename(path).startswith('podman-remote-')
 
 
 # ---------------------------------------------------------------------------

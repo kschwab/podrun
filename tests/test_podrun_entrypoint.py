@@ -115,6 +115,25 @@ class TestGenerateRunEntrypoint:
             content = f.read()
         assert '/etc/skel' in content
 
+    def test_skel_skips_bind_mounts(self):
+        """Skel copy skips entries whose destination is a bind mount (different device)."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        assert 'stat -c %d' in content
+        assert '_home_dev' in content
+        assert '_dest_dev' in content
+        assert '[ "$_dest_dev" != "$_home_dev" ] && continue' in content
+
+    def test_skel_glob_pattern(self):
+        """Skel copy uses three-pattern glob to match all entries including hidden files."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        assert '/etc/skel/*' in content
+        assert '/etc/skel/.[!.]*' in content
+        assert '/etc/skel/..?*' in content
+
     def test_sudo_setup(self):
         path = generate_run_entrypoint(_default_ns())
         with open(path) as f:

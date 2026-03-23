@@ -59,6 +59,7 @@ skip discovery entirely.
 | `workspaceFolder` | Container working directory (default `/app`) |
 | `workspaceMount` | Custom workspace mount (target overrides `workspaceFolder`) |
 | `containerEnv` | Environment variables set in the container |
+| `remoteEnv` | Environment variables set in the container (merged with `containerEnv`; wins on conflict) |
 | `mounts` | Additional bind/volume mounts (string or object form) |
 | `runArgs` | Extra podman run args |
 | `capAdd` | Capabilities to add |
@@ -103,7 +104,8 @@ override both.
 ### Variable Expansion
 
 Devcontainer.json variables are expanded in `workspaceFolder`,
-`workspaceMount`, `mounts`, `runArgs`, `containerEnv`, and `customizations`.
+`workspaceMount`, `mounts`, `runArgs`, `containerEnv`, `remoteEnv`, and
+`customizations`.
 Supported variables:
 
 | Variable | Value |

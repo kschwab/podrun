@@ -1544,6 +1544,12 @@ def _user_overlay_args(ns, pt, entrypoint_path, rc_path, exec_entry_path):
     args.append(f'-v={entrypoint_path}:{PODRUN_ENTRYPOINT_PATH}:ro,z')
     args.append(f'-v={rc_path}:{PODRUN_RC_PATH}:ro,z')
     args.append(f'-v={exec_entry_path}:{PODRUN_EXEC_ENTRY_PATH}:ro,z')
+    # Explicit HOME ensures Config.Env in `podman inspect` reports the
+    # correct home directory.  Without this, podman derives HOME from
+    # Config.WorkingDir (the -w flag), causing tools like VS Code's
+    # devcontainer CLI to place .vscode-server in the workspace folder
+    # instead of the user's home.
+    args.append(f'--env=HOME=/home/{UNAME}')
     args.append(f'--env=ENV={PODRUN_RC_PATH}')
     for entry in ns.get('run.export') or []:
         container_path, host_path, _ = _parse_export(entry)
@@ -2041,7 +2047,8 @@ def devcontainer_run_args(dc: dict, ns: dict) -> list:  # noqa: C901
     if dc.get('init', False):
         args.append('--init')
 
-    for key, val in dc.get('containerEnv', {}).items():
+    env = {**dc.get('containerEnv', {}), **dc.get('remoteEnv', {})}
+    for key, val in env.items():
         args.append(f'--env={key}={val}')
 
     if workspace_mount:
@@ -2344,7 +2351,7 @@ def _store_destroy(store_dir: str, podman_path: str) -> None:  # noqa: C901
         print(f'Removed {parent} (empty)')
 
 
-def _resolve_store(ctx: 'PodrunContext') -> Tuple[List[str], dict]:
+def _resolve_store(ctx: 'PodrunContext') -> Tuple[List[str], dict]:  # noqa: C901
     """Resolve store directory into podman global flags.
 
     Returns ``(flags_list, env_dict)`` where *flags_list* contains
@@ -2363,6 +2370,12 @@ def _resolve_store(ctx: 'PodrunContext') -> Tuple[List[str], dict]:
         return [], {}
 
     store_dir = ns.get('root.local_store')
+
+    # Env var fallback: PODRUN_LOCAL_STORE (between config and auto-discovery)
+    if not store_dir:
+        store_dir = os.environ.get('PODRUN_LOCAL_STORE')
+        if store_dir:
+            ns['root.local_store'] = store_dir
 
     # Auto-discover if not explicitly set
     if not store_dir:
@@ -2505,6 +2518,7 @@ _DC_CONFIG_MAP = {
     'workspaceMount': 'dc.workspace_mount',
     'workspaceFolder': 'dc.workspace_folder',
     'containerEnv': 'dc.container_env',
+    'remoteEnv': 'dc.remote_env',
     'image': 'dc.image',
 }
 
@@ -2551,6 +2565,7 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
             'mounts',
             'runArgs',
             'containerEnv',
+            'remoteEnv',
             'customizations',
         ):
             if field in dc:
@@ -2741,10 +2756,13 @@ def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns, rc_ns=None)
     if ns.get('run.dot_files_overlay'):
         ns['run.user_overlay'] = True
 
-    # containerEnv from devcontainer.json
-    dc_container_env = ns.get('dc.container_env')
-    if dc_container_env:
-        ns['run.container_env'] = dc_container_env
+    # containerEnv + remoteEnv from devcontainer.json.
+    # In podrun both map to --env on `podman run`; remoteEnv wins on conflict.
+    dc_container_env = ns.get('dc.container_env') or {}
+    dc_remote_env = ns.get('dc.remote_env') or {}
+    merged_env = {**dc_container_env, **dc_remote_env}
+    if merged_env:
+        ns['run.container_env'] = merged_env
 
     # Image/command resolution: CLI trailing > devcontainer image
     dc_image = ns.get('dc.image')

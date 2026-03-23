@@ -22,7 +22,7 @@ from podrun.podrun import (
 
 _COV_THRESHOLD = 95
 
-# Locate podman flags cache files (e.g. ~/.cache/podrun/podman-4.5.0.json).
+# Locate podman flags cache files (stat-based: podman-{mtime_ns}-{size}.json).
 _CACHE_DIR = os.path.join(
     os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
     'podrun',
@@ -119,7 +119,7 @@ def _try_load(binary):
     try:
         load_podman_flags(binary)
         return True
-    except (SystemExit, FileNotFoundError):
+    except (SystemExit, FileNotFoundError, RuntimeError):
         pass
     return False
 
@@ -246,6 +246,7 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV_PODRUN_PODMAN_REMOTE, raising=False)
     monkeypatch.delenv(ENV_PODRUN_CONTAINER, raising=False)
     monkeypatch.delenv(ENV_PODRUN_PODMAN_PATH, raising=False)
+    monkeypatch.delenv('PODRUN_LOCAL_STORE', raising=False)
     monkeypatch.delenv('CONTAINER_HOST', raising=False)
 
 

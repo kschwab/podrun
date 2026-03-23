@@ -1,5 +1,6 @@
 """Tests for Phase 2.5 — main orchestration + execution."""
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -10,15 +11,20 @@ import podrun.podrun as podrun_mod
 from podrun.podrun import (
     ENV_PODRUN_PODMAN_PATH,
     ENV_PODRUN_PODMAN_REMOTE,
+    PodmanFlags,
     UNAME,
     PodrunContext,
+    _clean_stale_cache,
     _default_podman_path,
     _discover_podrunrc,
     _filter_global_args,
+    _flags_cache_path,
     _is_remote,
     _resolve_overlay_mounts,
     _warn_missing_subids,
+    _write_flags_cache,
     _cleanup,
+    load_podman_flags,
     main,
 )
 
@@ -1171,15 +1177,15 @@ class TestCleanup:
         err = capsys.readouterr().err
         assert f'Stopped: Store service (PID {fake_pid})' in err
 
-    def test_cleanup_skips_active_containers(self, tmp_path, monkeypatch, capsys):
-        """_cleanup skips store entries with running containers."""
+    def test_cleanup_skips_active_containers_via_socket(self, tmp_path, monkeypatch, capsys):
+        """_cleanup skips store entries with containers (socket query)."""
         stores = tmp_path / 'stores'
         stores.mkdir()
         entry = stores / 'active'
         entry.mkdir()
         (entry / 'podman.sock').write_text('')
         (entry / 'podman.pid').write_text('12345')
-        # Mock subprocess.run — ps -q returns a container ID.
+        # Mock subprocess.run — ps -qa returns a container ID.
         monkeypatch.setattr(
             podrun_mod.subprocess,
             'run',
@@ -1191,11 +1197,45 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
         _cleanup()
-        # Entry should still exist — containers are running.
         assert entry.exists()
         err = capsys.readouterr().err
-        assert 'Skipped: Store service entry (containers running)' in err
-        assert str(entry) in err
+        assert 'Skipped: Store service entry (containers exist)' in err
+
+    def test_cleanup_skips_stopped_containers_no_socket(self, tmp_path, monkeypatch, capsys):
+        """_cleanup skips store entries with overlay-containers/ with config.json on disk."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'stopped'
+        entry.mkdir()
+        # No socket, no PID — service is down.  But container data exists
+        # with a valid config.json (real container, not stale metadata).
+        userdata = entry / 'overlay-containers' / 'abc123' / 'userdata'
+        userdata.mkdir(parents=True)
+        (userdata / 'config.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        assert entry.exists()
+        err = capsys.readouterr().err
+        assert 'Skipped: Store service entry (containers exist)' in err
+
+    def test_cleanup_removes_stale_container_dirs(self, tmp_path, monkeypatch, capsys):
+        """_cleanup removes entries with overlay-containers/ but no config.json (stale)."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'stale'
+        entry.mkdir()
+        # Bare container dir without userdata/config.json — stale metadata.
+        containers = entry / 'overlay-containers' / 'abc123'
+        containers.mkdir(parents=True)
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        assert not entry.exists()
+        err = capsys.readouterr().err
+        assert 'Skipped' not in err
 
     def test_cleanup_unshare_fallback(self, tmp_path, monkeypatch, capsys):
         """_cleanup falls back to podman unshare rm -rf on PermissionError."""
@@ -1234,6 +1274,70 @@ class TestCleanup:
         err = capsys.readouterr().err
         assert 'Store service runtime' in err
         assert 'Failed' not in err
+
+    def test_cleanup_unshare_partial_then_retry(self, tmp_path, monkeypatch, capsys):
+        """_cleanup retries rmtree after podman unshare partially cleans."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'partial'
+        entry.mkdir()
+        mapped_file = entry / 'uid-mapped'
+        mapped_file.write_text('data')
+
+        real_rmtree = shutil.rmtree
+        call_count = [0]
+
+        def fake_rmtree(path, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1 and str(path) == str(entry):
+                # First call: PermissionError (simulating UID-mapped files)
+                raise PermissionError(13, 'Permission denied', str(path))
+            # Second call (retry after unshare): succeeds
+            real_rmtree(path, **kw)
+
+        monkeypatch.setattr(shutil, 'rmtree', fake_rmtree)
+
+        # Mock unshare: removes the UID-mapped file but leaves the directory
+        def fake_run(*args, **kw):
+            cmd = args[0] if args else kw.get('args', [])
+            if 'unshare' in cmd:
+                mapped_file.unlink(missing_ok=True)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+
+        monkeypatch.setattr(podrun_mod.subprocess, 'run', fake_run)
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        _cleanup()
+        assert not entry.exists()
+        err = capsys.readouterr().err
+        assert 'Failed' not in err
+
+    def test_cleanup_rmtree_race_retry(self, tmp_path, monkeypatch, capsys):
+        """_cleanup retries rmtree when OSError occurs (file vanished mid-walk)."""
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'racy'
+        entry.mkdir()
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
+        # First rmtree raises OSError (simulating file vanished mid-walk),
+        # second call succeeds (real rmtree).
+        real_rmtree = shutil.rmtree
+        call_count = [0]
+
+        def racy_rmtree(path, **kw):
+            if str(path) == str(entry) and call_count[0] == 0:
+                call_count[0] += 1
+                raise OSError(2, 'No such file or directory', 'podman.sock')
+            return real_rmtree(path, **kw)
+
+        monkeypatch.setattr(shutil, 'rmtree', racy_rmtree)
+        _cleanup()
+        assert not entry.exists()
+        err = capsys.readouterr().err
+        assert 'Error removing' not in err
 
     def test_cleanup_noop_when_empty(self, tmp_path, monkeypatch, capsys):
         """_cleanup prints 'Nothing to clean.' when no dirs exist."""
@@ -1274,3 +1378,121 @@ class TestCleanup:
         parser = build_root_parser(flags)
         help_text = parser.format_help()
         assert '__cleanup__' not in help_text
+
+
+# ---------------------------------------------------------------------------
+# Stat-based flag cache
+# ---------------------------------------------------------------------------
+
+
+class TestStatBasedCache:
+    """Verify stat-based cache key eliminates podman --version subprocess."""
+
+    def test_warm_cache_no_subprocess(self, tmp_path, monkeypatch, podman_path):
+        """Seeded cache → load_podman_flags never calls subprocess."""
+        # Redirect cache dir to tmp so we don't pollute the real cache.
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path))
+        cache_path = _flags_cache_path(podman_path)
+        flags = PodmanFlags(
+            global_value_flags=frozenset(['--log-level']),
+            global_boolean_flags=frozenset(),
+            subcommands=frozenset(['ps', 'run']),
+            run_value_flags=frozenset(['-e']),
+            run_boolean_flags=frozenset(['--rm']),
+        )
+        _write_flags_cache(cache_path, flags)
+
+        # Clear in-memory cache so it must hit disk.
+        saved = podrun_mod._loaded_flags.copy()
+        podrun_mod._loaded_flags.clear()
+        try:
+            # Make subprocess.run blow up if called.
+            monkeypatch.setattr(
+                subprocess,
+                'run',
+                lambda *a, **kw: (_ for _ in ()).throw(AssertionError('subprocess called')),
+            )
+            result = load_podman_flags(podman_path)
+            assert result.subcommands == frozenset(['ps', 'run'])
+        finally:
+            podrun_mod._loaded_flags.clear()
+            podrun_mod._loaded_flags.update(saved)
+
+    def test_cache_miss_scrapes(self, tmp_path, monkeypatch, podman_path):
+        """No cache file → live scrape occurs."""
+        # Point cache dir to empty tmp dir so there's no cache hit.
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path))
+
+        scraped = False
+
+        orig_scrape = podrun_mod._scrape_all_flags
+
+        def tracking_scrape(pp):
+            nonlocal scraped
+            scraped = True
+            return orig_scrape(pp)
+
+        monkeypatch.setattr(podrun_mod, '_scrape_all_flags', tracking_scrape)
+
+        saved = podrun_mod._loaded_flags.copy()
+        podrun_mod._loaded_flags.clear()
+        try:
+            load_podman_flags(podman_path)
+            assert scraped
+        finally:
+            podrun_mod._loaded_flags.clear()
+            podrun_mod._loaded_flags.update(saved)
+
+    def test_stat_change_invalidates_cache(self, tmp_path, monkeypatch):
+        """Changing binary size produces a different cache path."""
+        fake = tmp_path / 'podman'
+        fake.write_text('v1')
+        path1 = _flags_cache_path(str(fake))
+
+        fake.write_text('v1-upgraded-binary')
+        path2 = _flags_cache_path(str(fake))
+
+        assert path1 != path2
+
+    def test_stale_cache_cleanup_same_label(self, tmp_path):
+        """Cleanup removes old files with the same label only."""
+        cache_dir = tmp_path / 'cache'
+        cache_dir.mkdir()
+
+        # Create stale podman file and a podman-remote file.
+        (cache_dir / 'podman-111-222.json').write_text('{}')
+        (cache_dir / 'podman-remote-333-444.json').write_text('{}')
+        # Non-json file should be left alone.
+        (cache_dir / 'README').write_text('keep')
+
+        current = str(cache_dir / 'podman-555-666.json')
+        with open(current, 'w') as f:
+            f.write('{}')
+
+        _clean_stale_cache(current)
+
+        remaining = sorted(os.listdir(str(cache_dir)))
+        # Old podman file removed, podman-remote file preserved.
+        assert remaining == ['README', 'podman-555-666.json', 'podman-remote-333-444.json']
+
+    def test_stale_cache_cleanup_remote_label(self, tmp_path):
+        """Cleanup for podman-remote does not remove podman files."""
+        cache_dir = tmp_path / 'cache'
+        cache_dir.mkdir()
+
+        (cache_dir / 'podman-111-222.json').write_text('{}')
+        (cache_dir / 'podman-remote-333-444.json').write_text('{}')
+
+        current = str(cache_dir / 'podman-remote-555-666.json')
+        with open(current, 'w') as f:
+            f.write('{}')
+
+        _clean_stale_cache(current)
+
+        remaining = sorted(os.listdir(str(cache_dir)))
+        # Old podman-remote file removed, podman file preserved.
+        assert remaining == ['podman-111-222.json', 'podman-remote-555-666.json']
+
+    def test_main_no_version_guard(self, monkeypatch, podman_path):
+        """main() does not call get_podman_version (function removed)."""
+        assert not hasattr(podrun_mod, 'get_podman_version')

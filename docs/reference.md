@@ -100,6 +100,7 @@ Keys in `customizations.podrun` of `devcontainer.json`:
 | `workspaceFolder` | Container working directory (default `/app`) |
 | `workspaceMount` | Custom workspace mount string (target overrides `workspaceFolder`) |
 | `containerEnv` | Environment variables set in the container |
+| `remoteEnv` | Environment variables set in the container (merged with `containerEnv`; wins on conflict) |
 | `mounts` | Additional bind/volume mounts (string or object form) |
 | `runArgs` | Extra podman run args |
 | `capAdd` | Capabilities to add |
@@ -114,6 +115,7 @@ Keys in `customizations.podrun` of `devcontainer.json`:
 | Variable | Description |
 |----------|-------------|
 | `PODRUN_PODMAN_PATH` | Override the podman binary path (highest priority, checked before any parsing) |
+| `PODRUN_LOCAL_STORE` | Override the local store directory (between config sources and auto-discovery) |
 | `PODRUN_UID` | Override UID on Windows (default: 1000) |
 | `PODRUN_GID` | Override GID on Windows (default: 1000) |
 

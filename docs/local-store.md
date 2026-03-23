@@ -35,11 +35,19 @@ podrun ps
 podrun run --adhoc ubuntu:24.04
 ```
 
-Auto-discovery has the lowest priority. Explicit `--local-store` takes
-precedence. If `--root`/`--runroot`/`--storage-driver` are already present
-in global flags, discovery is silently skipped.
+Store resolution priority (highest to lowest):
 
-Use `--local-store-ignore` to bypass auto-discovery:
+1. `--local-store` CLI flag
+2. `--config-script` output
+3. `customizations.podrun.localStore` in devcontainer.json
+4. `~/.podrunrc*` output
+5. `PODRUN_LOCAL_STORE` environment variable
+6. Auto-discovery (upward walk for `.devcontainer/.podrun/store` or `.podrun/store`)
+
+If `--root`/`--runroot`/`--storage-driver` are already present in global
+flags, discovery is silently skipped.
+
+Use `--local-store-ignore` to bypass all store resolution:
 
 ```bash
 podrun --local-store-ignore ps    # uses system podman storage

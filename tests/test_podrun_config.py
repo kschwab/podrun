@@ -1741,6 +1741,23 @@ class TestDevcontainerRunArgsContainerEnv:
         args = devcontainer_run_args(dc, {})
         assert not any(a.startswith('--env=') for a in args)
 
+    def test_remote_env(self):
+        dc = {'remoteEnv': {'REMOTE': 'yes'}}
+        args = devcontainer_run_args(dc, {})
+        assert '--env=REMOTE=yes' in args
+
+    def test_remote_env_overrides_container_env(self):
+        dc = {
+            'containerEnv': {'SHARED': 'container', 'ONLY_C': 'c'},
+            'remoteEnv': {'SHARED': 'remote', 'ONLY_R': 'r'},
+        }
+        args = devcontainer_run_args(dc, {})
+        assert '--env=SHARED=remote' in args
+        assert '--env=ONLY_C=c' in args
+        assert '--env=ONLY_R=r' in args
+        # containerEnv value should NOT be present
+        assert '--env=SHARED=container' not in args
+
 
 # ---------------------------------------------------------------------------
 # TestDevcontainerCliDetection — skip dc→args when devcontainer CLI drives
@@ -1917,6 +1934,42 @@ class TestVariableExpansionIntegration:
         )
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
         assert r.ns['run.container_env'] == {'PROJECT': str(tmp_project)}
+
+    def test_remote_env_from_devcontainer(self, monkeypatch, tmp_project):
+        """remoteEnv from devcontainer.json is merged into container_env."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'remoteEnv': {'REMOTE_VAR': 'val'},
+                }
+            )
+        )
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns['run.container_env'] == {'REMOTE_VAR': 'val'}
+
+    def test_remote_env_overrides_container_env(self, monkeypatch, tmp_project):
+        """remoteEnv wins over containerEnv on key conflict."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'containerEnv': {'SHARED': 'from_container', 'ONLY_C': 'c'},
+                    'remoteEnv': {'SHARED': 'from_remote', 'ONLY_R': 'r'},
+                }
+            )
+        )
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        env = r.ns['run.container_env']
+        assert env['SHARED'] == 'from_remote'
+        assert env['ONLY_C'] == 'c'
+        assert env['ONLY_R'] == 'r'
 
     def test_no_devconfig_skips_expansion(self, monkeypatch):
         """--no-devconfig produces no variable expansion errors."""

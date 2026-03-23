@@ -19,6 +19,7 @@ from podrun.podrun import (
     _OVERLAY_FIELDS,
     _copy_staging_args,
     _extract_copy_staging,
+    _extract_passthrough_user,
     _dot_files_overlay_args,
     _env_args,
     _find_root_git_dir,
@@ -28,6 +29,7 @@ from podrun.podrun import (
     _podman_remote_args,
     _resolve_git_submodule,
     _user_overlay_args,
+    _validate_passthrough_user,
     devcontainer_run_args,
     _validate_overlay_args,
     _x11_args,
@@ -104,6 +106,10 @@ class TestUserOverlayArgs:
     def test_userns_keep_id(self):
         args, _ = self._call()
         assert '--userns=keep-id' in args
+
+    def test_user_set(self):
+        args, _ = self._call()
+        assert f'--user={UID}:{GID}' in args
 
     def test_userns_not_added_if_present(self):
         args, _ = self._call(pt=['--userns=auto'])
@@ -616,20 +622,10 @@ class TestValidateOverlayArgs:
     def test_no_user_overlay_noop(self):
         _validate_overlay_args({})  # should not raise
 
-    def test_user_flag_conflicts(self):
-        ns = {'run.user_overlay': True, 'run.passthrough_args': ['--user=root']}
-        with pytest.raises(SystemExit):
-            _validate_overlay_args(ns)
-
-    def test_short_u_flag_conflicts(self):
-        ns = {'run.user_overlay': True, 'run.passthrough_args': ['-u', 'root']}
-        with pytest.raises(SystemExit):
-            _validate_overlay_args(ns)
-
-    def test_combined_short_u_conflicts(self):
-        ns = {'run.user_overlay': True, 'run.passthrough_args': ['-u1000']}
-        with pytest.raises(SystemExit):
-            _validate_overlay_args(ns)
+    def test_user_flag_not_checked_by_validate(self):
+        """--user validation is handled by _extract/_validate_passthrough_user."""
+        ns = {'run.user_overlay': True, 'run.passthrough_args': ['--user', 'root']}
+        _validate_overlay_args(ns)  # should not raise — handled elsewhere
 
     def test_userns_keep_id_ok(self):
         ns = {'run.user_overlay': True, 'run.passthrough_args': ['--userns=keep-id']}
@@ -639,6 +635,64 @@ class TestValidateOverlayArgs:
         ns = {'run.user_overlay': True, 'run.passthrough_args': ['--userns=auto']}
         _validate_overlay_args(ns)
         assert 'Warning' in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# _extract_passthrough_user
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPassthroughUser:
+    def test_no_user(self):
+        val, filtered = _extract_passthrough_user(['--rm', '-it'])
+        assert val is None
+        assert filtered == ['--rm', '-it']
+
+    def test_long_form(self):
+        val, filtered = _extract_passthrough_user(['--rm', '--user', '1000:1000', '-it'])
+        assert val == '1000:1000'
+        assert filtered == ['--rm', '-it']
+
+    def test_short_form(self):
+        val, filtered = _extract_passthrough_user(['-u', 'myuser', '--rm'])
+        assert val == 'myuser'
+        assert filtered == ['--rm']
+
+    def test_last_wins(self):
+        val, filtered = _extract_passthrough_user(['--user', 'a', '-u', 'b'])
+        assert val == 'b'
+        assert filtered == []
+
+
+# ---------------------------------------------------------------------------
+# _validate_passthrough_user
+# ---------------------------------------------------------------------------
+
+
+class TestValidatePassthroughUser:
+    def test_uid_only(self):
+        _validate_passthrough_user(str(UID))  # should not raise
+
+    def test_uid_gid(self):
+        _validate_passthrough_user(f'{UID}:{GID}')  # should not raise
+
+    def test_uname_only(self):
+        _validate_passthrough_user(UNAME)  # should not raise
+
+    def test_uname_gid(self):
+        _validate_passthrough_user(f'{UNAME}:{GID}')  # should not raise
+
+    def test_mismatch_errors(self):
+        with pytest.raises(SystemExit):
+            _validate_passthrough_user('root')
+
+    def test_wrong_uid_errors(self):
+        with pytest.raises(SystemExit):
+            _validate_passthrough_user('99999')
+
+    def test_wrong_uid_gid_errors(self):
+        with pytest.raises(SystemExit):
+            _validate_passthrough_user('0:0')
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,12 @@
 """Tests for Phase 2.1 — constants, utilities, and parsing helpers."""
 
 import os
+import shutil
 import stat
 
 import pytest
 
+import podrun.podrun as podrun_mod
 from podrun.podrun import (
     BOOTSTRAP_CAPS,
     GID,
@@ -25,6 +27,7 @@ from podrun.podrun import (
     _passthrough_has_exact,
     _passthrough_has_flag,
     _passthrough_has_short_flag,
+    _resolve_script_command,
     _volume_mount_destinations,
     _write_sha_file,
     yes_no_prompt,
@@ -419,3 +422,146 @@ class TestYesNoPrompt:
         monkeypatch.setattr('builtins.input', lambda: next(answers))
         result = yes_no_prompt('Continue?', answer_default=True, is_interactive=True)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _resolve_script_command
+# ---------------------------------------------------------------------------
+
+
+class TestResolveScriptCommand:
+    """Tests for shebang-based config script interpreter resolution."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_real(self, monkeypatch):
+        """Restore the real _resolve_script_command (overridden by _isolate)."""
+        monkeypatch.setattr(podrun_mod, '_resolve_script_command', _resolve_script_command)
+
+    # -- env form -----------------------------------------------------------
+
+    def test_env_form(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/env python3\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == 'python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '/usr/bin/python3' in cmd
+        assert str(script) in cmd
+
+    def test_env_with_args(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/env python3 -u\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == 'python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '-u' in cmd
+
+    def test_env_s_flag(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/env -S python3 -u\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == 'python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '/usr/bin/python3' in cmd
+        assert '-u' in cmd
+
+    def test_env_multiple_flags(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/env -S -i python3 -u -B\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == 'python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '-u' in cmd
+        assert '-B' in cmd
+
+    # -- absolute path form -------------------------------------------------
+
+    def test_absolute_path_direct(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/python3\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == '/usr/bin/python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '/usr/bin/python3' in cmd
+
+    def test_absolute_path_basename_fallback(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/python3\nprint("hi")\n')
+
+        def which_mock(x):
+            if x == '/usr/bin/python3':
+                return None  # full path not found
+            if x == 'python3':
+                return '/usr/local/bin/python3'  # basename found
+            return None
+
+        monkeypatch.setattr(shutil, 'which', which_mock)
+        cmd = _resolve_script_command(str(script))
+        assert '/usr/local/bin/python3' in cmd
+
+    def test_absolute_path_with_args(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/python3 -u\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == '/usr/bin/python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '-u' in cmd
+
+    # -- bare name form -----------------------------------------------------
+
+    def test_bare_name(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!python3\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == 'python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '/usr/bin/python3' in cmd
+
+    # -- /bin/env variant ---------------------------------------------------
+
+    def test_env_variant(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/bin/env python3\nprint("hi")\n')
+        monkeypatch.setattr(
+            shutil, 'which', lambda x: '/usr/bin/python3' if x == 'python3' else None
+        )
+        cmd = _resolve_script_command(str(script))
+        assert '/usr/bin/python3' in cmd
+
+    # -- error cases --------------------------------------------------------
+
+    def test_no_shebang_exits(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('print("hello")\n')
+        with pytest.raises(SystemExit):
+            _resolve_script_command(str(script))
+
+    def test_empty_shebang_exits(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!  \n')
+        with pytest.raises(SystemExit):
+            _resolve_script_command(str(script))
+
+    def test_env_only_flags_exits(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/env -S\n')
+        with pytest.raises(SystemExit):
+            _resolve_script_command(str(script))
+
+    def test_unreadable_file_exits(self):
+        with pytest.raises(SystemExit):
+            _resolve_script_command('/nonexistent/path/to/script.py')
+
+    def test_interpreter_not_found_exits(self, tmp_path, monkeypatch):
+        script = tmp_path / 'script.py'
+        script.write_text('#!/usr/bin/env nointerpxyz\nprint("hi")\n')
+        monkeypatch.setattr(shutil, 'which', lambda x: None)
+        with pytest.raises(SystemExit):
+            _resolve_script_command(str(script))

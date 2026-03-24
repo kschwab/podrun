@@ -692,18 +692,22 @@ def _warn_missing_subids():
         pass
 
 
-def _read_shebang(path: str) -> Tuple[str, List[str]]:
-    """Read a shebang line and return ``(interpreter, args)``.
+def _resolve_script_command(path: str) -> str:
+    """Build a shell command to execute a script via its shebang interpreter.
 
-    Handles common forms:
+    Reads the shebang line, parses the interpreter and flags, resolves the
+    interpreter on PATH, and returns a ready-to-run command string.  Handles
+    common shebang forms::
 
-    - ``#!/usr/bin/env python3``          → (``python3``, [])
-    - ``#!/usr/bin/env -S python3 -u``    → (``python3``, [``-u``])
-    - ``#!/usr/bin/python3 -u``           → (``/usr/bin/python3``, [``-u``])
-    - ``#!C:\\Python311\\python.exe -u``  → (``C:\\Python311\\python.exe``, [``-u``])
+        #!/usr/bin/env python3          → python3 script.py
+        #!/usr/bin/env -S python3 -u    → python3 -u script.py
+        #!/usr/bin/python3 -u           → python3 -u script.py
+        #!C:\\Python311\\python.exe     → C:\\Python311\\python.exe script.py
 
-    Exits with an error if the file cannot be read or has no shebang.
+    Exits with an error if the shebang is missing, empty, or the interpreter
+    cannot be found on PATH.
     """
+    # -- Read shebang ---------------------------------------------------------
     try:
         with open(path, encoding='utf-8', errors='replace') as f:
             first_line = f.readline()
@@ -713,7 +717,7 @@ def _read_shebang(path: str) -> Tuple[str, List[str]]:
     if not first_line.startswith('#!'):
         print(
             f'Error: Config script has no shebang line: {path}\n'
-            f'       On Windows, a shebang (e.g. #!/usr/bin/env python3) is required.',
+            f'       A shebang (e.g. #!/usr/bin/env python3) is required.',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -724,29 +728,18 @@ def _read_shebang(path: str) -> Tuple[str, List[str]]:
     # ``/usr/bin/env`` form — skip env itself and its flags (e.g. -S)
     if parts[0] == '/usr/bin/env' or parts[0].endswith('/env'):
         parts = parts[1:]  # drop env
-        # skip env flags like -S, -i, -u (start with -)
         while parts and parts[0].startswith('-'):
             parts = parts[1:]
         if not parts:
             print(f'Error: No interpreter after env in shebang: {path}', file=sys.stderr)
             sys.exit(1)
-    return parts[0], parts[1:]
+    interp, interp_args = parts[0], parts[1:]
 
-
-def _resolve_script_command(path: str) -> str:
-    """Build a shell command to execute a script via its shebang interpreter.
-
-    Reads the shebang, resolves the interpreter on PATH, and returns a
-    ready-to-run command string including any interpreter flags from the
-    shebang line.  Exits with an error if the shebang is missing or the
-    interpreter cannot be found.
-    """
-    interp, args = _read_shebang(path)
-    # Try the interpreter path directly first (handles Windows absolute paths
-    # like ``C:\Python311\python.exe`` and any path already on PATH).
+    # -- Resolve interpreter --------------------------------------------------
+    # Try full path first (handles Windows absolute paths and bare names).
     resolved = shutil.which(interp)
-    # Fall back to bare name for Unix absolute paths (``/usr/bin/python3``
-    # doesn't exist on Windows, but ``python3`` is likely on PATH).
+    # Fall back to basename for Unix absolute paths on Windows
+    # (``/usr/bin/python3`` doesn't exist, but ``python3`` is on PATH).
     if not resolved:
         resolved = shutil.which(os.path.basename(interp))
     if not resolved:
@@ -755,8 +748,8 @@ def _resolve_script_command(path: str) -> str:
             file=sys.stderr,
         )
         sys.exit(1)
-    parts = [_shell_quote(resolved)] + [_shell_quote(a) for a in args] + [_shell_quote(path)]
-    return ' '.join(parts)
+    cmd = [_shell_quote(resolved)] + [_shell_quote(a) for a in interp_args] + [_shell_quote(path)]
+    return ' '.join(cmd)
 
 
 def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] = None) -> List[str]:

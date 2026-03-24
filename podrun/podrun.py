@@ -781,6 +781,14 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
                 file=sys.stderr,
             )
             sys.exit(1)
+        if _IS_WINDOWS and '\\' in out.stdout:
+            print(
+                f'Warning: config script {path} output contains backslashes.\n'
+                f'         Backslashes are treated as escape characters during parsing\n'
+                f'         and will be removed. Use forward slashes for Windows paths\n'
+                f'         (e.g. pathlib.Path.as_posix()).',
+                file=sys.stderr,
+            )
         tokens.extend(shlex.split(out.stdout))
     return tokens
 

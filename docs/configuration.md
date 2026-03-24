@@ -186,6 +186,32 @@ Supported forms:
 If the interpreter cannot be found on PATH, podrun exits with an error
 showing the interpreter name and script path.
 
+### Windows Paths
+
+Config script output is tokenized with `shlex.split()`, which treats
+backslashes as escape characters. On Windows, use **forward slashes** in
+path arguments to avoid mangling. For Python scripts using `pathlib.Path`,
+call `.as_posix()`:
+
+```python
+_project_root = pathlib.Path(__file__).resolve().parent.parent
+_work_dir = _project_root / '.work' / getpass.getuser()
+_work_dir.mkdir(parents=True, exist_ok=True)
+
+# Convert once for use in arg strings (forward slashes survive shlex.split)
+_work = _work_dir.as_posix()
+
+args = [
+    f'-v={_work}:~/.config:z',        # ✓ C:/Users/alice/.work/alice
+    f'--export=~/.ssh:{_work}/.ssh',   # ✓ forward slashes throughout
+]
+```
+
+Use `Path` objects for filesystem operations (`mkdir`, `exists`, `open`)
+and `.as_posix()` strings for podrun/podman arguments. This is only needed
+on Windows — paths in `devcontainer.json` are not affected (they are parsed
+as JSON, not shell-tokenized).
+
 Multiple `--config-script` flags are executed left to right. When the same
 flag appears in more than one script, the rightmost (last) value wins.
 

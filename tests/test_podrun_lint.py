@@ -186,7 +186,7 @@ class TestVulture:
     def test_no_dead_code(self):
         """Detect unused code in podrun/podrun.py."""
         result = subprocess.run(
-            [sys.executable, '-m', 'vulture', 'podrun/podrun.py'],
+            [sys.executable, '-m', 'vulture', 'podrun/podrun.py', 'podrun_whitelist.py'],
             capture_output=True,
             text=True,
             cwd=PROJECT_ROOT,

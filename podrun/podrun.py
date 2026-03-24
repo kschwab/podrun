@@ -752,8 +752,23 @@ def _resolve_script_command(path: str) -> str:
     return ' '.join(cmd)
 
 
+def _config_split(text: str) -> List[str]:
+    """Split config script output into tokens.
+
+    Like ``shlex.split()`` but backslashes are not treated as escape
+    characters.  Config script output is program data, not shell source
+    code — quotes delimit tokens, but ``\\`` is a literal character (not
+    an escape prefix).  This matches how devcontainer.json treats values
+    after JSON parsing and avoids mangling Windows paths like ``C:\\Users``.
+    """
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ''
+    return list(lexer)
+
+
 def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] = None) -> List[str]:
-    """Execute scripts left-to-right, return concatenated shlex.split tokens.
+    """Execute scripts left-to-right, return concatenated parsed tokens.
 
     Fatal (sys.exit(1)) on non-zero exit.
 
@@ -781,15 +796,7 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
                 file=sys.stderr,
             )
             sys.exit(1)
-        if _IS_WINDOWS and '\\' in out.stdout:
-            print(
-                f'Warning: config script {path} output contains backslashes.\n'
-                f'         Backslashes are treated as escape characters during parsing\n'
-                f'         and will be removed. Use forward slashes for Windows paths\n'
-                f'         (e.g. pathlib.Path.as_posix()).',
-                file=sys.stderr,
-            )
-        tokens.extend(shlex.split(out.stdout))
+        tokens.extend(_config_split(out.stdout))
     return tokens
 
 
@@ -1512,7 +1519,7 @@ def generate_rc_sh(ns: dict) -> str:
         _b=$(printf '\033[34m')
         _i=$(printf '\033[7m')
         _n=$(printf '\033[0m')
-        _prompt_banner="{prompt_banner}"
+        _prompt_banner="{prompt_banner} 📦"
         _curr_shell="$(command -v "$0")"
         if readlink -f "$_curr_shell" > /dev/null 2>&1; then _curr_shell="$(readlink -f "$_curr_shell")"; fi
         case "$(basename "$_curr_shell")" in

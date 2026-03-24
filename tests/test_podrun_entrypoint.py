@@ -357,20 +357,20 @@ class TestGenerateRcSh:
         path = generate_rc_sh(_default_ns())
         with open(path) as f:
             content = f.read()
-        assert '_prompt_banner="podrun"' in content
+        assert '_prompt_banner="podrun 📦"' in content
 
     def test_default_prompt_banner_from_image(self):
         """With no prompt_banner set, falls back to image name."""
         path = generate_rc_sh(_default_ns(**{'run.image': 'alpine:3.18'}))
         with open(path) as f:
             content = f.read()
-        assert '_prompt_banner="alpine:3.18"' in content
+        assert '_prompt_banner="alpine:3.18 📦"' in content
 
     def test_custom_prompt_banner(self):
         path = generate_rc_sh(_default_ns(**{'run.prompt_banner': 'myproject'}))
         with open(path) as f:
             content = f.read()
-        assert '_prompt_banner="myproject"' in content
+        assert '_prompt_banner="myproject 📦"' in content
 
     def test_custom_prompt_banner_overrides_image(self):
         """Explicit prompt_banner takes priority over image name."""
@@ -379,7 +379,7 @@ class TestGenerateRcSh:
         )
         with open(path) as f:
             content = f.read()
-        assert '_prompt_banner="myproject"' in content
+        assert '_prompt_banner="myproject 📦"' in content
 
     def test_cpu_info_embedded(self):
         path = generate_rc_sh(_default_ns())
@@ -553,4 +553,4 @@ class TestNsDictInterface:
         path = generate_rc_sh({})
         with open(path) as f:
             content = f.read()
-        assert '_prompt_banner="podrun"' in content
+        assert '_prompt_banner="podrun 📦"' in content

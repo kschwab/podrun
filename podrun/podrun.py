@@ -692,6 +692,73 @@ def _warn_missing_subids():
         pass
 
 
+def _read_shebang(path: str) -> Tuple[str, List[str]]:
+    """Read a shebang line and return ``(interpreter, args)``.
+
+    Handles common forms:
+
+    - ``#!/usr/bin/env python3``          → (``python3``, [])
+    - ``#!/usr/bin/env -S python3 -u``    → (``python3``, [``-u``])
+    - ``#!/usr/bin/python3 -u``           → (``/usr/bin/python3``, [``-u``])
+    - ``#!C:\\Python311\\python.exe -u``  → (``C:\\Python311\\python.exe``, [``-u``])
+
+    Exits with an error if the file cannot be read or has no shebang.
+    """
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            first_line = f.readline()
+    except OSError:
+        print(f'Error: Cannot read config script: {path}', file=sys.stderr)
+        sys.exit(1)
+    if not first_line.startswith('#!'):
+        print(
+            f'Error: Config script has no shebang line: {path}\n'
+            f'       On Windows, a shebang (e.g. #!/usr/bin/env python3) is required.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    parts = first_line[2:].strip().split()
+    if not parts:
+        print(f'Error: Empty shebang in config script: {path}', file=sys.stderr)
+        sys.exit(1)
+    # ``/usr/bin/env`` form — skip env itself and its flags (e.g. -S)
+    if parts[0] == '/usr/bin/env' or parts[0].endswith('/env'):
+        parts = parts[1:]  # drop env
+        # skip env flags like -S, -i, -u (start with -)
+        while parts and parts[0].startswith('-'):
+            parts = parts[1:]
+        if not parts:
+            print(f'Error: No interpreter after env in shebang: {path}', file=sys.stderr)
+            sys.exit(1)
+    return parts[0], parts[1:]
+
+
+def _resolve_script_command(path: str) -> str:
+    """Build a shell command to execute a script via its shebang interpreter.
+
+    Reads the shebang, resolves the interpreter on PATH, and returns a
+    ready-to-run command string including any interpreter flags from the
+    shebang line.  Exits with an error if the shebang is missing or the
+    interpreter cannot be found.
+    """
+    interp, args = _read_shebang(path)
+    # Try the interpreter path directly first (handles Windows absolute paths
+    # like ``C:\Python311\python.exe`` and any path already on PATH).
+    resolved = shutil.which(interp)
+    # Fall back to bare name for Unix absolute paths (``/usr/bin/python3``
+    # doesn't exist on Windows, but ``python3`` is likely on PATH).
+    if not resolved:
+        resolved = shutil.which(os.path.basename(interp))
+    if not resolved:
+        print(
+            f'Error: Cannot find "{interp}" on PATH (from shebang in {path})',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    parts = [_shell_quote(resolved)] + [_shell_quote(a) for a in args] + [_shell_quote(path)]
+    return ' '.join(parts)
+
+
 def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] = None) -> List[str]:
     """Execute scripts left-to-right, return concatenated shlex.split tokens.
 
@@ -713,7 +780,8 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
 
     tokens: List[str] = []
     for path in script_paths:
-        out = run_os_cmd(_shell_quote(path), env=env)
+        cmd = _resolve_script_command(path)
+        out = run_os_cmd(cmd, env=env)
         if out.returncode != 0:
             print(
                 f'Error: --config-script {path} failed (exit {out.returncode}):\n{out.stderr}',

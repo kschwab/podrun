@@ -305,13 +305,23 @@ class TestGenerateRunEntrypoint:
         assert idx_home < idx_staging
 
     def test_copy_staging_chown(self):
-        """Copy-staging loop chowns copied files to container user."""
+        """Copy-staging loop chowns copied dirs to match source ownership."""
         path = generate_run_entrypoint(_default_ns())
         with open(path) as f:
             content = f.read()
         # Find the chown inside the copy-staging block
         staging_section = content[content.index('Copy-mode staging') :]
-        assert f'chown -R {UID}:{GID}' in staging_section
+        assert 'chown $(stat -c "%u:%g"' in staging_section
+
+    def test_copy_staging_chmod_descriptor(self):
+        """Entrypoint applies .podrun_chmod when descriptor exists."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        staging_section = content[content.index('Copy-mode staging') :]
+        assert '.podrun_chmod' in staging_section
+        assert 'chmod -R' in staging_section
+        assert 'chmod "$_chmod"' in staging_section
 
 
 # ---------------------------------------------------------------------------

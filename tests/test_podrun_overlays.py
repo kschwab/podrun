@@ -422,6 +422,48 @@ class TestCopyStagingArgs:
         paths = [a.split('=')[1].split(':')[0] for a in args]
         assert paths[0] != paths[1]
 
+    def test_chmod_not_written_on_linux(self, tmp_path, monkeypatch):
+        """On Linux (_IS_WINDOWS=False), .podrun_chmod is never written."""
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', False)
+        d = tmp_path / 'ssh'
+        d.mkdir()
+        chmod_map = {'/home/user/.ssh': '700'}
+        args = _copy_staging_args([(str(d), '/home/user/.ssh')], chmod_map)
+        staging_path = args[0].split('=')[1].split(':')[0]
+        assert not os.path.exists(os.path.join(staging_path, '.podrun_chmod'))
+
+    def test_chmod_written_on_windows(self, tmp_path, monkeypatch):
+        """On Windows (_IS_WINDOWS=True), .podrun_chmod is written with correct mode."""
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', True)
+        d = tmp_path / 'ssh'
+        d.mkdir()
+        chmod_map = {'/home/user/.ssh': '700'}
+        args = _copy_staging_args([(str(d), '/home/user/.ssh')], chmod_map)
+        staging_path = args[0].split('=')[1].split(':')[0]
+        chmod_file = os.path.join(staging_path, '.podrun_chmod')
+        assert os.path.isfile(chmod_file)
+        assert open(chmod_file).read() == '700'
+
+    def test_chmod_file_item_on_windows(self, tmp_path, monkeypatch):
+        """File items also get .podrun_chmod when in chmod_map."""
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', True)
+        f = tmp_path / 'gitconfig'
+        f.write_text('[user]')
+        chmod_map = {'/home/user/.gitconfig': '600'}
+        args = _copy_staging_args([(str(f), '/home/user/.gitconfig')], chmod_map)
+        staging_path = args[0].split('=')[1].split(':')[0]
+        assert open(os.path.join(staging_path, '.podrun_chmod')).read() == '600'
+
+    def test_chmod_no_match_no_file(self, tmp_path, monkeypatch):
+        """Items not in chmod_map don't get .podrun_chmod even on Windows."""
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', True)
+        f = tmp_path / 'other'
+        f.write_text('data')
+        chmod_map = {'/home/user/.ssh': '700'}
+        args = _copy_staging_args([(str(f), '/home/user/.other')], chmod_map)
+        staging_path = args[0].split('=')[1].split(':')[0]
+        assert not os.path.exists(os.path.join(staging_path, '.podrun_chmod'))
+
 
 # ---------------------------------------------------------------------------
 # _extract_copy_staging

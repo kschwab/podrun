@@ -160,10 +160,18 @@ _DOTFILES = [
     '-v=~/.emacs:~/.emacs:ro,z',
     '-v=~/.emacs.d:~/.emacs.d:ro,z',
     '-v=~/.vimrc:~/.vimrc:ro,z',
-    # Copy dot files
+    # Copy dot files (chmod applied after copy — see _DOTFILES_CHMOD)
     '-v=~/.ssh:~/.ssh:0',
     '-v=~/.gitconfig:~/.gitconfig:0',
 ]
+
+# Explicit permissions for copy-mode dotfiles.  Written as .podrun_chmod in
+# the staging directory; the entrypoint applies ``chmod [-R]`` after copying.
+# Keys are container paths (after tilde expansion to /home/{UNAME}).
+_DOTFILES_CHMOD: dict = {
+    f'/home/{UNAME}/.ssh': '700',
+    f'/home/{UNAME}/.gitconfig': '600',
+}
 
 # ---------------------------------------------------------------------------
 # CLI flag constants
@@ -1407,10 +1415,25 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
           for _staging_entry in /.podrun/copy-staging/*; do
             [ -d "$_staging_entry" ] || continue
             _target="$(cat "$_staging_entry/.podrun_target" 2>/dev/null)" || continue
-            mkdir -p "$(dirname "$_target")"
-            cp -a "$_staging_entry/data/." "$_target/" 2>/dev/null ||
-              cp -a "$_staging_entry/data" "$_target" 2>/dev/null || true
-            chown -R {UID}:{GID} "$_target" 2>/dev/null || true
+            if [ -d "$_staging_entry/data" ]; then
+              mkdir -p "$_target"
+              # shellcheck disable=SC2046
+              chown $(stat -c "%u:%g" "$_staging_entry/data") "$_target" 2>/dev/null || true
+              chmod "$(stat -c "%a" "$_staging_entry/data")" "$_target" 2>/dev/null || true
+              cp -af "$_staging_entry/data/." "$_target/" 2>/dev/null || true
+            else
+              mkdir -p "$(dirname "$_target")"
+              cp -af "$_staging_entry/data" "$_target" 2>/dev/null || true
+            fi
+            # Apply explicit permissions if .podrun_chmod descriptor exists
+            if [ -f "$_staging_entry/.podrun_chmod" ]; then
+              _chmod="$(cat "$_staging_entry/.podrun_chmod")"
+              if [ -d "$_target" ]; then
+                chmod -R "$_chmod" "$_target" 2>/dev/null || true
+              else
+                chmod "$_chmod" "$_target" 2>/dev/null || true
+              fi
+            fi
           done
         fi
 
@@ -1834,7 +1857,7 @@ def _host_overlay_args(ns, pt):
     return args
 
 
-def _copy_staging_args(items: list) -> list:
+def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
     """Build staging dirs and podman volume args for copy-mode items.
 
     *items* is a list of ``(host_path, container_path)`` tuples.
@@ -1844,6 +1867,11 @@ def _copy_staging_args(items: list) -> list:
     ``data`` entry (the actual content).  The staging directory is mounted
     ``:ro`` into ``/.podrun/copy-staging/{sha12}``; the entrypoint copies
     its contents to the target path so the container has a writable copy.
+
+    If *chmod_map* is provided, it maps container paths to octal mode
+    strings (e.g. ``{'~/.ssh': '700'}``).  A ``.podrun_chmod`` file is
+    written into the staging directory; the entrypoint applies
+    ``chmod [-R]`` after copying.
 
     For **files**, the host file is copied into the staging dir at build
     time (self-contained — one mount).  For **directories**, a nested bind
@@ -1861,6 +1889,14 @@ def _copy_staging_args(items: list) -> list:
         target_file = os.path.join(staging_dir, '.podrun_target')
         with open(target_file, 'w', encoding='utf-8', newline='\n') as f:
             f.write(container_path)
+
+        # Write optional chmod descriptor (Windows only — NTFS has no Unix
+        # permission bits so bind-mounted files appear as 0777; on Linux the
+        # stat-based copy already preserves the correct source permissions).
+        if _IS_WINDOWS and chmod_map and container_path in chmod_map:
+            chmod_file = os.path.join(staging_dir, '.podrun_chmod')
+            with open(chmod_file, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(chmod_map[container_path])
 
         if os.path.isfile(host_path):
             # File: copy into staging/data at build time (one mount)
@@ -4021,7 +4057,7 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
     pt, extra = _extract_copy_staging(pt)
     copy_staging.extend(extra)
     if copy_staging:
-        overlay_args.extend(_copy_staging_args(copy_staging))
+        overlay_args.extend(_copy_staging_args(copy_staging, _DOTFILES_CHMOD))
 
     # Inject overlay args into passthrough
     ns['run.passthrough_args'] = overlay_args + pt

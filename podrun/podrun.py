@@ -1385,6 +1385,8 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         # deriving it from --passwd-entry.
         HOME=/home/{UNAME}
         export HOME
+        USER={UNAME}
+        export USER
         ENV={PODRUN_RC_PATH}
         export ENV
 

@@ -151,6 +151,11 @@ class TestGenerateRunEntrypoint:
         with open(path) as f:
             content = f.read()
         assert f'touch {PODRUN_READY_PATH}' in content
+        # Also verify it's inside the guard (detailed tests in TestRestartGuard)
+        guard_open = content.index('# --- First-run setup')
+        guard_close = content.index('# --- End first-run setup ---')
+        touch_idx = content.index(f'touch {PODRUN_READY_PATH}')
+        assert guard_open < touch_idx < guard_close
 
     def test_git_submodule_worktree_bridge(self):
         """Entrypoint derives submodule path from .git file and creates worktree symlink."""
@@ -322,6 +327,84 @@ class TestGenerateRunEntrypoint:
         assert '.podrun_chmod' in staging_section
         assert 'chmod -R' in staging_section
         assert 'chmod "$_chmod"' in staging_section
+
+
+# ---------------------------------------------------------------------------
+# Restart guard — first-run vs always-run partitioning
+# ---------------------------------------------------------------------------
+
+
+class TestRestartGuard:
+    """Verify the READY sentinel guard partitions first-run setup from the shared tail."""
+
+    @pytest.fixture(autouse=True)
+    def _generate(self):
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            self.content = f.read()
+        # Locate guard boundaries using comment markers.
+        self.guard_open = self.content.index('# --- First-run setup')
+        self.guard_close = self.content.index('# --- End first-run setup ---')
+
+    def test_guard_structure(self):
+        """Script contains guard open/close with READY sentinel check."""
+        assert f'if [ ! -e {PODRUN_READY_PATH} ]; then' in self.content
+        # The fi closing the guard appears before the end marker
+        fi_idx = self.content.rindex('fi', self.guard_open, self.guard_close + 1)
+        assert fi_idx > self.guard_open
+
+    def test_setup_inside_guard(self):
+        """Key setup operations appear between guard open and guard close."""
+        guarded = self.content[self.guard_open : self.guard_close]
+        # passwd/group manipulation
+        assert 'sed' in guarded and '/etc/passwd' in guarded
+        # home dir creation
+        assert f'mkdir -p /home/{UNAME}' in guarded
+        # copy-staging
+        assert '/.podrun/copy-staging' in guarded
+        # sudo setup
+        assert 'NOPASSWD:ALL' in guarded
+        # git submodule bridge
+        assert '[ -f "$PWD/.git" ]' in guarded
+        # ~/workdir symlink
+        assert f'/home/{UNAME}/workdir' in guarded
+        # bashrc wiring
+        assert PODRUN_RC_PATH in guarded
+
+    def test_ready_touch_inside_guard(self):
+        """`touch /.podrun/READY` appears between guard open and fi."""
+        touch_idx = self.content.index(f'touch {PODRUN_READY_PATH}')
+        assert self.guard_open < touch_idx < self.guard_close
+
+    def test_shared_tail_outside_guard(self):
+        """HOME/USER/ENV exports, alt entrypoint, and cap-drop appear after guard."""
+        tail = self.content[self.guard_close :]
+        # Environment exports
+        assert 'HOME=/home/' in tail
+        assert 'export HOME' in tail
+        assert f'USER={UNAME}' in tail
+        assert 'export USER' in tail
+        assert f'ENV={PODRUN_RC_PATH}' in tail
+        assert 'export ENV' in tail
+        # Alt entrypoint handling
+        assert 'PODRUN_ALT_ENTRYPOINT' in tail
+        # Cap-drop exec
+        assert 'setpriv' in tail or 'exec' in tail
+
+    def test_shell_detect_before_guard(self):
+        """Shell detection (PODRUN_SHELL) appears before the guard."""
+        shell_idx = self.content.index('PODRUN_SHELL="$SHELL"')
+        assert shell_idx < self.guard_open
+
+    def test_exports_inside_guard(self):
+        """When exports are configured, export blocks appear inside the guard."""
+        path = generate_run_entrypoint(_default_ns(**{'run.export': ['/data:/host/data']}))
+        with open(path) as f:
+            content = f.read()
+        guard_open = content.index('# --- First-run setup')
+        guard_close = content.index('# --- End first-run setup ---')
+        guarded = content[guard_open:guard_close]
+        assert '# Export (mount): /data' in guarded
 
 
 # ---------------------------------------------------------------------------

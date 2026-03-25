@@ -1355,6 +1355,9 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
 {shell_detect}
         PODRUN_SHELL="$SHELL"; export PODRUN_SHELL
 
+        # --- First-run setup (skipped on container restart) ---
+        if [ ! -e {PODRUN_READY_PATH} ]; then
+
         # Remove image-shipped /etc/passwd entries that collide on UID but have
         # a different username (e.g. ubuntu:24.04 ships 'ubuntu' at UID 1000).
         # --passwd-entry appends our entry, but getpwuid returns the first match.
@@ -1479,18 +1482,22 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
           echo '. {PODRUN_RC_PATH}' >> "$_bashrc"
         fi
 
-        # Force HOME to the directory we just created — the image may have
-        # HOME baked in (e.g. ENV HOME=/root) which prevents podman from
-        # deriving it from --passwd-entry.
+{export_blocks}
+        # Signal that first-run setup is complete.
+        touch {PODRUN_READY_PATH}
+
+        fi
+        # --- End first-run setup ---
+
+        # Force HOME — the image may have HOME baked in (e.g. ENV HOME=/root)
+        # which prevents podman from deriving it from --passwd-entry.
+        # Set on every start so restarted containers have correct env.
         HOME=/home/{UNAME}
         export HOME
         USER={UNAME}
         export USER
         ENV={PODRUN_RC_PATH}
         export ENV
-
-{export_blocks}        # Signal that setup is complete so exec-entrypoint.sh can proceed.
-        touch {PODRUN_READY_PATH}
 
         # If an alternate entrypoint was requested (e.g. by the devcontainer
         # CLI via --entrypoint), prepend it to the args so it is exec'd after

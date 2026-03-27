@@ -701,63 +701,8 @@ def _warn_missing_subids():
 
 
 def _resolve_script_command(path: str) -> str:
-    """Build a shell command to execute a script via its shebang interpreter.
-
-    Reads the shebang line, parses the interpreter and flags, resolves the
-    interpreter on PATH, and returns a ready-to-run command string.  Handles
-    common shebang forms::
-
-        #!/usr/bin/env python3          → python3 script.py
-        #!/usr/bin/env -S python3 -u    → python3 -u script.py
-        #!/usr/bin/python3 -u           → python3 -u script.py
-        #!C:\\Python311\\python.exe     → C:\\Python311\\python.exe script.py
-
-    Exits with an error if the shebang is missing, empty, or the interpreter
-    cannot be found on PATH.
-    """
-    # -- Read shebang ---------------------------------------------------------
-    try:
-        with open(path, encoding='utf-8', errors='replace') as f:
-            first_line = f.readline()
-    except OSError:
-        print(f'Error: Cannot read config script: {path}', file=sys.stderr)
-        sys.exit(1)
-    if not first_line.startswith('#!'):
-        print(
-            f'Error: Config script has no shebang line: {path}\n'
-            f'       A shebang (e.g. #!/usr/bin/env python3) is required.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    parts = first_line[2:].strip().split()
-    if not parts:
-        print(f'Error: Empty shebang in config script: {path}', file=sys.stderr)
-        sys.exit(1)
-    # ``/usr/bin/env`` form — skip env itself and its flags (e.g. -S)
-    if parts[0] == '/usr/bin/env' or parts[0].endswith('/env'):
-        parts = parts[1:]  # drop env
-        while parts and parts[0].startswith('-'):
-            parts = parts[1:]
-        if not parts:
-            print(f'Error: No interpreter after env in shebang: {path}', file=sys.stderr)
-            sys.exit(1)
-    interp, interp_args = parts[0], parts[1:]
-
-    # -- Resolve interpreter --------------------------------------------------
-    # Try full path first (handles Windows absolute paths and bare names).
-    resolved = shutil.which(interp)
-    # Fall back to basename for Unix absolute paths on Windows
-    # (``/usr/bin/python3`` doesn't exist, but ``python3`` is on PATH).
-    if not resolved:
-        resolved = shutil.which(os.path.basename(interp))
-    if not resolved:
-        print(
-            f'Error: Cannot find "{interp}" on PATH (from shebang in {path})',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    cmd = [_shell_quote(resolved)] + [_shell_quote(a) for a in interp_args] + [_shell_quote(path)]
-    return ' '.join(cmd)
+    """Build a command to execute a Python config script."""
+    return _shell_quote(sys.executable) + ' ' + _shell_quote(path)
 
 
 def _config_split(text: str) -> List[str]:
@@ -3357,7 +3302,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         action='append',
         default=None,
         metavar='PATH',
-        help='Run script and inline its stdout as args (may be repeated)',
+        help='Run Python script and inline its stdout as args (may be repeated)',
     )
     opts.add_argument(
         '--no-devconfig',

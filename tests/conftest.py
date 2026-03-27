@@ -242,7 +242,6 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
     monkeypatch.setattr(podrun_mod, '_default_store_dir', lambda: None)
     monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: None)
-    monkeypatch.setattr(podrun_mod, '_resolve_script_command', podrun_mod._shell_quote)
     monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
     monkeypatch.delenv(ENV_PODRUN_PODMAN_REMOTE, raising=False)
     monkeypatch.delenv(ENV_PODRUN_CONTAINER, raising=False)

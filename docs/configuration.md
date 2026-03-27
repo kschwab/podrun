@@ -153,38 +153,22 @@ Supported variables:
 
 ## Config Scripts (`--config-script`)
 
-Config scripts are executables whose stdout is parsed as podrun/podman flags.
+Config scripts are Python scripts whose stdout is parsed as podrun/podman flags.
 Script output follows the standard config precedence — CLI flags override
 script flags, and script flags override devcontainer.json.
 
 ```bash
-podrun run --config-script ./my-config.sh ubuntu:24.04
+podrun run --config-script ./my-config.py ubuntu:24.04
 ```
 
-Where `my-config.sh` might output:
+Where `my-config.py` might output:
 
 ```
 --host-overlay --shell zsh -e HTTP_PROXY=http://proxy.example.com:80
 ```
 
-### Shebang Requirement
-
-Config scripts must have a shebang line (`#!`) as their first line. Podrun
-reads the shebang to determine the interpreter, resolves it on PATH, and
-executes the script explicitly. This provides consistent behavior on both
-Linux and Windows (where file extension associations are unreliable).
-
-Supported forms:
-
-| Shebang | Resolved as |
-|---------|-------------|
-| `#!/usr/bin/env python3` | `python3 script.py` (PATH lookup) |
-| `#!/usr/bin/env -S python3 -u` | `python3 -u script.py` (flags preserved) |
-| `#!/usr/bin/python3` | `python3 script.py` (basename fallback) |
-| `#!C:\Python311\python.exe` | Direct path on Windows |
-
-If the interpreter cannot be found on PATH, podrun exits with an error
-showing the interpreter name and script path.
+Config scripts are always executed by the same Python interpreter that is
+running podrun itself (`sys.executable`). No shebang line is required.
 
 Multiple `--config-script` flags are executed left to right. When the same
 flag appears in more than one script, the rightmost (last) value wins.

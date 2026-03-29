@@ -66,39 +66,98 @@ skip discovery entirely.
 | `securityOpt` | Security options |
 | `privileged` | Run as privileged |
 | `init` | Use `--init` |
+| `initializeCommand` | Run on host before container creation (string, array, or object) |
+| `onCreateCommand` | Run in container on first creation only (string, array, or object) |
+| `postCreateCommand` | Run in container after `onCreateCommand`, first creation only (string, array, or object) |
+| `postStartCommand` | Run in container on every start (string, array, or object) |
+| `postAttachCommand` | Run in container on every exec attach (string, array, or object) |
+| `updateContentCommand` | **Not supported** (warning printed; use devcontainer CLI) |
+| `waitFor` | **Not supported** (warning printed; use devcontainer CLI) |
 
 Top-level fields are converted to podman flags at the lowest precedence level
 within the devcontainer.json source.
+
+### Lifecycle Commands
+
+Podrun supports a subset of devcontainer lifecycle commands. These run
+setup scripts at specific points in the container's life.
+
+| Command | Runs on | When | Frequency |
+|---------|---------|------|-----------|
+| `initializeCommand` | Host | Before container creation | Every `podrun run` |
+| `onCreateCommand` | Container | During first-run entrypoint | Once (first creation) |
+| `postCreateCommand` | Container | After `onCreateCommand` | Once (first creation) |
+| `postStartCommand` | Container | After first-run setup completes | Every start |
+| `postAttachCommand` | Container | When exec-ing into a running container | Every attach |
+
+**Command forms** — all three devcontainer spec forms are accepted:
+
+- **String**: `"npm install"` — run via `/bin/sh -c`
+- **Array**: `["npm", "install"]` — direct invocation
+- **Object**: `{"server": "npm start", "watch": "npm run watch"}` — named
+  commands run in parallel (backgrounded with `&`, then `wait`)
+
+**Devcontainer CLI guard** — when podrun is invoked via
+`devcontainer --docker-path podrun`, lifecycle commands are skipped to avoid
+double execution (the devcontainer CLI runs them itself). The guard checks
+the `PODRUN_DEVCONTAINER_CLI` environment variable.
+
+**Unsupported fields** — `updateContentCommand` and `waitFor` are not
+executed. When present in devcontainer.json, podrun prints a single
+consolidated warning suggesting the devcontainer CLI for full lifecycle
+support.
+
+**Example:**
+
+```jsonc
+{
+  "image": "ubuntu:24.04",
+  "initializeCommand": "echo 'preparing host...'",
+  "onCreateCommand": ["npm", "install"],
+  "postCreateCommand": "npm run build",
+  "postStartCommand": {
+    "server": "npm start",
+    "watch": "npm run watch"
+  },
+  "postAttachCommand": "echo 'welcome back'",
+  "customizations": {
+    "podrun": {
+      "session": true,
+      "name": "mydev"
+    }
+  }
+}
+```
 
 ### `customizations.podrun` Keys
 
 | JSON Key | Type | Equivalent Flag |
 |----------|------|-----------------|
 | `name` | string | `--name` |
-| `userOverlay` | bool | `--user-overlay` |
-| `hostOverlay` | bool | `--host-overlay` |
-| `interactiveOverlay` | bool | `--interactive-overlay` |
-| `session` | bool | `--session` |
-| `adhoc` | bool | `--adhoc` |
-| `dotFilesOverlay` | bool | `--dotfiles` |
-| `x11` | bool | `--x11` |
-| `podmanRemote` | bool | `--podman-remote` |
-| `shell` | string | `--shell` |
-| `login` | bool | `--login` |
-| `promptBanner` | string | `--prompt-banner` |
-| `autoAttach` | bool | `--auto-attach` |
-| `autoReplace` | bool | `--auto-replace` |
-| `fuseOverlayfs` | bool | `--fuse-overlayfs` |
-| `noAutoResolveGitSubmodules` | bool | `--no-auto-resolve-git-submodules` |
-| `exports` | list | `--export` |
-| `noPodrunrc` | bool | `--no-podrunrc` |
-| `localStore` | string | `--local-store` |
-| `localStoreAutoInit` | bool | `--local-store-auto-init` |
-| `localStoreIgnore` | bool | `--local-store-ignore` |
+| `userOverlay` | bool | [`--user-overlay`](reference.md#run-flags) |
+| `hostOverlay` | bool | [`--host-overlay`](reference.md#run-flags) |
+| `interactiveOverlay` | bool | [`--interactive-overlay`](reference.md#run-flags) |
+| `session` | bool | [`--session`](reference.md#run-flags) |
+| `adhoc` | bool | [`--adhoc`](reference.md#run-flags) |
+| `dotFilesOverlay` | bool | [`--dotfiles`](reference.md#run-flags) |
+| `x11` | bool | [`--x11`](reference.md#run-flags) |
+| `podmanRemote` | bool | [`--podman-remote`](reference.md#run-flags) |
+| `shell` | string | [`--shell`](reference.md#run-flags) |
+| `login` | bool | [`--login`](reference.md#run-flags) |
+| `promptBanner` | string | [`--prompt-banner`](reference.md#run-flags) |
+| `autoAttach` | bool | [`--auto-attach`](reference.md#run-flags) |
+| `autoReplace` | bool | [`--auto-replace`](reference.md#run-flags) |
+| `fuseOverlayfs` | bool | [`--fuse-overlayfs`](reference.md#run-flags) |
+| `noAutoResolveGitSubmodules` | bool | [`--no-auto-resolve-git-submodules`](reference.md#run-flags) |
+| `exports` | list | [`--export`](reference.md#run-flags) |
+| `noPodrunrc` | bool | [`--no-podrunrc`](reference.md#global-flags) |
+| `localStore` | string | [`--local-store`](reference.md#global-flags) |
+| `localStoreAutoInit` | bool | [`--local-store-auto-init`](reference.md#global-flags) |
+| `localStoreIgnore` | bool | [`--local-store-ignore`](reference.md#global-flags) |
 | `storageDriver` | string | `--storage-driver` (podman global) |
-| `configScript` | string or list | `--config-script` |
-| `nfsRemediate` | string | `--nfs-remediate` |
-| `nfsRemediatePath` | string | `--nfs-remediate-path` |
+| `configScript` | string or list | [`--config-script`](reference.md#global-flags) |
+| `nfsRemediate` | string | [`--nfs-remediate`](reference.md#global-flags) |
+| `nfsRemediatePath` | string | [`--nfs-remediate-path`](reference.md#global-flags) |
 
 `customizations.podrun` values override top-level fields, and CLI flags
 override both.
@@ -137,6 +196,8 @@ Supported variables:
   "capAdd": ["SYS_PTRACE"],
   "securityOpt": ["seccomp=unconfined"],
   "init": true,
+  "onCreateCommand": "apt-get update && apt-get install -y build-essential",
+  "postStartCommand": "echo 'ready'",
   "customizations": {
     "podrun": {
       "name": "mydev",

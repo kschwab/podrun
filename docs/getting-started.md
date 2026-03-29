@@ -81,7 +81,9 @@ Then run podrun with no image argument — it discovers the config automatically
 podrun run
 ```
 
-See [Configuration](configuration.md) for all supported fields.
+Podrun also supports a subset of devcontainer lifecycle commands (`onCreateCommand`,
+`postStartCommand`, etc.) for running setup scripts at container creation or
+start. See [Configuration — Lifecycle Commands](configuration.md#lifecycle-commands).
 
 ## Inspecting What Podrun Generates
 

@@ -222,12 +222,11 @@ class TestHandleContainerState:
         ns = {'run.name': 'myc'}
         assert handle_container_state(_ctx_from_ns(ns)) is None
 
-    def test_stopped_auto_attach_warns(self, monkeypatch, capsys):
+    def test_stopped_auto_attach_restarts(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
-        # auto_attach=True but stopped → warn, then check auto_replace
+        # auto_attach=True + stopped → restart (auto_attach takes priority)
         ns = {'run.name': 'myc', 'run.auto_attach': True, 'run.auto_replace': True}
-        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
-        assert 'Cannot auto-attach' in capsys.readouterr().err
+        assert handle_container_state(_ctx_from_ns(ns)) == 'restart'
 
     def test_stopped_auto_replace(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
@@ -240,17 +239,32 @@ class TestHandleContainerState:
         ns = {'run.name': 'myc', 'run.auto_attach': False, 'run.auto_replace': False}
         assert handle_container_state(_ctx_from_ns(ns)) is None
 
-    def test_stopped_prompt_replace_yes(self, monkeypatch):
+    def test_stopped_prompt_restart_yes(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: True)
         ns = {'run.name': 'myc'}
-        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
+        assert handle_container_state(_ctx_from_ns(ns)) == 'restart'
 
-    def test_stopped_prompt_replace_no(self, monkeypatch):
+    def test_stopped_prompt_both_no(self, monkeypatch):
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr(podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: False)
         ns = {'run.name': 'myc'}
         assert handle_container_state(_ctx_from_ns(ns)) is None
+
+    def test_stopped_prompt_restart_no_replace_yes(self, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        prompts = iter([False, True])
+        monkeypatch.setattr(
+            podrun_mod, 'yes_no_prompt', lambda msg, default, interactive: next(prompts)
+        )
+        ns = {'run.name': 'myc'}
+        assert handle_container_state(_ctx_from_ns(ns)) == 'replace'
+
+    def test_stopped_auto_attach_priority_over_auto_replace(self, monkeypatch):
+        """When both auto_attach and auto_replace are True and stopped, restart wins."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        ns = {'run.name': 'myc', 'run.auto_attach': True, 'run.auto_replace': True}
+        assert handle_container_state(_ctx_from_ns(ns)) == 'restart'
 
     def test_auto_attach_priority_over_auto_replace(self, monkeypatch):
         """When both auto_attach and auto_replace are True and running, attach wins."""

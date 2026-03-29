@@ -3940,23 +3940,22 @@ def _handle_running_state(auto_attach, auto_replace, is_interactive):
 
 
 def _handle_stopped_state(name, auto_attach, auto_replace, is_interactive):
-    """Decide action for a stopped container: replace or None."""
+    """Decide action for a stopped container: restart, replace, or None."""
     if auto_attach:
-        print(
-            f'Warning: Cannot auto-attach to container {name!r} in non-running state',
-            file=sys.stderr,
-        )
+        return 'restart'
     if auto_replace:
         return 'replace'
     if auto_attach is False and auto_replace is False and not is_interactive:
         return None
+    if yes_no_prompt('Restart stopped instance?', True, is_interactive):
+        return 'restart'
     if yes_no_prompt('Replace stopped instance?', False, is_interactive):
         return 'replace'
     return None
 
 
 def handle_container_state(ctx: 'PodrunContext', global_flags=None):
-    """Returns ``"run"``, ``"attach"``, ``"replace"``, or ``None`` (exit).
+    """Returns ``"run"``, ``"attach"``, ``"restart"``, ``"replace"``, or ``None`` (exit).
 
     Reads from *ctx.ns*: ``run.name``, ``run.auto_attach``, ``run.auto_replace``.
     """
@@ -4881,6 +4880,20 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
         if not ns.get('root.print_cmd'):
             run_os_cmd(replace_rm_cmd)
         action = 'run'
+
+    if action == 'restart':
+        name = ns['run.name']
+        pm = _shell_quote(ctx.podman_path)
+        gf_str = ' '.join(_shell_quote(f) for f in global_flags) + ' ' if global_flags else ''
+        restart_start_cmd = f'{pm} {gf_str}start {_shell_quote(name)}'
+        if ns.get('root.print_cmd'):
+            print(restart_start_cmd)
+        else:
+            result = run_os_cmd(restart_start_cmd)
+            if result.returncode != 0:
+                print(f'Error: Failed to start container {name!r}.', file=sys.stderr)
+                sys.exit(1)
+        _exec_attach(ctx, global_flags)
 
     if action == 'attach':
         _exec_attach(ctx, global_flags)

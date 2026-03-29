@@ -40,7 +40,7 @@ These flags apply to all subcommands and must appear before the subcommand:
 | `--shell SHELL` | Shell to use inside container (e.g. `bash`, `zsh`) |
 | `--login` / `--no-login` | Run shell as login shell (sources `/etc/profile`). `--no-login` explicitly disables. |
 | `--prompt-banner TEXT` | Custom prompt banner text |
-| `--auto-attach` | Exec into a running named container (no effect on stopped containers; see [Container Lifecycle](#container-lifecycle)) |
+| `--auto-attach` | Exec into a running named container, or restart and exec into a stopped one (see [Container Lifecycle](#container-lifecycle)) |
 | `--auto-replace` | Remove and recreate named container (running or stopped; see [Container Lifecycle](#container-lifecycle)) |
 | `--export SRC:DST[:0]` | Export container path to host (requires `--user-overlay`). Append `:0` for copy-only. May be repeated. |
 | `--fuse-overlayfs` | Use fuse-overlayfs for overlay mount program (see [Fuse-Overlayfs](overlays.md#fuse-overlayfs)) |
@@ -71,30 +71,30 @@ Keys in `customizations.podrun` of `devcontainer.json`:
 
 | JSON Key | Type | Equivalent Flag |
 |----------|------|-----------------|
-| `userOverlay` | bool | `--user-overlay` |
-| `hostOverlay` | bool | `--host-overlay` |
-| `interactiveOverlay` | bool | `--interactive-overlay` |
-| `session` | bool | `--session` |
-| `adhoc` | bool | `--adhoc` |
-| `dotFilesOverlay` | bool | `--dotfiles` |
-| `x11` | bool | `--x11` |
-| `podmanRemote` | bool | `--podman-remote` |
-| `shell` | string | `--shell` |
-| `login` | bool | `--login` |
-| `promptBanner` | string | `--prompt-banner` |
-| `autoAttach` | bool | `--auto-attach` |
-| `autoReplace` | bool | `--auto-replace` |
-| `fuseOverlayfs` | bool | `--fuse-overlayfs` |
-| `noAutoResolveGitSubmodules` | bool | `--no-auto-resolve-git-submodules` |
-| `exports` | list | `--export` |
-| `noPodrunrc` | bool | `--no-podrunrc` |
-| `localStore` | string | `--local-store` |
-| `localStoreAutoInit` | bool | `--local-store-auto-init` |
-| `localStoreIgnore` | bool | `--local-store-ignore` |
+| `userOverlay` | bool | [`--user-overlay`](#run-flags) |
+| `hostOverlay` | bool | [`--host-overlay`](#run-flags) |
+| `interactiveOverlay` | bool | [`--interactive-overlay`](#run-flags) |
+| `session` | bool | [`--session`](#run-flags) |
+| `adhoc` | bool | [`--adhoc`](#run-flags) |
+| `dotFilesOverlay` | bool | [`--dotfiles`](#run-flags) |
+| `x11` | bool | [`--x11`](#run-flags) |
+| `podmanRemote` | bool | [`--podman-remote`](#run-flags) |
+| `shell` | string | [`--shell`](#run-flags) |
+| `login` | bool | [`--login`](#run-flags) |
+| `promptBanner` | string | [`--prompt-banner`](#run-flags) |
+| `autoAttach` | bool | [`--auto-attach`](#run-flags) |
+| `autoReplace` | bool | [`--auto-replace`](#run-flags) |
+| `fuseOverlayfs` | bool | [`--fuse-overlayfs`](#run-flags) |
+| `noAutoResolveGitSubmodules` | bool | [`--no-auto-resolve-git-submodules`](#run-flags) |
+| `exports` | list | [`--export`](#run-flags) |
+| `noPodrunrc` | bool | [`--no-podrunrc`](#global-flags) |
+| `localStore` | string | [`--local-store`](#global-flags) |
+| `localStoreAutoInit` | bool | [`--local-store-auto-init`](#global-flags) |
+| `localStoreIgnore` | bool | [`--local-store-ignore`](#global-flags) |
 | `storageDriver` | string | `--storage-driver` (podman global) |
-| `configScript` | string or list | `--config-script` |
-| `nfsRemediate` | string | `--nfs-remediate` |
-| `nfsRemediatePath` | string | `--nfs-remediate-path` |
+| `configScript` | string or list | [`--config-script`](#global-flags) |
+| `nfsRemediate` | string | [`--nfs-remediate`](#global-flags) |
+| `nfsRemediatePath` | string | [`--nfs-remediate-path`](#global-flags) |
 
 ## Top-Level Devcontainer Fields
 
@@ -111,6 +111,47 @@ Keys in `customizations.podrun` of `devcontainer.json`:
 | `securityOpt` | Security options |
 | `privileged` | Run as privileged |
 | `init` | Use `--init` |
+| `initializeCommand` | Run on host before container creation (string, array, or object) |
+| `onCreateCommand` | Run in container on first creation (string, array, or object) |
+| `postCreateCommand` | Run in container after `onCreateCommand`, first creation only (string, array, or object) |
+| `postStartCommand` | Run in container on every start (string, array, or object) |
+| `postAttachCommand` | Run in container on every exec attach (string, array, or object) |
+| `updateContentCommand` | Not supported (warning printed; use devcontainer CLI) |
+| `waitFor` | Not supported (warning printed; use devcontainer CLI) |
+
+## Devcontainer Lifecycle Commands
+
+Podrun executes a subset of devcontainer lifecycle commands at specific
+points during container creation, start, and attach.
+
+| Command | Runs on | When |
+|---------|---------|------|
+| `initializeCommand` | Host | Before container creation (every run) |
+| `onCreateCommand` | Container | First-run entrypoint (once) |
+| `postCreateCommand` | Container | After `onCreateCommand` (once) |
+| `postStartCommand` | Container | After first-run setup (every start) |
+| `postAttachCommand` | Container | Exec attach into running container |
+
+All three devcontainer command forms are accepted:
+
+- **String**: `"npm install"` — executed via `/bin/sh -c`
+- **Array**: `["npm", "install"]` — direct invocation
+- **Object**: `{"a": "cmd1", "b": "cmd2"}` — parallel execution (backgrounded
+  with `&`, then `wait`)
+
+`initializeCommand` runs on the host via `subprocess` before the container is
+created. All other lifecycle commands are injected into the generated
+entrypoint scripts.
+
+Container-side lifecycle blocks are guarded by `PODRUN_DEVCONTAINER_CLI` — when
+podrun is invoked via `devcontainer --docker-path podrun`, lifecycle commands
+are skipped to avoid double execution.
+
+`updateContentCommand` and `waitFor` are not executed. A warning is printed
+when these appear in devcontainer.json.
+
+See [Configuration — Lifecycle Commands](configuration.md#lifecycle-commands)
+for examples.
 
 ## Environment Variables
 
@@ -162,7 +203,7 @@ When a `--name` is provided, podrun checks for existing containers:
 | Container state | `--auto-attach` | `--auto-replace` | Neither (interactive) |
 |---|---|---|---|
 | **Running** | Exec into container (attach) | Remove + re-run | Prompt: attach? replace? |
-| **Stopped** | Warning, then prompt | Remove + re-run | Prompt: replace? |
+| **Stopped** | Start + exec into container (restart) | Remove + re-run | Prompt: restart? replace? |
 | **Not found** | Create new | Create new | Create new |
 
 **Typical patterns:**
@@ -180,18 +221,16 @@ When a `--name` is provided, podrun checks for existing containers:
   existing container and creates a new one. If you find yourself always
   auto-replacing, `--adhoc` (which implies `--rm`) is likely a better fit.
 
-**Why podrun does not auto-start stopped containers:**
+**Stale-config caveat when restarting stopped containers:**
 
 Podman bakes the container's entrypoint, environment variables, volume
 mounts, and image layers at creation time. `podman start` re-runs a stopped
 container with that original frozen configuration — if anything changed since
 (CLI flags, config scripts, `~/.podrunrc`, image updates), the restarted
-container silently uses stale settings.
-
-To preserve state across container replacements, use `--export` to bind
-specific directories to the host. If you explicitly need to restart a
-stopped container with its original configuration, use `podman start <name>`
-directly.
+container silently uses stale settings. `--auto-attach` (and the interactive
+restart prompt) use `podman start` for convenience, so be aware that the
+resumed container runs with its creation-time configuration. If you need a
+fresh container with current settings, use `--auto-replace` instead.
 
 ## NFS Storage Remediation
 

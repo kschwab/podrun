@@ -572,6 +572,30 @@ class TestHandleRunContainerState:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert 'not created with podrun user overlay' in capsys.readouterr().err
 
+    def test_restart_prints_start_then_exec(self, monkeypatch, capsys):
+        """When restarting, --print-cmd should show start then exec command."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(
+            podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        lines = out.strip().split('\n')
+        assert len(lines) == 2
+        assert 'start' in lines[0]
+        assert 'myc' in lines[0]
+        assert 'exec' in lines[1]
+
+    def test_restart_non_user_overlay_errors(self, monkeypatch, capsys):
+        """Cannot restart-attach to a container not created with user overlay."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'none'))
+        with pytest.raises(SystemExit):
+            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
+        assert 'not created with podrun user overlay' in capsys.readouterr().err
+
     def test_action_none_exits_cleanly(self, monkeypatch):
         """When handle_container_state returns None, main exits with 0."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')

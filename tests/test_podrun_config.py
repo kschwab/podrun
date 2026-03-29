@@ -1,9 +1,10 @@
 import json
-import subprocess
+import os
 
 import pytest
 
 from podrun.podrun import (
+    _config_split,
     _devcontainer_project_dir,
     _devcontainer_to_ns,
     _expand_devcontainer_vars,
@@ -38,38 +39,69 @@ def tmp_project(tmp_path):
 
 
 class TestRunConfigScripts:
-    def test_single_script(self, mock_run_os_cmd):
-        mock_run_os_cmd.set_return(stdout='--rm --name test')
-        tokens = run_config_scripts(['/path/to/script.sh'])
-        assert tokens == ['--rm', '--name', 'test']
-        assert len(mock_run_os_cmd.calls) == 1
+    def _write_script(self, tmp_path, name, body):
+        p = tmp_path / name
+        p.write_text(body)
+        return str(p)
 
-    def test_multiple_scripts_concatenated(self, mock_run_os_cmd):
-        mock_run_os_cmd.set_side_effect(
-            [
-                subprocess.CompletedProcess(args='', returncode=0, stdout='--rm'),
-                subprocess.CompletedProcess(args='', returncode=0, stdout='--name test'),
-            ]
-        )
-        tokens = run_config_scripts(['/a.sh', '/b.sh'])
+    def test_single_script(self, tmp_path):
+        s = self._write_script(tmp_path, 'a.py', 'print("--rm --name test")')
+        tokens = run_config_scripts([s])
         assert tokens == ['--rm', '--name', 'test']
-        assert len(mock_run_os_cmd.calls) == 2
 
-    def test_empty_output(self, mock_run_os_cmd):
-        mock_run_os_cmd.set_return(stdout='')
-        tokens = run_config_scripts(['/empty.sh'])
+    def test_multiple_scripts_concatenated(self, tmp_path):
+        a = self._write_script(tmp_path, 'a.py', 'print("--rm")')
+        b = self._write_script(tmp_path, 'b.py', 'print("--name test")')
+        tokens = run_config_scripts([a, b])
+        assert tokens == ['--rm', '--name', 'test']
+
+    def test_empty_output(self, tmp_path):
+        s = self._write_script(tmp_path, 'empty.py', '')
+        tokens = run_config_scripts([s])
         assert tokens == []
 
-    def test_failure_exits(self, mock_run_os_cmd):
-        mock_run_os_cmd.set_return(returncode=1, stderr='boom')
+    def test_failure_exits(self, tmp_path):
+        s = self._write_script(tmp_path, 'bad.py', 'import sys; sys.exit(1)')
         with pytest.raises(SystemExit) as exc_info:
-            run_config_scripts(['/bad.sh'])
+            run_config_scripts([s])
         assert exc_info.value.code == 1
 
-    def test_empty_list(self, mock_run_os_cmd):
+    def test_empty_list(self):
         tokens = run_config_scripts([])
         assert tokens == []
-        assert len(mock_run_os_cmd.calls) == 0
+
+    def test_sys_exit_zero_captures_output(self, tmp_path):
+        s = self._write_script(tmp_path, 'exit0.py', 'print("--rm"); import sys; sys.exit(0)')
+        tokens = run_config_scripts([s])
+        assert tokens == ['--rm']
+
+    def test_exception_exits(self, tmp_path):
+        s = self._write_script(tmp_path, 'exc.py', 'raise ValueError("boom")')
+        with pytest.raises(SystemExit) as exc_info:
+            run_config_scripts([s])
+        assert exc_info.value.code == 1
+
+    def test_env_passthrough_and_restore(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('PODRUN_DEVCONTAINER_CLI', raising=False)
+        s = self._write_script(
+            tmp_path, 'env.py', 'import os; print(os.environ.get("PODRUN_DEVCONTAINER_CLI", ""))'
+        )
+
+        import dataclasses
+
+        ctx = parse_args(['run', 'alpine'])
+        ctx = dataclasses.replace(ctx, dc_from_cli=True)
+        tokens = run_config_scripts([s], ctx=ctx)
+        assert tokens == ['1']
+        assert 'PODRUN_DEVCONTAINER_CLI' not in os.environ
+
+    def test_stderr_passes_through(self, tmp_path, capsys):
+        s = self._write_script(
+            tmp_path, 'err.py', 'import sys; print("--rm"); print("warn", file=sys.stderr)'
+        )
+        tokens = run_config_scripts([s])
+        assert tokens == ['--rm']
+        assert 'warn' in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -471,13 +503,14 @@ class TestResolveConfig:
         )
 
         if script_stdout is not None:
-            monkeypatch.setattr(
-                podrun_mod,
-                'run_os_cmd',
-                lambda cmd, env=None: subprocess.CompletedProcess(
-                    args='', returncode=0, stdout=script_stdout
-                ),
-            )
+            _real = run_config_scripts
+
+            def _fake(paths, ctx=None):
+                if paths:
+                    return _config_split(script_stdout)
+                return _real(paths, ctx)
+
+            monkeypatch.setattr(podrun_mod, 'run_config_scripts', _fake)
 
         if dc is not None:
             monkeypatch.setattr(podrun_mod, 'parse_devcontainer_json', lambda path: dc)
@@ -544,25 +577,21 @@ class TestResolveConfig:
         # DC wins for session (neither CLI nor script set it)
         assert r.ns.get('run.session') is True
 
-    def test_multiple_scripts(self, monkeypatch):
+    def test_multiple_scripts(self, tmp_path, monkeypatch):
         """Multiple --config-script: tokens concatenated."""
-        call_count = [0]
+        a = tmp_path / 'a.py'
+        b = tmp_path / 'b.py'
+        a.write_text('print("--rm")')
+        b.write_text('print("--name from-script")')
 
-        def fake_run_os_cmd(cmd, env=None):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return subprocess.CompletedProcess(args='', returncode=0, stdout='--rm')
-            return subprocess.CompletedProcess(args='', returncode=0, stdout='--name from-script')
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
         monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: None)
 
         r = parse_args(
             [
                 '--config-script',
-                '/a.sh',
+                str(a),
                 '--config-script',
-                '/b.sh',
+                str(b),
                 '--no-devconfig',
                 'run',
                 'alpine',
@@ -593,8 +622,13 @@ class TestResolveConfig:
         )
         assert r.ns.get('run.session') is True
 
-    def test_dc_config_script_list(self, monkeypatch, tmp_project):
+    def test_dc_config_script_list(self, tmp_path, monkeypatch, tmp_project):
         """configScript as a list in devcontainer.json — all scripts run in order."""
+        dc_a = tmp_path / 'dc-a.py'
+        dc_b = tmp_path / 'dc-b.py'
+        dc_a.write_text('print("--session")')
+        dc_b.write_text('print("--shell /bin/zsh")')
+
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -604,21 +638,12 @@ class TestResolveConfig:
                     'image': 'alpine',
                     'customizations': {
                         'podrun': {
-                            'configScript': ['/dc-a.sh', '/dc-b.sh'],
+                            'configScript': [str(dc_a), str(dc_b)],
                         }
                     },
                 }
             )
         )
-        calls = []
-
-        def fake_run_os_cmd(cmd, env=None):
-            calls.append(cmd)
-            if len(calls) == 1:
-                return subprocess.CompletedProcess(args='', returncode=0, stdout='--session')
-            return subprocess.CompletedProcess(args='', returncode=0, stdout='--shell /bin/zsh')
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
         monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
         monkeypatch.setattr(
             podrun_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
@@ -626,17 +651,25 @@ class TestResolveConfig:
 
         r = parse_args(['run'])
         r = resolve_config(r)
-        assert len(calls) == 2
         assert r.ns.get('run.session') is True
         assert r.ns.get('run.shell') == '/bin/zsh'
 
-    def test_dc_scripts_then_cli_scripts(self, monkeypatch, tmp_project):
+    def test_dc_scripts_then_cli_scripts(self, tmp_path, monkeypatch, tmp_project):
         """devcontainer configScript runs first, then CLI --config-script.
 
         Processing order:
             dc configScript-0, dc configScript-1, cli script-0, cli script-1
         Later scripts override earlier ones for podrun flags.
         """
+        dc_a = tmp_path / 'dc-a.py'
+        dc_b = tmp_path / 'dc-b.py'
+        cli_a = tmp_path / 'cli-a.py'
+        cli_b = tmp_path / 'cli-b.py'
+        dc_a.write_text('print("--shell /bin/dc-a")')
+        dc_b.write_text('print("--shell /bin/dc-b")')
+        cli_a.write_text('print("--session")')
+        cli_b.write_text('print("--shell /bin/cli-b")')
+
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -646,29 +679,12 @@ class TestResolveConfig:
                     'image': 'alpine',
                     'customizations': {
                         'podrun': {
-                            'configScript': ['/dc-a.sh', '/dc-b.sh'],
+                            'configScript': [str(dc_a), str(dc_b)],
                         }
                     },
                 }
             )
         )
-        calls = []
-
-        def fake_run_os_cmd(cmd, env=None):
-            calls.append(cmd)
-            outputs = {
-                1: '--shell /bin/dc-a',  # dc script 0
-                2: '--shell /bin/dc-b',  # dc script 1 overrides dc-a
-                3: '--session',  # cli script 0
-                4: '--shell /bin/cli-b',  # cli script 1 overrides dc-b
-            }
-            return subprocess.CompletedProcess(
-                args='',
-                returncode=0,
-                stdout=outputs.get(len(calls), ''),
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
         monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
         monkeypatch.setattr(
             podrun_mod, 'parse_devcontainer_json', lambda path: json.loads(dc_file.read_text())
@@ -677,18 +693,16 @@ class TestResolveConfig:
         r = parse_args(
             [
                 '--config-script',
-                '/cli-a.sh',
+                str(cli_a),
                 '--config-script',
-                '/cli-b.sh',
+                str(cli_b),
                 'run',
             ]
         )
         r = resolve_config(r)
-        # All 4 scripts ran in order
-        assert len(calls) == 4
         # CLI script's --shell wins (last writer wins via concatenated tokens)
         assert r.ns.get('run.shell') == '/bin/cli-b'
-        # --session from cli-a.sh is present
+        # --session from cli-a.py is present
         assert r.ns.get('run.session') is True
 
     def test_overlay_implication_adhoc(self, monkeypatch):
@@ -1044,14 +1058,21 @@ class TestIntegrationPipeline:
     CLI flags) produce the correct final podman command line.
     """
 
-    def _cmd(self, argv, monkeypatch, dc_file=None, script_effects=None):
+    def _write_script(self, tmp_path, name, stdout):
+        """Write a Python config script that prints *stdout* and return its path."""
+        p = tmp_path / name
+        p.write_text(f'print({stdout!r})')
+        return str(p)
+
+    def _cmd(self, argv, monkeypatch, dc_file=None, script_paths=None):
         """Parse + resolve + build, returning the final command list.
 
         Args:
             argv: CLI args (without podman path).
             dc_file: Path to a real devcontainer.json on disk (in tmp_path).
-            script_effects: List of (returncode, stdout) tuples for successive
-                            run_os_cmd calls, or None for no mocking.
+            script_paths: Dict mapping placeholder path (e.g. '/s.sh') to the
+                          real script path on disk.  Placeholder paths in *argv*
+                          are substituted before parsing.
         """
         monkeypatch.setattr(
             podrun_mod,
@@ -1059,20 +1080,8 @@ class TestIntegrationPipeline:
             lambda start_dir=None: dc_file,
         )
 
-        if script_effects is not None:
-            call_idx = [0]
-
-            def fake_run_os_cmd(cmd, env=None):
-                i = call_idx[0]
-                call_idx[0] += 1
-                if i < len(script_effects):
-                    rc, stdout = script_effects[i]
-                    return subprocess.CompletedProcess(
-                        args='', returncode=rc, stdout=stdout, stderr=''
-                    )
-                return subprocess.CompletedProcess(args='', returncode=0, stdout='', stderr='')
-
-            monkeypatch.setattr(podrun_mod, 'run_os_cmd', fake_run_os_cmd)
+        if script_paths is not None:
+            argv = [script_paths.get(a, a) for a in argv]
 
         r = parse_args(argv)
         r = resolve_config(r)
@@ -1208,10 +1217,10 @@ class TestIntegrationPipeline:
 
     def test_script_passthrough_in_command(self, monkeypatch, tmp_project):
         """Config script output becomes podman flags in the final command."""
+        s = self._write_script(tmp_project, 's.py', '-e SCRIPT_VAR=1 --rm')
         cmd = self._cmd(
-            ['--config-script', '/s.sh', '--no-devconfig', 'run', 'alpine'],
+            ['--config-script', s, '--no-devconfig', 'run', 'alpine'],
             monkeypatch,
-            script_effects=[(0, '-e SCRIPT_VAR=1 --rm')],
         )
         assert '-e' in cmd
         assert 'SCRIPT_VAR=1' in cmd
@@ -1220,10 +1229,10 @@ class TestIntegrationPipeline:
 
     def test_script_name_in_command(self, monkeypatch, tmp_project):
         """Config script setting --name flows to --name= in the final command."""
+        s = self._write_script(tmp_project, 's.py', '--name from-script')
         cmd = self._cmd(
-            ['--config-script', '/s.sh', '--no-devconfig', 'run', 'alpine'],
+            ['--config-script', s, '--no-devconfig', 'run', 'alpine'],
             monkeypatch,
-            script_effects=[(0, '--name from-script')],
         )
         assert '--name=from-script' in cmd
 
@@ -1249,10 +1258,10 @@ class TestIntegrationPipeline:
 
     def test_script_args_before_cli_passthrough(self, monkeypatch, tmp_project):
         """Script passthrough args appear before CLI passthrough args."""
+        s = self._write_script(tmp_project, 's.py', '-e SCRIPT=1')
         cmd = self._cmd(
-            ['--config-script', '/s.sh', '--no-devconfig', 'run', '-e', 'CLI=1', 'alpine'],
+            ['--config-script', s, '--no-devconfig', 'run', '-e', 'CLI=1', 'alpine'],
             monkeypatch,
-            script_effects=[(0, '-e SCRIPT=1')],
         )
         script_e_idx = cmd.index('SCRIPT=1') - 1  # -e before SCRIPT=1
         cli_e_idx = cmd.index('CLI=1') - 1  # -e before CLI=1
@@ -1264,22 +1273,20 @@ class TestIntegrationPipeline:
         Podman uses last-writer-wins, so this ordering means CLI overrides
         script which overrides DC.
         """
+        dc_s = self._write_script(tmp_project, 'dc-script.py', '-e DC_SCRIPT=1')
+        cli_s = self._write_script(tmp_project, 'cli-script.py', '-e CLI_SCRIPT=1')
         dc_file = self._write_dc(
             tmp_project,
             {
                 'image': 'alpine',
                 'capAdd': ['SYS_PTRACE'],
-                'customizations': {'podrun': {'configScript': '/dc-script.sh'}},
+                'customizations': {'podrun': {'configScript': dc_s}},
             },
         )
         cmd = self._cmd(
-            ['--config-script', '/cli-script.sh', 'run', '-e', 'CLI=1', 'alpine'],
+            ['--config-script', cli_s, 'run', '-e', 'CLI=1', 'alpine'],
             monkeypatch,
             dc_file=dc_file,
-            script_effects=[
-                (0, '-e DC_SCRIPT=1'),  # dc configScript
-                (0, '-e CLI_SCRIPT=1'),  # cli --config-script
-            ],
         )
         # All three sources contribute flags; verify ordering
         cap_idx = cmd.index('--cap-add=SYS_PTRACE')
@@ -1293,10 +1300,10 @@ class TestIntegrationPipeline:
 
     def test_cli_name_overrides_script_name(self, monkeypatch, tmp_project):
         """CLI --name wins over script --name in the final command."""
+        s = self._write_script(tmp_project, 's.py', '--name script-name')
         cmd = self._cmd(
-            ['--config-script', '/s.sh', '--no-devconfig', 'run', '--name', 'cli-name', 'alpine'],
+            ['--config-script', s, '--no-devconfig', 'run', '--name', 'cli-name', 'alpine'],
             monkeypatch,
-            script_effects=[(0, '--name script-name')],
         )
         assert '--name=cli-name' in cmd
         assert '--name=script-name' not in cmd
@@ -1320,6 +1327,7 @@ class TestIntegrationPipeline:
 
     def test_script_name_overrides_dc_name(self, monkeypatch, tmp_project):
         """Script --name wins over devcontainer name in the final command."""
+        s = self._write_script(tmp_project, 's.py', '--name script-name')
         dc_file = self._write_dc(
             tmp_project,
             {
@@ -1327,7 +1335,7 @@ class TestIntegrationPipeline:
                 'customizations': {
                     'podrun': {
                         'name': 'dc-name',
-                        'configScript': '/s.sh',
+                        'configScript': s,
                     }
                 },
             },
@@ -1336,7 +1344,6 @@ class TestIntegrationPipeline:
             ['run'],
             monkeypatch,
             dc_file=dc_file,
-            script_effects=[(0, '--name script-name')],
         )
         assert '--name=script-name' in cmd
         assert '--name=dc-name' not in cmd
@@ -1420,6 +1427,8 @@ class TestIntegrationPipeline:
 
     def test_full_scenario(self, monkeypatch, tmp_project):
         """Real-world-like scenario: DC + script + CLI all contributing."""
+        dc_s = self._write_script(tmp_project, 'dc-script.py', '-e DC_SCRIPT_VAR=1')
+        cli_s = self._write_script(tmp_project, 'cli-script.py', '-e CLI_SCRIPT_VAR=1 --rm')
         dc_file = self._write_dc(
             tmp_project,
             {
@@ -1431,7 +1440,7 @@ class TestIntegrationPipeline:
                 'customizations': {
                     'podrun': {
                         'name': 'dc-name',
-                        'configScript': '/dc-script.sh',
+                        'configScript': dc_s,
                     }
                 },
             },
@@ -1439,7 +1448,7 @@ class TestIntegrationPipeline:
         cmd = self._cmd(
             [
                 '--config-script',
-                '/cli-script.sh',
+                cli_s,
                 'run',
                 '--name',
                 'my-container',
@@ -1453,10 +1462,6 @@ class TestIntegrationPipeline:
             ],
             monkeypatch,
             dc_file=dc_file,
-            script_effects=[
-                (0, '-e DC_SCRIPT_VAR=1'),  # dc configScript
-                (0, '-e CLI_SCRIPT_VAR=1 --rm'),  # cli --config-script
-            ],
         )
 
         # Structure: podman run --name=... --label=... [passthrough] image

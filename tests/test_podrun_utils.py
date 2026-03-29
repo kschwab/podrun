@@ -2,7 +2,6 @@
 
 import os
 import stat
-import sys
 
 import pytest
 
@@ -420,26 +419,3 @@ class TestYesNoPrompt:
         monkeypatch.setattr('builtins.input', lambda: next(answers))
         result = yes_no_prompt('Continue?', answer_default=True, is_interactive=True)
         assert result is False
-
-
-# ---------------------------------------------------------------------------
-# _resolve_script_command
-# ---------------------------------------------------------------------------
-
-
-class TestResolveScriptCommand:
-    """Tests for Python config script command building."""
-
-    def test_uses_sys_executable(self):
-        from podrun.podrun import _resolve_script_command
-
-        cmd = _resolve_script_command('/some/script.py')
-        assert sys.executable in cmd
-        assert '/some/script.py' in cmd
-
-    def test_quoting_with_spaces(self):
-        from podrun.podrun import _resolve_script_command
-
-        cmd = _resolve_script_command('/path with spaces/script.py')
-        assert sys.executable in cmd
-        assert 'path with spaces' in cmd

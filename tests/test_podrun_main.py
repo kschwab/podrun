@@ -884,83 +884,39 @@ class TestPodrunrcIntegration:
             ),
         )
 
+    def _write_rc(self, tmp_path, output):
+        """Write a podrunrc Python script that prints *output*."""
+        rc = tmp_path / '.podrunrc'
+        rc.write_text(f'print({output!r})')
+        return str(rc)
+
     def _run(self, argv, capsys):
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd'] + argv)
         assert exc_info.value.code == 0
         return shlex.split(capsys.readouterr().out)
 
-    def test_rc_flags_appear_in_command(self, monkeypatch, capsys):
+    def test_rc_flags_appear_in_command(self, tmp_path, monkeypatch, capsys):
         """~/.podrunrc output is parsed and appears in the podman command."""
-        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
-
-        # Mock run_os_cmd to return --session when called with the rc script,
-        # and empty output for other calls (stale cleanup, etc.)
-        def mock_cmd(cmd, env=None):
-            if '/fake/.podrunrc' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=0,
-                    stdout='--session\n',
-                    stderr='',
-                )
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout='',
-                stderr='',
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        rc = self._write_rc(tmp_path, '--session')
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: rc)
         cmd = self._run(['run', 'alpine'], capsys)
         # --session implies -it and --userns=keep-id
         assert '-it' in cmd
         assert '--userns=keep-id' in cmd
 
-    def test_rc_passthrough_flags_in_command(self, monkeypatch, capsys):
+    def test_rc_passthrough_flags_in_command(self, tmp_path, monkeypatch, capsys):
         """Passthrough flags from rc appear in the podman command."""
-        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
-
-        def mock_cmd(cmd, env=None):
-            if '/fake/.podrunrc' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=0,
-                    stdout='-e RC_VAR=1\n',
-                    stderr='',
-                )
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout='',
-                stderr='',
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        rc = self._write_rc(tmp_path, '-e RC_VAR=1')
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: rc)
         cmd = self._run(['run', 'alpine'], capsys)
         assert '-e' in cmd
         assert 'RC_VAR=1' in cmd
 
-    def test_cli_overrides_rc(self, monkeypatch, capsys):
+    def test_cli_overrides_rc(self, tmp_path, monkeypatch, capsys):
         """CLI flags take precedence over rc flags."""
-        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
-
-        def mock_cmd(cmd, env=None):
-            if '/fake/.podrunrc' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=0,
-                    stdout='--shell /bin/bash\n',
-                    stderr='',
-                )
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout='',
-                stderr='',
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        rc = self._write_rc(tmp_path, '--shell /bin/bash')
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: rc)
         cmd = self._run(['run', '--shell', '/bin/zsh', '--session', 'alpine'], capsys)
         # The CLI --shell /bin/zsh should win over rc's --shell /bin/bash
         # We can't directly see the shell in the command, but the entrypoint
@@ -973,24 +929,8 @@ class TestPodrunrcIntegration:
         dc_path = tmp_path / 'devcontainer.json'
         dc_path.write_text('{"customizations": {"podrun": {"name": "dc-name"}}}')
         monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_path)
-        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
-
-        def mock_cmd(cmd, env=None):
-            if '/fake/.podrunrc' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=0,
-                    stdout='--name rc-name\n',
-                    stderr='',
-                )
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout='',
-                stderr='',
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        rc = self._write_rc(tmp_path, '--name rc-name')
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: rc)
         cmd = self._run(['run', '--session', 'alpine'], capsys)
         assert '--name=dc-name' in cmd
 
@@ -1040,24 +980,8 @@ class TestPodrunrcIntegration:
             f'{{"customizations": {{"podrun": {{"exports": ["/dc_src:{dc_dst}"]}}}}}}'
         )
         monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_path)
-        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
-
-        def mock_cmd(cmd, env=None):
-            if '/fake/.podrunrc' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=0,
-                    stdout=f'--export /rc_src:{rc_dst}\n',
-                    stderr='',
-                )
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout='',
-                stderr='',
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        rc = self._write_rc(tmp_path, f'--export /rc_src:{rc_dst}')
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: rc)
         cmd = self._run(
             ['run', '--user-overlay', '--export', f'/cli_src:{cli_dst}', 'alpine'],
             capsys,
@@ -1068,26 +992,10 @@ class TestPodrunrcIntegration:
         assert str(dc_dst) in joined
         assert str(cli_dst) in joined
 
-    def test_rc_passthrough_lowest_priority(self, monkeypatch, capsys):
+    def test_rc_passthrough_lowest_priority(self, tmp_path, monkeypatch, capsys):
         """rc passthrough args come before dc/script/cli passthrough."""
-        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: '/fake/.podrunrc')
-
-        def mock_cmd(cmd, env=None):
-            if '/fake/.podrunrc' in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=0,
-                    stdout='-e FROM_RC=1\n',
-                    stderr='',
-                )
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout='',
-                stderr='',
-            )
-
-        monkeypatch.setattr(podrun_mod, 'run_os_cmd', mock_cmd)
+        rc = self._write_rc(tmp_path, '-e FROM_RC=1')
+        monkeypatch.setattr(podrun_mod, '_discover_podrunrc', lambda: rc)
         cmd = self._run(['run', '-e', 'FROM_CLI=1', 'alpine'], capsys)
         # Both env vars should be present
         joined = ' '.join(cmd)

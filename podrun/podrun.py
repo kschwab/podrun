@@ -40,14 +40,17 @@ https://github.com/kschwab/podrun/blob/main/LICENSE.md"""
 )
 
 import argparse
+import contextlib
 import dataclasses
 import getpass
 import hashlib
+import io
 import json
 import os
 import pathlib
 import platform
 import re
+import runpy
 import shlex
 import shutil
 import signal
@@ -56,6 +59,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import traceback
 from typing import List, Optional, Tuple
 
 _IS_WINDOWS = sys.platform == 'win32'
@@ -700,11 +704,6 @@ def _warn_missing_subids():
         pass
 
 
-def _resolve_script_command(path: str) -> str:
-    """Build a command to execute a Python config script."""
-    return _shell_quote(sys.executable) + ' ' + _shell_quote(path)
-
-
 def _config_split(text: str) -> List[str]:
     """Split config script output into tokens.
 
@@ -720,10 +719,37 @@ def _config_split(text: str) -> List[str]:
     return list(lexer)
 
 
-def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] = None) -> List[str]:
-    """Execute scripts left-to-right, return concatenated parsed tokens.
+def _run_script_in_process(path: str, extra: dict) -> str:
+    """Run a single Python config script in-process and return its stdout.
 
-    Fatal (sys.exit(1)) on non-zero exit.
+    Sets *extra* env vars for the duration and restores them afterward.
+    Calls ``sys.exit(1)`` on script failure.
+    """
+    saved = os.environ.copy()
+    try:
+        os.environ.update(extra)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runpy.run_path(path, run_name='__main__')
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+        if code != 0:
+            print(f'Error: --config-script {path} failed (exit {code})', file=sys.stderr)
+            sys.exit(1)
+    except Exception:
+        traceback.print_exc()
+        print(f'Error: --config-script {path} raised an exception', file=sys.stderr)
+        sys.exit(1)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    return buf.getvalue()
+
+
+def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] = None) -> List[str]:
+    """Execute scripts in-process left-to-right, return concatenated parsed tokens.
+
+    Fatal (sys.exit(1)) on non-zero exit or unhandled exception.
 
     When *ctx* is provided, scripts receive on-demand env vars so they
     can branch on context:
@@ -737,19 +763,10 @@ def run_config_scripts(script_paths: List[str], ctx: Optional['PodrunContext'] =
             extra[ENV_PODRUN_DEVCONTAINER_CLI] = '1'
         if _is_remote(ctx.podman_path):
             extra[ENV_PODRUN_PODMAN_REMOTE] = '1'
-    env: Optional[dict] = {**os.environ, **extra} if extra else None
 
     tokens: List[str] = []
     for path in script_paths:
-        cmd = _resolve_script_command(path)
-        out = run_os_cmd(cmd, env=env)
-        if out.returncode != 0:
-            print(
-                f'Error: --config-script {path} failed (exit {out.returncode}):\n{out.stderr}',
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        tokens.extend(_config_split(out.stdout))
+        tokens.extend(_config_split(_run_script_in_process(path, extra)))
     return tokens
 
 

@@ -26,6 +26,7 @@ from podrun.podrun import (
     _is_vacant_store,
     _nfs_remediate,
     _resolve_overlay_mounts,
+    _run_initialize_command,
     _warn_missing_subids,
     _write_flags_cache,
     _cleanup,
@@ -2039,3 +2040,72 @@ class TestNfsRemediate:
         _nfs_remediate(self._ctx(ns))
         assert (user_store / 'existing').read_text() == 'keep'
         assert 'skip (exists)' in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# initializeCommand — host-side lifecycle via _handle_run
+# ---------------------------------------------------------------------------
+
+
+class TestInitializeCommandInHandleRun:
+    """Verify initializeCommand is invoked (or skipped) by _handle_run via --print-cmd."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_run_os_cmd(self, monkeypatch):
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd, env=None: subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='', stderr=''
+            ),
+        )
+
+    def test_skipped_with_print_cmd(self, monkeypatch, capsys, tmp_path):
+        """initializeCommand is NOT executed when --print-cmd is set."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        import json
+
+        dc_file.write_text(
+            json.dumps({'image': 'alpine', 'initializeCommand': 'echo SHOULD_NOT_RUN'})
+        )
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        # Capture that _run_initialize_command is not called
+        calls = []
+        orig = _run_initialize_command
+        monkeypatch.setattr(
+            podrun_mod,
+            '_run_initialize_command',
+            lambda cmd: calls.append(cmd) or orig(cmd),
+        )
+        with pytest.raises(SystemExit) as exc:
+            main(['--print-cmd', 'run', 'alpine'])
+        assert exc.value.code == 0
+        assert len(calls) == 0
+
+    def test_skipped_when_dc_cli_drives(self, monkeypatch, capsys, tmp_path):
+        """initializeCommand is NOT executed when devcontainer CLI is driving."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        import json
+
+        dc_file.write_text(
+            json.dumps({'image': 'alpine', 'initializeCommand': 'echo SHOULD_NOT_RUN'})
+        )
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        calls = []
+        monkeypatch.setattr(podrun_mod, '_run_initialize_command', lambda cmd: calls.append(cmd))
+        with pytest.raises(SystemExit) as exc:
+            main(
+                [
+                    '--print-cmd',
+                    'run',
+                    '-l',
+                    f'devcontainer.config_file={dc_file}',
+                    'alpine',
+                ]
+            )
+        assert exc.value.code == 0
+        assert len(calls) == 0

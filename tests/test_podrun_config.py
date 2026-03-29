@@ -7,7 +7,9 @@ from podrun.podrun import (
     _devcontainer_project_dir,
     _devcontainer_to_ns,
     _expand_devcontainer_vars,
+    _resolve_dc_fields,
     _strip_jsonc,
+    _warn_unsupported_lifecycle_fields,
     build_run_command,
     devcontainer_run_args,
     extract_podrun_config,
@@ -1975,3 +1977,194 @@ class TestVariableExpansionIntegration:
         """--no-devconfig produces no variable expansion errors."""
         r = self._resolve(['--no-devconfig', 'run', 'alpine'], monkeypatch)
         assert r.ns.get('dc.workspace_folder') is None
+
+
+# ---------------------------------------------------------------------------
+# TestLifecycleConfigParsing — lifecycle fields from devcontainer.json
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleConfigParsing:
+    def test_string_command_parsed(self):
+        """String lifecycle command is stored in ns."""
+        dc = {'onCreateCommand': 'apt-get update'}
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns)
+        assert ns['dc.on_create_command'] == 'apt-get update'
+
+    def test_array_command_parsed(self):
+        """Array lifecycle command is stored in ns."""
+        dc = {'postCreateCommand': ['npm', 'install']}
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns)
+        assert ns['dc.post_create_command'] == ['npm', 'install']
+
+    def test_object_command_parsed(self):
+        """Object lifecycle command is stored in ns."""
+        dc = {'postStartCommand': {'web': 'npm start', 'api': 'go run .'}}
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns)
+        assert ns['dc.post_start_command'] == {'web': 'npm start', 'api': 'go run .'}
+
+    def test_initialize_command_parsed(self):
+        """initializeCommand is stored in ns."""
+        dc = {'initializeCommand': 'apt-get update'}
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns)
+        assert ns['dc.initialize_command'] == 'apt-get update'
+
+    def test_all_five_fields(self):
+        """All five lifecycle fields are parsed."""
+        dc = {
+            'initializeCommand': 'step0',
+            'onCreateCommand': 'step1',
+            'postCreateCommand': 'step2',
+            'postStartCommand': 'step3',
+            'postAttachCommand': 'step4',
+        }
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns)
+        assert ns['dc.initialize_command'] == 'step0'
+        assert ns['dc.on_create_command'] == 'step1'
+        assert ns['dc.post_create_command'] == 'step2'
+        assert ns['dc.post_start_command'] == 'step3'
+        assert ns['dc.post_attach_command'] == 'step4'
+
+    def test_absent_fields_not_in_ns(self):
+        """Absent lifecycle fields do not appear in ns."""
+        dc = {'image': 'alpine'}
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns)
+        assert 'dc.initialize_command' not in ns
+        assert 'dc.on_create_command' not in ns
+        assert 'dc.post_create_command' not in ns
+        assert 'dc.post_start_command' not in ns
+        assert 'dc.post_attach_command' not in ns
+
+    def test_variable_expansion_in_lifecycle(self, tmp_path):
+        """Variables like ${localWorkspaceFolder} are expanded in lifecycle commands."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text('{}')
+        dc = {
+            'onCreateCommand': 'cd ${localWorkspaceFolder} && make',
+            'workspaceFolder': '/workspace',
+        }
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns, dc_path=str(dc_file))
+        assert str(tmp_path) in ns['dc.on_create_command']
+        assert '${' not in ns['dc.on_create_command']
+
+    def test_variable_expansion_in_array_command(self, tmp_path):
+        """Variables expanded in array lifecycle commands."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text('{}')
+        dc = {
+            'postCreateCommand': ['ls', '${localWorkspaceFolder}'],
+            'workspaceFolder': '/workspace',
+        }
+        ns: dict = {}
+        _resolve_dc_fields(dc, ns, dc_path=str(dc_file))
+        assert str(tmp_path) in str(ns['dc.post_create_command'])
+
+    def test_lifecycle_in_resolve_config(self, monkeypatch, tmp_path):
+        """Lifecycle fields survive full resolve_config pipeline."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'onCreateCommand': 'echo hello',
+                    'postStartCommand': ['echo', 'started'],
+                }
+            )
+        )
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        result = parse_args(['run'])
+        result = resolve_config(result)
+        assert result.ns.get('dc.on_create_command') == 'echo hello'
+        assert result.ns.get('dc.post_start_command') == ['echo', 'started']
+
+
+# ---------------------------------------------------------------------------
+# TestUnsupportedLifecycleWarning — warn about fields podrun doesn't execute
+# ---------------------------------------------------------------------------
+
+
+class TestUnsupportedLifecycleWarning:
+    def test_update_content_command_warns(self, capsys):
+        _warn_unsupported_lifecycle_fields({'updateContentCommand': 'echo update'})
+        assert 'updateContentCommand' in capsys.readouterr().err
+
+    def test_wait_for_warns(self, capsys):
+        _warn_unsupported_lifecycle_fields({'waitFor': 'updateContentCommand'})
+        assert 'waitFor' in capsys.readouterr().err
+
+    def test_multiple_unsupported_warns_once(self, capsys):
+        dc = {
+            'updateContentCommand': 'echo update',
+            'waitFor': 'postCreateCommand',
+        }
+        _warn_unsupported_lifecycle_fields(dc)
+        err = capsys.readouterr().err
+        assert 'updateContentCommand' in err
+        assert 'waitFor' in err
+        # Single warning line
+        assert err.count('podrun: warning:') == 1
+
+    def test_supported_fields_no_warning(self, capsys):
+        dc = {
+            'initializeCommand': 'echo init',
+            'onCreateCommand': 'echo create',
+            'postCreateCommand': 'npm install',
+            'postStartCommand': 'echo start',
+            'postAttachCommand': 'echo attach',
+        }
+        _warn_unsupported_lifecycle_fields(dc)
+        assert capsys.readouterr().err == ''
+
+    def test_empty_dc_no_warning(self, capsys):
+        _warn_unsupported_lifecycle_fields({})
+        assert capsys.readouterr().err == ''
+
+    def test_warning_in_resolve_config_standalone(self, monkeypatch, tmp_path, capsys):
+        """Unsupported fields trigger warning when podrun runs standalone."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'updateContentCommand': 'echo update',
+                }
+            )
+        )
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        result = parse_args(['run'])
+        resolve_config(result)
+        assert 'updateContentCommand' in capsys.readouterr().err
+
+    def test_no_warning_when_dc_cli_drives(self, monkeypatch, tmp_path, capsys):
+        """No warning when devcontainer CLI is driving."""
+        dc_dir = tmp_path / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'updateContentCommand': 'echo update',
+                }
+            )
+        )
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        # Simulate devcontainer CLI driving via label in passthrough
+        result = parse_args(['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'])
+        resolve_config(result)
+        assert 'updateContentCommand' not in capsys.readouterr().err

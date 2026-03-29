@@ -135,6 +135,34 @@ class TestShellcheck:
         assert result.returncode == 0, f'shellcheck errors:\n{result.stdout}'
 
     @pytest.mark.skipif(not _SHELLCHECK_AVAILABLE, reason='shellcheck not available')
+    def test_run_entrypoint_with_lifecycle(self):
+        ns = _default_ns(
+            **{
+                'dc.on_create_command': 'apt-get update && apt-get install -y curl',
+                'dc.post_create_command': ['npm', 'install'],
+                'dc.post_start_command': {'server': 'npm start', 'watch': 'npm run watch'},
+            }
+        )
+        path = generate_run_entrypoint(ns)
+        result = subprocess.run(
+            ['shellcheck', '-s', 'sh', '--severity=warning', path],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f'shellcheck errors:\n{result.stdout}'
+
+    @pytest.mark.skipif(not _SHELLCHECK_AVAILABLE, reason='shellcheck not available')
+    def test_exec_entrypoint_with_lifecycle(self):
+        ns = {'dc.post_attach_command': 'git fetch --all'}
+        path = generate_exec_entrypoint(ns)
+        result = subprocess.run(
+            ['shellcheck', '-s', 'sh', '--severity=warning', path],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f'shellcheck errors:\n{result.stdout}'
+
+    @pytest.mark.skipif(not _SHELLCHECK_AVAILABLE, reason='shellcheck not available')
     def test_bash_completion(self):
         from podrun.podrun import _generate_bash_completion
 

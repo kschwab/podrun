@@ -8,12 +8,15 @@ import pytest
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
     BOOTSTRAP_CAPS,
+    ENV_PODRUN_DEVCONTAINER_CLI,
     GID,
     PODRUN_RC_PATH,
     PODRUN_READY_PATH,
     UID,
     UNAME,
     __version__,
+    _lifecycle_command_to_shell,
+    _run_initialize_command,
     generate_exec_entrypoint,
     generate_rc_sh,
     generate_run_entrypoint,
@@ -642,8 +645,292 @@ class TestNsDictInterface:
         path = generate_run_entrypoint({})
         assert os.path.isfile(path)
 
+    def test_exec_entrypoint_backward_compat(self):
+        """generate_exec_entrypoint still works with no args."""
+        path = generate_exec_entrypoint()
+        assert os.path.isfile(path)
+
     def test_rc_sh_missing_keys_use_defaults(self):
         path = generate_rc_sh({})
         with open(path) as f:
             content = f.read()
         assert '_prompt_banner="podrun 📦"' in content
+
+
+# ---------------------------------------------------------------------------
+# _lifecycle_command_to_shell
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleCommandToShell:
+    def test_none_returns_empty(self):
+        assert _lifecycle_command_to_shell(None) == ''
+
+    def test_empty_string_returns_empty(self):
+        assert _lifecycle_command_to_shell('') == ''
+
+    def test_false_returns_empty(self):
+        assert _lifecycle_command_to_shell(False) == ''
+
+    def test_string_command(self):
+        result = _lifecycle_command_to_shell('echo hello')
+        assert "/bin/sh -c 'echo hello'" in result
+
+    def test_string_with_single_quotes(self):
+        result = _lifecycle_command_to_shell("echo 'hi there'")
+        assert '/bin/sh -c' in result
+        # Single quotes are escaped
+        assert "'\\''" in result or "\\'" in result
+
+    def test_array_command(self):
+        result = _lifecycle_command_to_shell(['npm', 'install', '--save'])
+        assert 'npm' in result
+        assert 'install' in result
+        assert '--save' in result
+
+    def test_array_single_element(self):
+        result = _lifecycle_command_to_shell(['make'])
+        assert 'make' in result
+
+    def test_object_command(self):
+        result = _lifecycle_command_to_shell(
+            {
+                'server': 'npm start',
+                'watch': 'npm run watch',
+            }
+        )
+        assert '# server' in result
+        assert '# watch' in result
+        assert ' &' in result
+        assert 'wait' in result
+
+    def test_object_with_array_sub(self):
+        result = _lifecycle_command_to_shell(
+            {
+                'build': ['make', 'all'],
+            }
+        )
+        assert '# build' in result
+        assert 'make' in result
+        assert ' &' in result
+        assert 'wait' in result
+
+    def test_empty_dict_returns_empty(self):
+        assert _lifecycle_command_to_shell({}) == ''
+
+    def test_empty_list_returns_empty(self):
+        assert _lifecycle_command_to_shell([]) == ''
+
+    def test_custom_indent(self):
+        result = _lifecycle_command_to_shell('echo hello', indent='    ')
+        assert result.startswith('    ')
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle in run-entrypoint
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleInRunEntrypoint:
+    def test_on_create_inside_ready_guard(self):
+        """onCreateCommand appears inside READY guard (first-run only)."""
+        ns = _default_ns(**{'dc.on_create_command': 'apt-get update'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        guard_open = content.index('# --- First-run setup')
+        guard_close = content.index('# --- End first-run setup ---')
+        assert 'onCreateCommand' in content[guard_open:guard_close]
+        assert 'apt-get update' in content[guard_open:guard_close]
+
+    def test_post_create_inside_ready_guard(self):
+        """postCreateCommand appears inside READY guard (first-run only)."""
+        ns = _default_ns(**{'dc.post_create_command': 'npm install'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        guard_open = content.index('# --- First-run setup')
+        guard_close = content.index('# --- End first-run setup ---')
+        assert 'postCreateCommand' in content[guard_open:guard_close]
+        assert 'npm install' in content[guard_open:guard_close]
+
+    def test_on_create_before_post_create(self):
+        """onCreateCommand runs before postCreateCommand."""
+        ns = _default_ns(
+            **{
+                'dc.on_create_command': 'step-one',
+                'dc.post_create_command': 'step-two',
+            }
+        )
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        idx_on = content.index('step-one')
+        idx_post = content.index('step-two')
+        assert idx_on < idx_post
+
+    def test_post_start_outside_ready_guard(self):
+        """postStartCommand appears outside READY guard (runs every start)."""
+        ns = _default_ns(**{'dc.post_start_command': 'redis-server'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        guard_close = content.index('# --- End first-run setup ---')
+        tail = content[guard_close:]
+        assert 'postStartCommand' in tail
+        assert 'redis-server' in tail
+
+    def test_devcontainer_cli_guard_present(self):
+        """Lifecycle blocks are guarded by PODRUN_DEVCONTAINER_CLI."""
+        ns = _default_ns(
+            **{
+                'dc.on_create_command': 'echo test',
+                'dc.post_start_command': 'echo start',
+            }
+        )
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert ENV_PODRUN_DEVCONTAINER_CLI in content
+
+    def test_no_lifecycle_no_lifecycle_block(self):
+        """Without lifecycle commands, no lifecycle blocks appear."""
+        ns = _default_ns()
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert 'Devcontainer lifecycle' not in content
+
+    def test_lifecycle_before_ready_touch(self):
+        """First-run lifecycle commands appear before touch READY."""
+        ns = _default_ns(**{'dc.on_create_command': 'setup-step'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        idx_cmd = content.index('setup-step')
+        idx_touch = content.index(f'touch {PODRUN_READY_PATH}')
+        assert idx_cmd < idx_touch
+
+    def test_array_lifecycle_command(self):
+        """Array-form lifecycle command is rendered."""
+        ns = _default_ns(**{'dc.on_create_command': ['make', 'build']})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert 'make' in content
+        assert 'build' in content
+
+    def test_object_lifecycle_command(self):
+        """Object-form lifecycle command has background + wait."""
+        ns = _default_ns(
+            **{
+                'dc.post_create_command': {'web': 'npm start', 'api': 'go run .'},
+            }
+        )
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert '# web' in content
+        assert '# api' in content
+        assert ' &' in content
+        assert 'wait' in content
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle in exec-entrypoint
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleInExecEntrypoint:
+    def test_post_attach_in_exec_entrypoint(self):
+        """postAttachCommand appears in exec-entrypoint."""
+        ns = {'dc.post_attach_command': 'git fetch'}
+        path = generate_exec_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert 'postAttachCommand' in content
+        assert 'git fetch' in content
+
+    def test_post_attach_before_exec(self):
+        """postAttachCommand appears before the Exec block."""
+        ns = {'dc.post_attach_command': 'my-attach-cmd'}
+        path = generate_exec_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        idx_cmd = content.index('my-attach-cmd')
+        idx_exec = content.index('# --- Exec ---')
+        assert idx_cmd < idx_exec
+
+    def test_devcontainer_cli_guard_in_exec(self):
+        """postAttachCommand is guarded by PODRUN_DEVCONTAINER_CLI."""
+        ns = {'dc.post_attach_command': 'echo attach'}
+        path = generate_exec_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert ENV_PODRUN_DEVCONTAINER_CLI in content
+
+    def test_no_ns_no_lifecycle(self):
+        """With no ns, no lifecycle blocks appear."""
+        path = generate_exec_entrypoint()
+        with open(path) as f:
+            content = f.read()
+        assert 'Devcontainer lifecycle' not in content
+
+    def test_empty_ns_no_lifecycle(self):
+        """With empty ns, no lifecycle blocks appear."""
+        path = generate_exec_entrypoint({})
+        with open(path) as f:
+            content = f.read()
+        assert 'Devcontainer lifecycle' not in content
+
+    def test_backward_compat_no_args(self):
+        """generate_exec_entrypoint() with no args still works."""
+        path = generate_exec_entrypoint()
+        assert os.path.isfile(path)
+
+
+# ---------------------------------------------------------------------------
+# _run_initialize_command — host-side lifecycle execution
+# ---------------------------------------------------------------------------
+
+
+class TestRunInitializeCommand:
+    def test_none_is_noop(self):
+        _run_initialize_command(None)
+
+    def test_empty_string_is_noop(self):
+        _run_initialize_command('')
+
+    def test_false_is_noop(self):
+        _run_initialize_command(False)
+
+    def test_string_command_succeeds(self):
+        _run_initialize_command('true')
+
+    def test_string_command_failure_exits(self):
+        with pytest.raises(SystemExit):
+            _run_initialize_command('false')
+
+    def test_array_command_succeeds(self):
+        _run_initialize_command(['true'])
+
+    def test_array_command_failure_exits(self):
+        with pytest.raises(SystemExit):
+            _run_initialize_command(['/bin/false'])
+
+    def test_object_command_succeeds(self):
+        _run_initialize_command({'a': 'true', 'b': 'true'})
+
+    def test_object_command_partial_failure_exits(self):
+        with pytest.raises(SystemExit):
+            _run_initialize_command({'ok': 'true', 'fail': 'false'})
+
+    def test_object_empty_sub_skipped(self):
+        _run_initialize_command({'a': 'true', 'b': ''})
+
+    def test_string_shell_features(self):
+        """String form supports shell features like &&."""
+        _run_initialize_command('true && true')
+
+    def test_array_with_args(self):
+        _run_initialize_command(['/bin/sh', '-c', 'true'])

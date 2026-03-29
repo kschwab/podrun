@@ -1153,6 +1153,87 @@ def _expand_export_tilde(exports: list) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _lifecycle_command_to_shell(cmd, indent: str = '        ') -> str:
+    """Convert a devcontainer lifecycle command to shell script lines.
+
+    *cmd* may be a string, a list of strings, or a dict of named commands.
+    Returns a shell snippet (with leading *indent*) or empty string for
+    None/falsy input.
+
+    - **string** → ``/bin/sh -c '<escaped>'``
+    - **array**  → elements shlex-quoted and joined
+    - **object** → each named command backgrounded (``&``), then ``wait``
+    """
+    if not cmd:
+        return ''
+    if isinstance(cmd, str):
+        escaped = cmd.replace("'", "'\\''")
+        return f"{indent}/bin/sh -c '{escaped}'\n"
+    if isinstance(cmd, list):
+        quoted = ' '.join(shlex.quote(str(c)) for c in cmd)
+        return f'{indent}{quoted}\n'
+    if isinstance(cmd, dict):
+        lines = []
+        for name, sub in cmd.items():
+            sub_sh = _lifecycle_command_to_shell(sub, indent='').strip()
+            if sub_sh:
+                lines.append(f'{indent}# {name}')
+                lines.append(f'{indent}{sub_sh} &')
+        if lines:
+            lines.append(f'{indent}wait')
+        return '\n'.join(lines) + '\n' if lines else ''
+    return ''
+
+
+def _lifecycle_block(ns: dict, ns_key: str, label: str, indent: str = '        ') -> str:
+    """Build a guarded lifecycle shell block for *ns_key*.
+
+    Returns empty string when the key is absent/falsy, otherwise wraps the
+    command in a ``PODRUN_DEVCONTAINER_CLI`` guard.
+    """
+    cmd = ns.get(ns_key)
+    shell = _lifecycle_command_to_shell(cmd, indent=indent + '  ')
+    if not shell:
+        return ''
+    return (
+        f'{indent}# Devcontainer lifecycle: {label}\n'
+        f'{indent}if [ -z "${ENV_PODRUN_DEVCONTAINER_CLI}" ]; then\n'
+        f'{shell}'
+        f'{indent}fi\n'
+    )
+
+
+def _run_host_command(cmd) -> subprocess.Popen:
+    """Launch a single host-side command (string or list) and return its Popen."""
+    if isinstance(cmd, str):
+        return subprocess.Popen(cmd, shell=True)
+    return subprocess.Popen([str(c) for c in cmd])
+
+
+def _run_initialize_command(cmd) -> None:
+    """Execute a devcontainer ``initializeCommand`` on the host.
+
+    *cmd* may be a string, a list of strings, or a dict of named commands.
+    Output streams directly to the terminal.  Exits with error on failure.
+    """
+    if not cmd:
+        return
+    if isinstance(cmd, dict):
+        procs = {n: _run_host_command(s) for n, s in cmd.items() if s}
+        failed = [n for n, p in procs.items() if p.wait() != 0]
+        if failed:
+            print(
+                f'Error: initializeCommand failed for: {", ".join(failed)}',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        rc = _run_host_command(cmd).wait()
+        if rc != 0:
+            print(f'Error: initializeCommand failed (exit {rc})', file=sys.stderr)
+            sys.exit(1)
+
+
 def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> str:
     """Generate the run-entrypoint script and return its path (SHA-named, idempotent).
 
@@ -1208,6 +1289,12 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
                 lines.append('        fi')
             lines.append('')
         export_blocks = '\n'.join(lines)
+
+    # Build lifecycle blocks (devcontainer lifecycle scripts)
+    lifecycle_first_run = _lifecycle_block(
+        ns, 'dc.on_create_command', 'onCreateCommand'
+    ) + _lifecycle_block(ns, 'dc.post_create_command', 'postCreateCommand')
+    lifecycle_post_start = _lifecycle_block(ns, 'dc.post_start_command', 'postStartCommand')
 
     # 8-space indent to match textwrap.dedent template below
     if default_shell:
@@ -1428,6 +1515,7 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         fi
 
 {export_blocks}
+{lifecycle_first_run}
         # Signal that first-run setup is complete.
         touch {PODRUN_READY_PATH}
 
@@ -1444,6 +1532,7 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         ENV={PODRUN_RC_PATH}
         export ENV
 
+{lifecycle_post_start}
         # If an alternate entrypoint was requested (e.g. by the devcontainer
         # CLI via --entrypoint), prepend it to the args so it is exec'd after
         # our setup completes.  The podrun entrypoint always runs first to
@@ -1552,12 +1641,17 @@ def generate_rc_sh(ns: dict) -> str:
     return _write_sha_file(script, 'rc_', '.sh')
 
 
-def generate_exec_entrypoint() -> str:
+def generate_exec_entrypoint(ns: Optional[dict] = None) -> str:
     """Generate exec-entrypoint.sh and return its path (SHA-named, idempotent).
 
-    The exec-entrypoint is configuration-independent — it reads ``PODRUN_*``
-    env vars at runtime (set by ``podman run -e``).  No *ns* dict needed.
+    The exec-entrypoint is mostly configuration-independent — it reads
+    ``PODRUN_*`` env vars at runtime (set by ``podman run -e``).  When *ns*
+    is provided, ``dc.post_attach_command`` is injected before the exec block.
     """
+    lifecycle_post_attach = _lifecycle_block(
+        ns or {}, 'dc.post_attach_command', 'postAttachCommand'
+    )
+
     script = textwrap.dedent(f"""\
         #!/bin/sh
         # Generated by podrun {__version__}. Do not modify by hand.
@@ -1611,6 +1705,7 @@ def generate_exec_entrypoint() -> str:
           unset PODRUN_STTY_INIT
         fi
 
+{lifecycle_post_attach}
         # --- Exec ---
         shift 2 2>/dev/null || true
         if [ $# -gt 0 ]; then
@@ -2810,6 +2905,11 @@ _DC_CONFIG_MAP = {
     'containerEnv': 'dc.container_env',
     'remoteEnv': 'dc.remote_env',
     'image': 'dc.image',
+    'initializeCommand': 'dc.initialize_command',
+    'onCreateCommand': 'dc.on_create_command',
+    'postCreateCommand': 'dc.post_create_command',
+    'postStartCommand': 'dc.post_start_command',
+    'postAttachCommand': 'dc.post_attach_command',
 }
 
 
@@ -2857,6 +2957,11 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
             'containerEnv',
             'remoteEnv',
             'customizations',
+            'initializeCommand',
+            'onCreateCommand',
+            'postCreateCommand',
+            'postStartCommand',
+            'postAttachCommand',
         ):
             if field in dc:
                 dc[field] = _expand_devcontainer_vars(dc[field], var_context)
@@ -2949,6 +3054,25 @@ def _expand_devcontainer_vars(value, context: dict):  # noqa: C901
     if isinstance(value, list):
         return [_expand_devcontainer_vars(item, context) for item in value]
     return value
+
+
+_UNSUPPORTED_DC_LIFECYCLE_FIELDS = (
+    'updateContentCommand',
+    'waitFor',
+)
+
+
+def _warn_unsupported_lifecycle_fields(dc: dict) -> None:
+    """Warn about devcontainer lifecycle fields that podrun does not execute."""
+    found = [f for f in _UNSUPPORTED_DC_LIFECYCLE_FIELDS if f in dc]
+    if found:
+        names = ', '.join(found)
+        print(
+            f'podrun: warning: devcontainer.json contains unsupported lifecycle'
+            f' field(s): {names} (ignored by podrun, use the devcontainer CLI'
+            f' for full lifecycle support)',
+            file=sys.stderr,
+        )
 
 
 def _load_devcontainer(ns) -> Tuple[dict, dict]:
@@ -3088,6 +3212,10 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
 
     # Copy dc_from_cli from ns (set by _load_devcontainer) to ctx
     ctx.dc_from_cli = ns.get('internal.dc_from_cli', False)
+
+    # Warn about unsupported devcontainer lifecycle fields when running standalone
+    if dc and not ctx.dc_from_cli:
+        _warn_unsupported_lifecycle_fields(dc)
 
     # 4. Discover and execute ~/.podrunrc* (lowest priority config)
     rc_ns: dict = {}
@@ -3972,7 +4100,7 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
     if ns.get('run.user_overlay'):
         entrypoint_path = generate_run_entrypoint(ns, caps_to_drop=compute_caps_to_drop(pt))
         rc_path = generate_rc_sh(ns)
-        exec_entry_path = generate_exec_entrypoint()
+        exec_entry_path = generate_exec_entrypoint(ns)
         user_args, caps_to_drop = _user_overlay_args(
             ns, pt, entrypoint_path, rc_path, exec_entry_path
         )
@@ -4741,6 +4869,12 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
         _exec_attach(ctx, global_flags)
 
     # action == 'run'
+
+    # Devcontainer initializeCommand — runs on the host before container creation.
+    # Skipped when the devcontainer CLI is driving (it handles its own lifecycle).
+    init_cmd = ns.get('dc.initialize_command')
+    if init_cmd and not ctx.dc_from_cli and not ns.get('root.print_cmd'):
+        _run_initialize_command(init_cmd)
 
     # Filter exports that conflict with existing volume mounts
     if ns.get('run.user_overlay') and (ns.get('run.export') or []):

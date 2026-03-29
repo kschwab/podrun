@@ -1973,9 +1973,12 @@ def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
                 f.write(chmod_map[container_path])
 
         if os.path.isfile(host_path):
-            # File: copy into staging/data at build time (one mount)
+            # File: copy into staging/data at build time (one mount).
+            # Use shutil.copy (not copy2) so the data file gets the current
+            # mtime — copy2 preserves the source mtime, and _clean_stale_files
+            # would delete old files before the container starts.
             data_path = os.path.join(staging_dir, 'data')
-            shutil.copy2(host_path, data_path)
+            shutil.copy(host_path, data_path)
             args.append(f'-v={staging_dir}:{container_staging}:ro,z')
         elif os.path.isdir(host_path):
             # Directory: bind-mount the host dir as staging/data (two mounts)

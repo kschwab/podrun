@@ -40,7 +40,7 @@ These flags apply to all subcommands and must appear before the subcommand:
 | `--shell SHELL` | Shell to use inside container (e.g. `bash`, `zsh`) |
 | `--login` / `--no-login` | Run shell as login shell (sources `/etc/profile`). `--no-login` explicitly disables. |
 | `--prompt-banner TEXT` | Custom prompt banner text |
-| `--auto-attach` | Exec into a running named container, or restart and exec into a stopped one (see [Container Lifecycle](#container-lifecycle)) |
+| `--auto-attach` | Exec into a running named container, or restart a stopped one (see [Container Lifecycle](#container-lifecycle)) |
 | `--auto-replace` | Remove and recreate named container (running or stopped; see [Container Lifecycle](#container-lifecycle)) |
 | `--export SRC:DST[:0]` | Export container path to host (requires `--user-overlay`). Append `:0` for copy-only. May be repeated. |
 | `--fuse-overlayfs` | Use fuse-overlayfs for overlay mount program (see [Fuse-Overlayfs](overlays.md#fuse-overlayfs)) |
@@ -111,11 +111,11 @@ Keys in `customizations.podrun` of `devcontainer.json`:
 | `securityOpt` | Security options |
 | `privileged` | Run as privileged |
 | `init` | Use `--init` |
-| `initializeCommand` | Run on host before container creation (string, array, or object) |
+| `initializeCommand` | Run on host during initialization, including creation and subsequent starts (string, array, or object) |
 | `onCreateCommand` | Run in container on first creation (string, array, or object) |
 | `postCreateCommand` | Run in container after `onCreateCommand`, first creation only (string, array, or object) |
 | `postStartCommand` | Run in container on every start (string, array, or object) |
-| `postAttachCommand` | Run in container on every exec attach (string, array, or object) |
+| `postAttachCommand` | Run in container on every start and exec attach (string, array, or object) |
 | `updateContentCommand` | Not supported (warning printed; use devcontainer CLI) |
 | `waitFor` | Not supported (warning printed; use devcontainer CLI) |
 
@@ -126,11 +126,20 @@ points during container creation, start, and attach.
 
 | Command | Runs on | When |
 |---------|---------|------|
-| `initializeCommand` | Host | Before container creation (every run) |
+| `initializeCommand` | Host | Every `podrun run` invocation (create, restart, replace, attach) |
 | `onCreateCommand` | Container | First-run entrypoint (once) |
 | `postCreateCommand` | Container | After `onCreateCommand` (once) |
-| `postStartCommand` | Container | After first-run setup (every start) |
-| `postAttachCommand` | Container | Exec attach into running container |
+| `postStartCommand` | Container | Every container start (first run and restart) |
+| `postAttachCommand` | Container | Every container start and every exec attach |
+
+The lifecycle sequence depends on the container state:
+
+| Path | Sequence |
+|------|----------|
+| **First run** | initializeCommand → onCreateCommand → postCreateCommand → postStartCommand → postAttachCommand |
+| **Restart** (stopped container) | initializeCommand → postStartCommand → postAttachCommand |
+| **Exec attach** (running container) | initializeCommand → postAttachCommand |
+| **Replace** | initializeCommand → (same as first run) |
 
 All three devcontainer command forms are accepted:
 
@@ -139,9 +148,12 @@ All three devcontainer command forms are accepted:
 - **Object**: `{"a": "cmd1", "b": "cmd2"}` — parallel execution (backgrounded
   with `&`, then `wait`)
 
-`initializeCommand` runs on the host via `subprocess` before the container is
-created. All other lifecycle commands are injected into the generated
+`initializeCommand` runs on the host via `subprocess` before any container
+action. All other lifecycle commands are injected into the generated
 entrypoint scripts.
+
+If a lifecycle command fails, subsequent lifecycle commands are skipped but the
+user still gets a shell. A warning is printed to stderr.
 
 Container-side lifecycle blocks are guarded by `PODRUN_DEVCONTAINER_CLI` — when
 podrun is invoked via `devcontainer --docker-path podrun`, lifecycle commands
@@ -203,7 +215,7 @@ When a `--name` is provided, podrun checks for existing containers:
 | Container state | `--auto-attach` | `--auto-replace` | Neither (interactive) |
 |---|---|---|---|
 | **Running** | Exec into container (attach) | Remove + re-run | Prompt: attach? replace? |
-| **Stopped** | Start + exec into container (restart) | Remove + re-run | Prompt: restart? replace? |
+| **Stopped** | Start + attach (restart) | Remove + re-run | Prompt: restart? replace? |
 | **Not found** | Create new | Create new | Create new |
 
 **Typical patterns:**

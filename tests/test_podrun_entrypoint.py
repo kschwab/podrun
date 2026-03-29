@@ -835,6 +835,82 @@ class TestLifecycleInRunEntrypoint:
         assert ' &' in content
         assert 'wait' in content
 
+    def test_post_attach_outside_ready_guard(self):
+        """postAttachCommand appears outside READY guard (runs every start)."""
+        ns = _default_ns(**{'dc.post_attach_command': 'git fetch'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        guard_close = content.index('# --- End first-run setup ---')
+        tail = content[guard_close:]
+        assert 'postAttachCommand' in tail
+        assert 'git fetch' in tail
+
+    def test_post_attach_after_post_start(self):
+        """postAttachCommand runs after postStartCommand."""
+        ns = _default_ns(
+            **{
+                'dc.post_start_command': 'start-step',
+                'dc.post_attach_command': 'attach-step',
+            }
+        )
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        idx_start = content.index('start-step')
+        idx_attach = content.index('attach-step')
+        assert idx_start < idx_attach
+
+    def test_lifecycle_ok_initialized(self):
+        """_PODRUN_LIFECYCLE_OK=1 is set near the top of the entrypoint."""
+        ns = _default_ns()
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert '_PODRUN_LIFECYCLE_OK=1' in content
+
+    def test_lifecycle_ok_guard_in_block(self):
+        """Lifecycle blocks check _PODRUN_LIFECYCLE_OK before running."""
+        ns = _default_ns(**{'dc.post_start_command': 'redis-server'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        assert '_PODRUN_LIFECYCLE_OK' in content
+        # The guard should appear before the command
+        idx_guard = content.index('_PODRUN_LIFECYCLE_OK')
+        idx_cmd = content.index('redis-server')
+        assert idx_guard < idx_cmd
+
+    def test_lifecycle_fault_tolerant(self):
+        """Failed lifecycle command sets flag and prints warning, doesn't abort."""
+        ns = _default_ns(**{'dc.on_create_command': 'false'})
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        # Subshell wrapping for fault tolerance
+        assert '( ' in content or '(\n' in content
+        # Warning on failure
+        assert 'warning: onCreateCommand failed' in content
+        # Flag gets set to 0 on failure
+        assert '_PODRUN_LIFECYCLE_OK=0' in content
+
+    def test_lifecycle_failure_skips_subsequent(self):
+        """When a lifecycle command fails, subsequent ones are skipped."""
+        ns = _default_ns(
+            **{
+                'dc.on_create_command': 'first-cmd',
+                'dc.post_create_command': 'second-cmd',
+                'dc.post_start_command': 'third-cmd',
+                'dc.post_attach_command': 'fourth-cmd',
+            }
+        )
+        path = generate_run_entrypoint(ns)
+        with open(path) as f:
+            content = f.read()
+        # Each block should check _PODRUN_LIFECYCLE_OK
+        # Count occurrences — should be at least 4 (one per lifecycle block)
+        assert content.count('"$_PODRUN_LIFECYCLE_OK" = 1') >= 4
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle in exec-entrypoint

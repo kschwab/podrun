@@ -572,29 +572,43 @@ class TestHandleRunContainerState:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert 'not created with podrun user overlay' in capsys.readouterr().err
 
-    def test_restart_prints_start_then_exec(self, monkeypatch, capsys):
-        """When restarting, --print-cmd should show start then exec command."""
+    def test_restart_prints_start_attach(self, monkeypatch, capsys):
+        """When restarting, --print-cmd should show start -a -i command (session is interactive)."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
-        monkeypatch.setattr(
-            podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
-        )
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        lines = out.strip().split('\n')
-        assert len(lines) == 2
-        assert 'start' in lines[0]
-        assert 'myc' in lines[0]
-        assert 'exec' in lines[1]
+        cmd = shlex.split(out.strip())
+        assert 'start' in cmd
+        assert '-a' in cmd
+        assert '-i' in cmd
+        assert 'myc' in cmd
 
-    def test_restart_non_user_overlay_errors(self, monkeypatch, capsys):
-        """Cannot restart-attach to a container not created with user overlay."""
+    def test_restart_non_interactive_no_stdin(self, monkeypatch, capsys):
+        """When restarting without interactive overlay or -i, -i is not passed."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
-        monkeypatch.setattr(podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'none'))
-        with pytest.raises(SystemExit):
-            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
-        assert 'not created with podrun user overlay' in capsys.readouterr().err
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        cmd = shlex.split(out.strip())
+        assert 'start' in cmd
+        assert '-a' in cmd
+        assert '-i' not in cmd
+        assert '-ai' not in cmd
+
+    def test_restart_passthrough_interactive(self, monkeypatch, capsys):
+        """When restarting with -i via passthrough (no overlay), -i is passed."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '-i', 'alpine'])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        cmd = shlex.split(out.strip())
+        assert 'start' in cmd
+        assert '-a' in cmd
+        assert '-i' in cmd
 
     def test_action_none_exits_cleanly(self, monkeypatch):
         """When handle_container_state returns None, main exits with 0."""

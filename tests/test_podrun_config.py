@@ -2173,3 +2173,87 @@ class TestUnsupportedLifecycleWarning:
         result = parse_args(['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'])
         resolve_config(result)
         assert 'updateContentCommand' not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# TestDcNameBridge — dc top-level "name" → run.name fallback
+# ---------------------------------------------------------------------------
+
+
+class TestDcNameBridge:
+    def _resolve(self, argv, monkeypatch, dc_json_path=None):
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
+        )
+        result = parse_args(argv)
+        return resolve_config(result)
+
+    def test_dc_name_sets_run_name(self, monkeypatch, tmp_project):
+        """dc top-level 'name' sets run.name when no CLI --name."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'myproject'}))
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.name') == 'myproject'
+        assert r.ns.get('run.name') == 'myproject'
+
+    def test_cli_name_overrides_dc_name(self, monkeypatch, tmp_project):
+        """CLI --name overrides dc top-level 'name'."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'dc-name'}))
+        r = self._resolve(['run', '--name=cli-name'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.name') == 'dc-name'
+        assert r.ns.get('run.name') == 'cli-name'
+
+    def test_podrun_cfg_name_overrides_dc_name(self, monkeypatch, tmp_project):
+        """customizations.podrun.name overrides dc top-level 'name'."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'name': 'dc-name',
+                    'customizations': {'podrun': {'name': 'podrun-name'}},
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.name') == 'dc-name'
+        assert r.ns.get('run.name') == 'podrun-name'
+
+    def test_dc_name_skipped_when_dc_cli_drives(self, monkeypatch, tmp_project):
+        """dc top-level 'name' is NOT applied when dc_from_cli is true."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'dc-name'}))
+        r = self._resolve(
+            ['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'],
+            monkeypatch,
+        )
+        assert r.ns.get('dc.name') == 'dc-name'
+        assert r.ns.get('internal.dc_from_cli') is True
+        assert r.ns.get('run.name') is None
+
+    def test_dc_name_variable_expansion(self, monkeypatch, tmp_project):
+        """Variable expansion works in dc 'name' (e.g. ${localWorkspaceFolderBasename}-dev)."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'name': '${localWorkspaceFolderBasename}-dev',
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        expected = f'{tmp_project.name}-dev'
+        assert r.ns.get('dc.name') == expected
+        assert r.ns.get('run.name') == expected

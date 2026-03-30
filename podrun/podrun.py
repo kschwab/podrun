@@ -2930,6 +2930,7 @@ _RUN_CONFIG_MAP = {
 # Top-level devcontainer.json fields → ns['dc.*'] keys.
 # These are resolved in resolve_config after variable expansion.
 _DC_CONFIG_MAP = {
+    'name': 'dc.name',
     'workspaceMount': 'dc.workspace_mount',
     'workspaceFolder': 'dc.workspace_folder',
     'containerEnv': 'dc.container_env',
@@ -2981,6 +2982,7 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
         # Second pass: use resolved containerWorkspaceFolder for remaining fields
         var_context['containerWorkspaceFolder'] = dc.get('workspaceFolder', '')
         for field in (
+            'name',
             'workspaceMount',
             'mounts',
             'runArgs',
@@ -3296,6 +3298,12 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
     # 10. Handle run specifics
     if ns.get('subcommand') == 'run':
         _apply_run_specifics(ns, ctx, dc_ns, script_ns, rc_ns)
+
+    # 11. Bridge dc top-level name → run.name (lowest priority fallback).
+    #     Skipped when the devcontainer CLI is driving (it manages naming)
+    #     or when run.name is already set (CLI --name or customizations.podrun.name).
+    if ns.get('dc.name') and not ns.get('run.name') and not ns.get('internal.dc_from_cli'):
+        ns['run.name'] = ns['dc.name']
 
     return ctx
 

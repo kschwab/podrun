@@ -7,8 +7,11 @@ import pytest
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
     BOOTSTRAP_CAPS,
+    ENV_PODRUN_CONTAINER,
+    ENV_PODRUN_HOST_TMP,
     PODRUN_ENTRYPOINT_PATH,
     PODRUN_EXEC_ENTRY_PATH,
+    PODRUN_HOST_TMP_MOUNT,
     PODRUN_RC_PATH,
     PodrunContext,
     build_overlay_run_command,
@@ -592,3 +595,54 @@ class TestBuildOverlayRunCommand:
         r = self._parse_and_resolve(['run', '--label=env=prod', 'alpine'])
         cmd, _ = build_overlay_run_command(r)
         assert '--label=env=prod' in cmd
+
+    def test_nested_remote_entrypoint_uses_daemon_path(self, tmp_path, monkeypatch):
+        """In nested-remote mode, entrypoint -v args use daemon-visible paths."""
+        host_tmp_mount = tmp_path / 'host-tmp'
+        host_tmp_mount.mkdir()
+        monkeypatch.setattr(podrun_mod, 'PODRUN_HOST_TMP_MOUNT', str(host_tmp_mount))
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/real/host/podrun-tmp')
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
+        cmd, _ = build_overlay_run_command(r)
+        # Entrypoint volume mounts should reference the daemon path
+        vol_args = [a for a in cmd if a.startswith('-v=') and '/.podrun/' in a]
+        for v in vol_args:
+            source = v.split('=', 1)[1].split(':')[0]
+            # Sources must use the daemon path, not the container-local mount
+            assert not source.startswith(str(host_tmp_mount)), (
+                f'volume source {source} should use daemon path, not local staging'
+            )
+
+    def test_host_tmp_present_with_podman_remote(self):
+        """Host-tmp mount+env is injected when --podman-remote is set."""
+        r = self._parse_and_resolve(['run', '--podman-remote', '--user-overlay', 'alpine'])
+        cmd, _ = build_overlay_run_command(r)
+        daemon = podrun_mod._daemon_dir()
+        assert f'-v={daemon}:{PODRUN_HOST_TMP_MOUNT}:z' in cmd
+        assert f'--env={ENV_PODRUN_HOST_TMP}={daemon}' in cmd
+
+    def test_host_tmp_absent_without_podman_remote(self):
+        """Host-tmp is not added when --podman-remote is not set."""
+        r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
+        cmd, _ = build_overlay_run_command(r)
+        assert PODRUN_HOST_TMP_MOUNT not in ' '.join(cmd)
+
+    def test_mount_manifest_written_with_podman_remote(self, tmp_path):
+        """build_overlay_run_command writes a mount manifest when --podman-remote."""
+        import json
+
+        r = self._parse_and_resolve(['run', '--podman-remote', '--user-overlay', 'alpine'])
+        build_overlay_run_command(r)
+        manifest_path = tmp_path / 'mount-manifest.json'
+        assert manifest_path.exists()
+        m = json.loads(manifest_path.read_text())
+        assert 'mounts' in m
+        assert 'copy_staging' in m
+
+    def test_mount_manifest_not_written_without_podman_remote(self, tmp_path):
+        """No manifest written when --podman-remote is not set."""
+        r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
+        build_overlay_run_command(r)
+        manifest_path = tmp_path / 'mount-manifest.json'
+        assert not manifest_path.exists()

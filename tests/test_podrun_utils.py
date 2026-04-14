@@ -5,8 +5,11 @@ import stat
 
 import pytest
 
+import podrun.podrun as podrun_mod
 from podrun.podrun import (
     BOOTSTRAP_CAPS,
+    ENV_PODRUN_CONTAINER,
+    ENV_PODRUN_HOST_TMP,
     GID,
     PODRUN_ENTRYPOINT_PATH,
     PODRUN_EXEC_ENTRY_PATH,
@@ -17,15 +20,20 @@ from podrun.podrun import (
     UNAME,
     USER_HOME,
     _OVERLAY_FIELDS,
+    PODRUN_HOST_TMP_MOUNT,
+    _daemon_dir,
     _expand_export_tilde,
-    _expand_volume_tilde,
     _extract_passthrough_entrypoint,
     _parse_export,
     _parse_image_ref,
     _passthrough_has_exact,
     _passthrough_has_flag,
     _passthrough_has_short_flag,
+    _process_volume_args,
+    _read_mount_manifest,
+    _staging_dir,
     _volume_mount_destinations,
+    _write_mount_manifest,
     _write_sha_file,
     yes_no_prompt,
 )
@@ -173,6 +181,72 @@ class TestWriteShaFile:
         path = _write_sha_file('x', 'p_', '.sh')
         assert os.path.exists(path)
 
+    def test_nested_remote_writes_staging_returns_daemon(self, tmp_path, monkeypatch):
+        """In nested-remote mode, file is written to _staging_dir but path uses _daemon_dir."""
+        host_tmp_mount = tmp_path / 'host-tmp'
+        host_tmp_mount.mkdir()
+        monkeypatch.setattr(podrun_mod, 'PODRUN_HOST_TMP_MOUNT', str(host_tmp_mount))
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/real/host/podrun-tmp')
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        path = _write_sha_file('nested content', 'ep_', '.sh')
+        # Returned path references the daemon-visible directory
+        assert path.startswith('/real/host/podrun-tmp/')
+        # But the file was physically written to the staging dir
+        filename = os.path.basename(path)
+        written = os.path.join(str(host_tmp_mount), filename)
+        assert os.path.exists(written)
+        with open(written) as f:
+            assert f.read() == 'nested content'
+
+
+# ---------------------------------------------------------------------------
+# _staging_dir / _daemon_dir
+# ---------------------------------------------------------------------------
+
+
+class TestStagingDir:
+    def test_normal_returns_podrun_tmp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        assert _staging_dir() == str(tmp_path)
+
+    def test_nested_remote_returns_host_tmp_mount(self, monkeypatch):
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/host/podrun-tmp')
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        assert _staging_dir() == PODRUN_HOST_TMP_MOUNT
+
+    def test_host_tmp_without_container_returns_podrun_tmp(self, tmp_path, monkeypatch):
+        """PODRUN_HOST_TMP alone (without PODRUN_CONTAINER) is not nested-remote."""
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/host/podrun-tmp')
+        assert _staging_dir() == str(tmp_path)
+
+    def test_container_without_host_tmp_returns_podrun_tmp(self, tmp_path, monkeypatch):
+        """PODRUN_CONTAINER alone (without PODRUN_HOST_TMP) is not nested-remote."""
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        assert _staging_dir() == str(tmp_path)
+
+
+class TestDaemonDir:
+    def test_normal_returns_podrun_tmp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        assert _daemon_dir() == str(tmp_path)
+
+    def test_nested_remote_returns_host_tmp_value(self, monkeypatch):
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/host/podrun-tmp')
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        assert _daemon_dir() == '/host/podrun-tmp'
+
+    def test_host_tmp_without_container_returns_podrun_tmp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/host/podrun-tmp')
+        assert _daemon_dir() == str(tmp_path)
+
+    def test_container_without_host_tmp_returns_podrun_tmp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        assert _daemon_dir() == str(tmp_path)
+
 
 # ---------------------------------------------------------------------------
 # Passthrough flag introspection
@@ -306,45 +380,6 @@ class TestVolumeMountDestinations:
 # ---------------------------------------------------------------------------
 
 
-class TestExpandVolumeTilde:
-    def test_source_tilde(self):
-        result = _expand_volume_tilde(['-v=~/src:/dst'])
-        assert result == [f'-v={USER_HOME}/src:/dst']
-
-    def test_dest_tilde(self):
-        result = _expand_volume_tilde(['-v=/src:~/dst'])
-        assert result == [f'-v=/src:/home/{UNAME}/dst']
-
-    def test_both_tildes(self):
-        result = _expand_volume_tilde(['-v=~/src:~/dst'])
-        assert result == [f'-v={USER_HOME}/src:/home/{UNAME}/dst']
-
-    def test_long_form(self):
-        result = _expand_volume_tilde(['--volume=~/src:/dst'])
-        assert result == [f'--volume={USER_HOME}/src:/dst']
-
-    def test_with_options(self):
-        result = _expand_volume_tilde(['-v=~/src:~/dst:ro'])
-        assert result == [f'-v={USER_HOME}/src:/home/{UNAME}/dst:ro']
-
-    def test_non_volume_unchanged(self):
-        result = _expand_volume_tilde(['-e=FOO=bar', '--rm'])
-        assert result == ['-e=FOO=bar', '--rm']
-
-    def test_no_tilde_unchanged(self):
-        result = _expand_volume_tilde(['-v=/a:/b'])
-        assert result == ['-v=/a:/b']
-
-    def test_single_part(self):
-        result = _expand_volume_tilde(['-v=~/only'])
-        assert result == [f'-v={USER_HOME}/only']
-
-    def test_space_form_single_part_tilde(self):
-        """Space-form volume with only one colon-part expands source tilde."""
-        result = _expand_volume_tilde(['-v', '~/only'])
-        assert result == ['-v', f'{USER_HOME}/only']
-
-
 class TestExpandExportTilde:
     def test_container_tilde(self):
         result = _expand_export_tilde(['~/src:/dst'])
@@ -419,3 +454,137 @@ class TestYesNoPrompt:
         monkeypatch.setattr('builtins.input', lambda: next(answers))
         result = yes_no_prompt('Continue?', answer_default=True, is_interactive=True)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _write_mount_manifest / _read_mount_manifest
+# ---------------------------------------------------------------------------
+
+
+class TestMountManifest:
+    def test_write_and_read_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        mount_map = {'/.podrun/run-entrypoint.sh': '/host/ep.sh', '/home/user/.ssh': '/host/.ssh'}
+        _write_mount_manifest(mount_map)
+        m = _read_mount_manifest()
+        assert m['mounts']['/.podrun/run-entrypoint.sh'] == '/host/ep.sh'
+        assert m['mounts']['/home/user/.ssh'] == '/host/.ssh'
+
+    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        m = _read_mount_manifest()
+        assert m == {'mounts': {}, 'copy_staging': {}}
+
+    def test_copy_staging_section(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        cs = [
+            ('/home/user/.ssh', '/home/user/.ssh'),
+            ('/home/user/.gitconfig', '/home/user/.gitconfig'),
+        ]
+        _write_mount_manifest({'/ctr/.ssh': '/host/.ssh'}, cs)
+        m = _read_mount_manifest()
+        assert m['copy_staging']['/home/user/.ssh'] == '/home/user/.ssh'
+        assert m['copy_staging']['/home/user/.gitconfig'] == '/home/user/.gitconfig'
+
+    def test_empty_copy_staging(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path))
+        _write_mount_manifest({'/b': '/a'})
+        m = _read_mount_manifest()
+        assert m['copy_staging'] == {}
+
+
+# ---------------------------------------------------------------------------
+# _process_volume_args
+# ---------------------------------------------------------------------------
+
+
+class TestProcessVolumeArgs:
+    def test_tilde_expansion(self):
+        args = ['-v=~/src:/dst:ro']
+        result, cs, mm = _process_volume_args(args, expand_tilde=True)
+        assert result[0] == f'-v={podrun_mod.USER_HOME}/src:/dst:ro'
+
+    def test_tilde_expansion_bare(self):
+        args = ['-v=~:/dst']
+        result, cs, mm = _process_volume_args(args, expand_tilde=True)
+        assert result[0] == f'-v={podrun_mod.USER_HOME}:/dst'
+
+    def test_copy_staging_extraction(self):
+        args = ['-v=/a:/b:0', '-v=/c:/d:ro']
+        result, cs, mm = _process_volume_args(args)
+        assert len(result) == 1
+        assert result[0] == '-v=/c:/d:ro'
+        assert cs == [('/a', '/b')]
+
+    def test_copy_staging_extraction_space_form(self):
+        args = ['-v', '/a:/b:0', '-v=/c:/d:ro']
+        result, cs, mm = _process_volume_args(args)
+        assert len(result) == 1
+        assert result[0] == '-v=/c:/d:ro'
+        assert cs == [('/a', '/b')]
+
+    def test_manifest_translation_equals(self):
+        mounts = {'/app': '/real/host/project'}
+        args = ['-v=/app:/app:z', '--env=FOO=bar']
+        result, _, mm = _process_volume_args(args, manifest_mounts=mounts)
+        assert result == ['-v=/real/host/project:/app:z', '--env=FOO=bar']
+
+    def test_manifest_translation_space(self):
+        mounts = {'/home/user/.vimrc': '/real/home/.vimrc'}
+        args = ['-v', '/home/user/.vimrc:/home/user/.vimrc:ro,z']
+        result, _, _ = _process_volume_args(args, manifest_mounts=mounts)
+        assert result == ['-v', '/real/home/.vimrc:/home/user/.vimrc:ro,z']
+
+    def test_manifest_translation_mount_spec(self):
+        mounts = {'/app': '/real/project'}
+        args = ['--mount=type=bind,source=/app,target=/app']
+        result, _, _ = _process_volume_args(args, manifest_mounts=mounts)
+        assert result == ['--mount=type=bind,source=/real/project,target=/app']
+
+    def test_manifest_translation_mount_space(self):
+        mounts = {'/app': '/real/project'}
+        args = ['--mount', 'type=bind,src=/app,dst=/app']
+        result, _, _ = _process_volume_args(args, manifest_mounts=mounts)
+        assert result == ['--mount', 'type=bind,src=/real/project,dst=/app']
+
+    def test_mount_map_built(self):
+        args = ['-v=/a:/b:ro', '-v', '/c:/d', '--mount=type=bind,source=/e,target=/f']
+        _, _, mm = _process_volume_args(args)
+        assert mm == {'/b': '/a', '/d': '/c', '/f': '/e'}
+
+    def test_no_match_unchanged(self):
+        mounts = {'/ctr': '/host'}
+        args = ['-v=/etc/localtime:/etc/localtime:ro']
+        result, _, _ = _process_volume_args(args, manifest_mounts=mounts)
+        assert result == ['-v=/etc/localtime:/etc/localtime:ro']
+
+    def test_non_volume_args_passthrough(self):
+        args = ['--rm', '-it', '--env=FOO=bar']
+        result, cs, mm = _process_volume_args(args)
+        assert result == args
+        assert cs == []
+        assert mm == {}
+
+    def test_all_features_combined(self):
+        """Tilde expansion + :0 extraction + manifest translation in one pass."""
+        mounts = {'/app': '/real/project'}
+        args = ['-v=~/src:~/dst:ro', '-v=~/.ssh:~/.ssh:0', '-v=/app:/app:z']
+        result, cs, mm = _process_volume_args(
+            args,
+            expand_tilde=True,
+            manifest_mounts=mounts,
+        )
+        # Tilde expanded, :0 extracted, /app translated
+        assert len(result) == 2
+        assert '~' not in result[0]
+        assert result[1] == '-v=/real/project:/app:z'
+        assert len(cs) == 1  # .ssh extracted
+        assert mm['/app'] == '/real/project'
+
+    def test_daemon_visible_sources_untouched(self):
+        """Sources already daemon-visible (not in manifest dests) stay unchanged."""
+        mounts = {'/.podrun/run-entrypoint.sh': '/host/podrun-tmp/ep_old.sh'}
+        args = ['-v=/host/podrun-tmp/ep_new.sh:/.podrun/run-entrypoint.sh:ro,z']
+        result, _, _ = _process_volume_args(args, manifest_mounts=mounts)
+        # Source is NOT a manifest destination, so untouched
+        assert result == args

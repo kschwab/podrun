@@ -14,6 +14,7 @@ if sys.platform == 'win32':
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
     ENV_PODRUN_CONTAINER,
+    ENV_PODRUN_HOST_TMP,
     ENV_PODRUN_PODMAN_PATH,
     ENV_PODRUN_PODMAN_REMOTE,
     _read_flags_cache,
@@ -246,6 +247,7 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV_PODRUN_PODMAN_REMOTE, raising=False)
     monkeypatch.delenv(ENV_PODRUN_CONTAINER, raising=False)
     monkeypatch.delenv(ENV_PODRUN_PODMAN_PATH, raising=False)
+    monkeypatch.delenv(ENV_PODRUN_HOST_TMP, raising=False)
     monkeypatch.delenv('PODRUN_LOCAL_STORE', raising=False)
     monkeypatch.delenv('CONTAINER_HOST', raising=False)
 

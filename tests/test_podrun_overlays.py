@@ -9,6 +9,8 @@ import pytest
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
     BOOTSTRAP_CAPS,
+    ENV_PODRUN_CONTAINER,
+    ENV_PODRUN_HOST_TMP,
     GID,
     PODRUN_ENTRYPOINT_PATH,
     PODRUN_EXEC_ENTRY_PATH,
@@ -18,7 +20,6 @@ from podrun.podrun import (
     _DOTFILES,
     _OVERLAY_FIELDS,
     _copy_staging_args,
-    _extract_copy_staging,
     _extract_passthrough_user,
     _dot_files_overlay_args,
     _env_args,
@@ -464,47 +465,37 @@ class TestCopyStagingArgs:
         staging_path = args[0].split('=')[1].split(':')[0]
         assert not os.path.exists(os.path.join(staging_path, '.podrun_chmod'))
 
+    def test_dir_two_mounts_in_nested_remote(self, tmp_path, monkeypatch):
+        """In nested-remote, directories produce two mounts (translation happens upstream)."""
+        host_tmp_mount = tmp_path / 'host-tmp'
+        host_tmp_mount.mkdir()
+        monkeypatch.setattr(podrun_mod, 'PODRUN_HOST_TMP_MOUNT', str(host_tmp_mount))
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/real/host/podrun-tmp')
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        d = tmp_path / 'ssh'
+        d.mkdir()
+        (d / 'config').write_text('Host *')
+        args = _copy_staging_args([(str(d), '/home/user/.ssh')])
+        # Two mounts: staging dir + data bind (source rewriting is done by
+        # _translate_nested_volume_sources in build_overlay_run_command)
+        assert len(args) == 2
+        assert args[0].startswith('-v=/real/host/podrun-tmp/copy-staging/')
+        assert ':ro,z' in args[0]
+        assert args[1].startswith(f'-v={d}:')
+        assert '/data:ro,z' in args[1]
 
-# ---------------------------------------------------------------------------
-# _extract_copy_staging
-# ---------------------------------------------------------------------------
-
-
-class TestExtractCopyStaging:
-    def test_extracts_zero_suffix_equals_form(self):
-        args = ['-v=/host/.ssh:/ctr/.ssh:0', '-v=/a:/b:ro']
-        filtered, items = _extract_copy_staging(args)
-        assert filtered == ['-v=/a:/b:ro']
-        assert items == [('/host/.ssh', '/ctr/.ssh')]
-
-    def test_extracts_zero_suffix_space_form(self):
-        args = ['-v', '/host/.ssh:/ctr/.ssh:0', '-v=/a:/b:ro']
-        filtered, items = _extract_copy_staging(args)
-        assert filtered == ['-v=/a:/b:ro']
-        assert items == [('/host/.ssh', '/ctr/.ssh')]
-
-    def test_preserves_non_zero_args(self):
-        args = ['-v=/a:/b:ro', '--rm', '-e', 'FOO=bar']
-        filtered, items = _extract_copy_staging(args)
-        assert filtered == args
-        assert items == []
-
-    def test_empty(self):
-        filtered, items = _extract_copy_staging([])
-        assert filtered == []
-        assert items == []
-
-    def test_multiple_zero_items(self):
-        args = ['-v=/a:/b:0', '-v=/c:/d:0', '-v=/e:/f:ro']
-        filtered, items = _extract_copy_staging(args)
-        assert filtered == ['-v=/e:/f:ro']
-        assert len(items) == 2
-
-    def test_volume_long_form(self):
-        args = ['--volume=/host:/ctr:0']
-        filtered, items = _extract_copy_staging(args)
-        assert filtered == []
-        assert items == [('/host', '/ctr')]
+    def test_file_uses_daemon_dir_in_nested_remote(self, tmp_path, monkeypatch):
+        """In nested-remote, file staging -v args use daemon paths."""
+        host_tmp_mount = tmp_path / 'host-tmp'
+        host_tmp_mount.mkdir()
+        monkeypatch.setattr(podrun_mod, 'PODRUN_HOST_TMP_MOUNT', str(host_tmp_mount))
+        monkeypatch.setenv(ENV_PODRUN_HOST_TMP, '/real/host/podrun-tmp')
+        monkeypatch.setenv(ENV_PODRUN_CONTAINER, '1')
+        f = tmp_path / 'gitconfig'
+        f.write_text('[user]')
+        args = _copy_staging_args([(str(f), '/home/user/.gitconfig')])
+        assert len(args) == 1
+        assert args[0].startswith('-v=/real/host/podrun-tmp/copy-staging/')
 
 
 # ---------------------------------------------------------------------------

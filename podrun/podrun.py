@@ -89,6 +89,7 @@ PODRUN_EXEC_ENTRY_PATH = '/.podrun/exec-entrypoint.sh'
 PODRUN_READY_PATH = '/.podrun/READY'
 PODRUN_SOCKET_PATH = '/.podrun/podman/podman.sock'
 PODRUN_CONTAINER_HOST = f'unix://{PODRUN_SOCKET_PATH}'
+PODRUN_HOST_TMP_MOUNT = '/.podrun/host-tmp'
 BOOTSTRAP_CAPS = ['CAP_DAC_OVERRIDE', 'CAP_CHOWN', 'CAP_FOWNER', 'CAP_SETPCAP']
 
 _NFS_REMEDIATE_DEFAULT_BASE = '/opt/podman-local-storage'
@@ -136,6 +137,7 @@ ENV_PODRUN_IMG_NAME = 'PODRUN_IMG_NAME'  # image name component
 ENV_PODRUN_IMG_REPO = 'PODRUN_IMG_REPO'  # image repo component
 ENV_PODRUN_IMG_TAG = 'PODRUN_IMG_TAG'  # image tag component
 ENV_PODRUN_ALT_ENTRYPOINT = 'PODRUN_ALT_ENTRYPOINT'  # user --entrypoint override
+ENV_PODRUN_HOST_TMP = 'PODRUN_HOST_TMP'  # host-visible PODRUN_TMP for nested-remote
 
 # Container-exported and config-script exported (on-demand)
 ENV_PODRUN_PODMAN_REMOTE = 'PODRUN_PODMAN_REMOTE'  # force podman-remote resolution
@@ -607,7 +609,7 @@ def _default_podman_path():
             if podman:
                 return podman
         print(
-            f'Error: {ENV_PODRUN_PODMAN_REMOTE} is set but podman-remote not found.',
+            f'Error: {ENV_PODRUN_PODMAN_REMOTE} is set but podman and podman-remote were not found.',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -938,7 +940,12 @@ def _parse_image_ref(image: str) -> Tuple[str, str, str]:
 
 
 def _write_sha_file(content: str, prefix: str, suffix: str) -> str:
-    """Write content to a SHA-named file in PODRUN_TMP.
+    """Write content to a SHA-named file and return the daemon-visible path.
+
+    In nested-remote mode (``PODRUN_CONTAINER=1`` + ``PODRUN_HOST_TMP``),
+    the file is physically written to :func:`_staging_dir` (the bind-mounted
+    host directory) but the returned path uses :func:`_daemon_dir` so that
+    ``-v`` args reference a path the host daemon can resolve.
 
     Always overwrites — the files are small and avoiding staleness
     (e.g. wrong line endings from a previous platform) is worth the
@@ -946,12 +953,78 @@ def _write_sha_file(content: str, prefix: str, suffix: str) -> str:
     """
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:12]
     filename = f'{prefix}{content_hash}{suffix}'
-    path = os.path.join(PODRUN_TMP, filename)
-    pathlib.Path(PODRUN_TMP).mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+    write_dir = _staging_dir()
+    pathlib.Path(write_dir).mkdir(parents=True, exist_ok=True)
+    write_path = os.path.join(write_dir, filename)
+    with open(write_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)
-    os.chmod(path, 0o755)
-    return path
+    os.chmod(write_path, 0o755)
+    return os.path.join(_daemon_dir(), filename)
+
+
+def _staging_dir() -> str:
+    """Return the directory where podrun physically writes staging files.
+
+    In nested-remote mode the outer podrun bind-mounts its ``PODRUN_TMP``
+    at ``PODRUN_HOST_TMP_MOUNT`` inside the container.  Writing there
+    makes files visible to the host daemon.  Otherwise returns ``PODRUN_TMP``.
+    """
+    host_tmp = os.environ.get(ENV_PODRUN_HOST_TMP)
+    if host_tmp and os.environ.get(ENV_PODRUN_CONTAINER):
+        return PODRUN_HOST_TMP_MOUNT
+    return PODRUN_TMP
+
+
+def _daemon_dir() -> str:
+    """Return the base path the daemon uses to see staging files.
+
+    In nested-remote mode this is the ``PODRUN_HOST_TMP`` env var value
+    (the original host path).  Otherwise returns ``PODRUN_TMP``.
+    """
+    host_tmp = os.environ.get(ENV_PODRUN_HOST_TMP)
+    if host_tmp and os.environ.get(ENV_PODRUN_CONTAINER):
+        return host_tmp
+    return PODRUN_TMP
+
+
+def _write_mount_manifest(mount_map: dict, copy_staging: Optional[list] = None) -> str:
+    """Write a mount manifest recording daemon-visible sources for each mount.
+
+    *mount_map* is a ``{container_dest: host_source}`` dict built by
+    :func:`_process_volume_args`.
+
+    *copy_staging* is an optional list of ``(host_path, container_path)``
+    tuples recorded in a separate ``copy_staging`` section.
+
+    Returns the path the manifest was written to.
+    """
+    cs: dict = {}
+    if copy_staging:
+        for host_path, container_path in copy_staging:
+            cs[container_path] = host_path
+
+    manifest = {'mounts': mount_map, 'copy_staging': cs}
+    write_dir = _staging_dir()
+    pathlib.Path(write_dir).mkdir(parents=True, exist_ok=True)
+    manifest_path = os.path.join(write_dir, 'mount-manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(manifest, f)
+    return manifest_path
+
+
+def _read_mount_manifest() -> dict:
+    """Read the mount manifest written by an outer podrun.
+
+    Returns the parsed dict or ``{"mounts": {}, "copy_staging": {}}`` if
+    the manifest file is missing or unreadable.
+    """
+    manifest_path = os.path.join(_staging_dir(), 'mount-manifest.json')
+    try:
+        with open(manifest_path, encoding='utf-8') as f:
+            data: dict = json.load(f)
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'mounts': {}, 'copy_staging': {}}
 
 
 # ---------------------------------------------------------------------------
@@ -1124,36 +1197,143 @@ def _expand_tilde_spec(spec: str, first_home: str, second_home: str) -> str:
     return ':'.join(parts)
 
 
-def _expand_volume_tilde(args: list) -> list:
-    """Expand ``~`` in ``-v``/``--volume`` arguments.
+def _process_vol_spec(
+    spec: str,
+    expand_tilde: bool,
+    manifest_mounts: Optional[dict],
+    container_home: str,
+) -> Tuple[str, Optional[Tuple[str, str]], Optional[Tuple[str, str]]]:
+    """Process a single ``src:dst[:opts]`` volume spec.
 
-    Source (host) ``~`` expands to USER_HOME.
-    Destination (container) ``~`` expands to ``/home/{UNAME}``.
+    Returns ``(new_spec, copy_staging_item, mount_entry)`` where
+    *copy_staging_item* is ``(src, dst)`` if ``:0`` mode (the arg should
+    be dropped), *mount_entry* is ``(dst, src)`` for the mount map, and
+    *new_spec* is the rewritten spec string.
+    """
+    if expand_tilde:
+        spec = _expand_tilde_spec(spec, USER_HOME, container_home)
+    parts = _split_path_colon(spec)
+    if len(parts) >= 3 and parts[-1] == '0':
+        return '', (parts[0], parts[1]), None
+    if manifest_mounts and len(parts) >= 2 and parts[0] in manifest_mounts:
+        parts[0] = manifest_mounts[parts[0]]
+    entry = (parts[1], parts[0]) if len(parts) >= 2 else None
+    return ':'.join(parts), None, entry
 
-    Handles both equals form (``-v=~/src:/dst``) and space-separated
-    form (``-v``, ``~/src:/dst``) as produced by ``_PassthroughAction``.
+
+def _process_mount_spec(
+    spec: str,
+    manifest_mounts: Optional[dict],
+) -> Tuple[str, Optional[Tuple[str, str]]]:
+    """Process a single ``--mount`` key=value spec.
+
+    Returns ``(new_spec, mount_entry)`` where *mount_entry* is
+    ``(target, source)`` for the mount map.
+    """
+    kvs = spec.split(',')
+    source = target = None
+    for j, kv in enumerate(kvs):
+        if '=' in kv:
+            key, val = kv.split('=', 1)
+            if key in ('source', 'src'):
+                if manifest_mounts and val in manifest_mounts:
+                    val = manifest_mounts[val]
+                source = val
+                kvs[j] = f'{key}={val}'
+            elif key in ('target', 'dst', 'destination'):
+                target = val
+    entry = (target, source) if source and target else None
+    return ','.join(kvs), entry
+
+
+def _process_volume_args(  # noqa: C901
+    args: list,
+    *,
+    expand_tilde: bool = False,
+    manifest_mounts: Optional[dict] = None,
+) -> Tuple[list, list, dict]:
+    """Single-pass volume/mount arg processing.
+
+    Walks *args* once and for each ``-v``/``--volume``/``--mount`` entry:
+
+    1. **Tilde expansion** (when *expand_tilde*) — ``~`` in source expands to
+       ``USER_HOME``, in destination to ``/home/{UNAME}``.
+    2. **``:0`` extraction** — items with ``:0`` mode are removed from the
+       result and collected as copy-staging tuples.
+    3. **Manifest translation** (when *manifest_mounts*) — if the source
+       appears as a key in *manifest_mounts*, it is replaced with the
+       daemon-visible path.
+    4. **Mount map** — records ``{dest: source}`` for every volume/mount.
+
+    Returns ``(processed_args, copy_staging_items, mount_map)``.
     """
     container_home = f'/home/{UNAME}'
-    result = []
+    result: list = []
+    copy_staging: list = []
+    mount_map: dict = {}
     i = 0
     while i < len(args):
         arg = args[i]
-        # Equals form: -v=~/src:/dst or --volume=~/src:/dst
+
+        # --- -v= / --volume= equals form ---
         m = re.match(r'^(-v|--volume)=(.*)', arg)
         if m:
-            flag = m.group(1)
-            result.append(f'{flag}={_expand_tilde_spec(m.group(2), USER_HOME, container_home)}')
+            spec, cs_item, mm_entry = _process_vol_spec(
+                m.group(2),
+                expand_tilde,
+                manifest_mounts,
+                container_home,
+            )
+            if cs_item:
+                copy_staging.append(cs_item)
+            else:
+                if mm_entry:
+                    mount_map[mm_entry[0]] = mm_entry[1]
+                result.append(f'{m.group(1)}={spec}')
             i += 1
             continue
-        # Space form: -v ~/src:/dst or --volume ~/src:/dst
+
+        # --- -v / --volume space form ---
         if arg in ('-v', '--volume') and i + 1 < len(args):
-            result.append(arg)
-            result.append(_expand_tilde_spec(args[i + 1], USER_HOME, container_home))
+            spec, cs_item, mm_entry = _process_vol_spec(
+                args[i + 1],
+                expand_tilde,
+                manifest_mounts,
+                container_home,
+            )
+            if cs_item:
+                copy_staging.append(cs_item)
+            else:
+                if mm_entry:
+                    mount_map[mm_entry[0]] = mm_entry[1]
+                result.append(arg)
+                result.append(spec)
             i += 2
             continue
+
+        # --- --mount= equals form ---
+        mount_m = re.match(r'^(--mount)=(.*)', arg)
+        if mount_m:
+            spec, mm_entry = _process_mount_spec(mount_m.group(2), manifest_mounts)
+            if mm_entry:
+                mount_map[mm_entry[0]] = mm_entry[1]
+            result.append(f'{mount_m.group(1)}={spec}')
+            i += 1
+            continue
+
+        # --- --mount space form ---
+        if arg == '--mount' and i + 1 < len(args):
+            spec, mm_entry = _process_mount_spec(args[i + 1], manifest_mounts)
+            if mm_entry:
+                mount_map[mm_entry[0]] = mm_entry[1]
+            result.append(arg)
+            result.append(spec)
+            i += 2
+            continue
+
         result.append(arg)
         i += 1
-    return result
+    return result, copy_staging, mount_map
 
 
 def _expand_export_tilde(exports: list) -> list:
@@ -1879,10 +2059,20 @@ def _git_submodule_args(workspace_src: str, workspace_folder: str) -> list:
     relative paths in nested submodule configs also resolve correctly.
     No ``GIT_DIR``/``GIT_WORK_TREE`` env vars are needed.
 
+    In nested-remote mode, local gitdir resolution may fail because the
+    pointer references a host path that doesn't exist inside the container.
+    In that case, the mount manifest from the outer podrun is consulted to
+    propagate any ``.git`` mount with its daemon-visible source path.
+
     Returns an empty list for normal repos or when the gitdir pointer is broken.
     """
     git_dir = _resolve_git_submodule(workspace_src)
     if not git_dir or not os.path.isdir(git_dir):
+        # In nested-remote mode, the gitdir pointer references a host path
+        # that doesn't exist here.  Check the manifest for a .git mount
+        # that the outer podrun created.
+        if _staging_dir() != _daemon_dir():
+            return _git_submodule_args_from_manifest()
         return []
     root_git, subpath = _find_root_git_dir(git_dir)
     if not root_git or not subpath or not os.path.isdir(root_git):
@@ -1901,6 +2091,20 @@ def _git_submodule_args(workspace_src: str, workspace_folder: str) -> list:
         container_parent = container_parent.parent
     container_git_mount = str(container_parent / '.git')
     return [f'-v={root_git}:{container_git_mount}:z']
+
+
+def _git_submodule_args_from_manifest() -> list:
+    """Propagate ``.git`` mounts from the outer podrun via the mount manifest.
+
+    Scans the manifest's ``mounts`` section for any destination ending in
+    ``/.git`` and re-emits them using the daemon-visible source path.
+    """
+    manifest = _read_mount_manifest()
+    args: list = []
+    for dest, source in manifest.get('mounts', {}).items():
+        if dest.endswith('/.git'):
+            args.append(f'-v={source}:{dest}:z')
+    return args
 
 
 def _host_overlay_args(ns, pt):
@@ -1936,7 +2140,7 @@ def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
 
     *items* is a list of ``(host_path, container_path)`` tuples.
 
-    For each item a staging directory is created under ``PODRUN_TMP``
+    For each item a staging directory is created under :func:`_staging_dir`
     containing a ``.podrun_target`` file (the container destination) and a
     ``data`` entry (the actual content).  The staging directory is mounted
     ``:ro`` into ``/.podrun/copy-staging/{sha12}``; the entrypoint copies
@@ -1950,12 +2154,17 @@ def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
     For **files**, the host file is copied into the staging dir at build
     time (self-contained — one mount).  For **directories**, a nested bind
     mount provides the content (two mounts: one for the target metadata,
-    one for the data directory).
+    one for the data directory).  In nested-remote mode, the general
+    ``_translate_nested_volume_sources`` pass rewrites the directory source
+    to the daemon-visible path — no special handling here.
     """
+    write_base = _staging_dir()
+    daemon_base = _daemon_dir()
     args: list = []
     for host_path, container_path in items:
         sha12 = hashlib.sha256(container_path.encode()).hexdigest()[:12]
-        staging_dir = os.path.join(PODRUN_TMP, 'copy-staging', sha12)
+        staging_dir = os.path.join(write_base, 'copy-staging', sha12)
+        daemon_staging_dir = os.path.join(daemon_base, 'copy-staging', sha12)
         container_staging = f'/.podrun/copy-staging/{sha12}'
         pathlib.Path(staging_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1979,47 +2188,14 @@ def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
             # would delete old files before the container starts.
             data_path = os.path.join(staging_dir, 'data')
             shutil.copy(host_path, data_path)
-            args.append(f'-v={staging_dir}:{container_staging}:ro,z')
+            args.append(f'-v={daemon_staging_dir}:{container_staging}:ro,z')
         elif os.path.isdir(host_path):
-            # Directory: bind-mount the host dir as staging/data (two mounts)
-            args.append(f'-v={staging_dir}:{container_staging}:ro,z')
+            # Directory: bind-mount the host dir as staging/data (two mounts).
+            # In nested-remote mode, _translate_nested_volume_sources will
+            # rewrite host_path to the daemon-visible source.
+            args.append(f'-v={daemon_staging_dir}:{container_staging}:ro,z')
             args.append(f'-v={host_path}:{container_staging}/data:ro,z')
     return args
-
-
-def _extract_copy_staging(args: list) -> Tuple[list, list]:
-    """Extract ``:0`` volume mounts from *args* for copy-staging.
-
-    Returns ``(filtered_args, items)`` where *filtered_args* has the
-    ``:0`` entries removed and *items* is a list of ``(host_path,
-    container_path)`` tuples ready for :func:`_copy_staging_args`.
-
-    Handles both equals form (``-v=host:ctr:0``) and space form
-    (``-v host:ctr:0``).
-    """
-    result: list = []
-    items: list = []
-    skip = False
-    for i, arg in enumerate(args):
-        if skip:
-            skip = False
-            continue
-        # Equals form
-        m = re.match(r'^(-v=|--volume=)(.+)$', arg)
-        if m:
-            parts = _split_path_colon(m.group(2))
-            if len(parts) >= 3 and parts[-1] == '0':
-                items.append((parts[0], parts[1]))
-                continue
-        # Space form
-        if arg in ('-v', '--volume') and i + 1 < len(args):
-            parts = _split_path_colon(args[i + 1])
-            if len(parts) >= 3 and parts[-1] == '0':
-                items.append((parts[0], parts[1]))
-                skip = True
-                continue
-        result.append(arg)
-    return result, items
 
 
 def _dot_files_overlay_args(ns, pt):
@@ -3022,11 +3198,14 @@ _DC_VAR_RE = re.compile(r'\$\{([^}]+)\}')
 def _devcontainer_project_dir(dc_path) -> Optional[str]:
     """Derive the project root directory from a devcontainer.json path.
 
-    Returns None if *dc_path* is None.
+    Returns None if *dc_path* is None.  Always returns an absolute path
+    so that ``${localWorkspaceFolder}`` is unambiguous — relative paths
+    would be resolved by the daemon relative to *its* CWD, which breaks
+    nested-remote mode.
     """
     if dc_path is None:
         return None
-    p = pathlib.Path(dc_path)
+    p = pathlib.Path(dc_path).resolve()
     if not p.is_file():
         return str(p)
     # Walk up looking for .devcontainer parent dir
@@ -4161,23 +4340,60 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
 
     overlay_args.extend(_env_args(ns))
 
-    # Apply tilde expansion to passthrough and overlay args when user overlay active
-    if ns.get('run.user_overlay'):
-        pt = _expand_volume_tilde(pt)
-        overlay_args = _expand_volume_tilde(overlay_args)
+    # Propagate the staging directory when podman-remote is active so nested
+    # podrun can write files visible to the host daemon.  Use _daemon_dir()
+    # (not PODRUN_TMP) as the mount source so multi-level nesting forwards
+    # the original host path.
+    if ns.get('run.podman_remote'):
+        daemon = _daemon_dir()
+        overlay_args.append(f'-v={daemon}:{PODRUN_HOST_TMP_MOUNT}:z')
+        overlay_args.append(f'--env={ENV_PODRUN_HOST_TMP}={daemon}')
 
-    # Extract :0 (writable-copy) volumes from overlay_args and passthrough.
-    # :O (overlay) items were already resolved by _resolve_overlay_mounts().
+    # Single-pass volume processing: tilde expansion, :0 extraction,
+    # manifest source translation, and mount map building.
+    expand = bool(ns.get('run.user_overlay'))
+    nested = _staging_dir() != _daemon_dir()
+    manifest_mounts = _read_mount_manifest().get('mounts', {}) if nested else None
     copy_staging = ctx.copy_staging or []
-    overlay_args, extra = _extract_copy_staging(overlay_args)
-    copy_staging.extend(extra)
-    pt, extra = _extract_copy_staging(pt)
-    copy_staging.extend(extra)
+
+    # :O (overlay) items were already resolved by _resolve_overlay_mounts().
+    overlay_args, extra_cs, mount_map = _process_volume_args(
+        overlay_args,
+        expand_tilde=expand,
+        manifest_mounts=manifest_mounts,
+    )
+    copy_staging.extend(extra_cs)
+    pt, extra_cs, pt_mm = _process_volume_args(
+        pt,
+        expand_tilde=expand,
+        manifest_mounts=manifest_mounts,
+    )
+    copy_staging.extend(extra_cs)
+    mount_map.update(pt_mm)
+
+    # In nested-remote mode, translate copy-staging host paths using the
+    # manifest's copy_staging section (these are mount sources that don't
+    # appear as mount destinations in the mounts section).
+    if nested and copy_staging:
+        cs_map = _read_mount_manifest().get('copy_staging', {})
+        copy_staging = [(cs_map.get(cp, hp), cp) for hp, cp in copy_staging]
+
     if copy_staging:
-        overlay_args.extend(_copy_staging_args(copy_staging, _DOTFILES_CHMOD))
+        staging_args = _copy_staging_args(copy_staging, _DOTFILES_CHMOD)
+        staging_args, _, staging_mm = _process_volume_args(
+            staging_args,
+            manifest_mounts=manifest_mounts,
+        )
+        overlay_args.extend(staging_args)
+        mount_map.update(staging_mm)
 
     # Inject overlay args into passthrough
     ns['run.passthrough_args'] = overlay_args + pt
+
+    # Write the mount manifest so nested podrun can resolve daemon-visible
+    # source paths for each -v mount.
+    if ns.get('run.podman_remote'):
+        _write_mount_manifest(mount_map, copy_staging)
 
     return build_run_command(ctx), caps_to_drop
 
@@ -4960,7 +5176,7 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
 
     # Clean stale files (>48h) from previous configs
     if ns.get('run.user_overlay'):
-        _clean_stale_files(PODRUN_TMP, max_age_days=1)
+        _clean_stale_files(_staging_dir(), max_age_days=1)
 
     if ns.get('root.print_cmd'):
         if replace_rm_cmd:

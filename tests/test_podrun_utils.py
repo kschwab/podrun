@@ -21,18 +21,22 @@ from podrun.podrun import (
     USER_HOME,
     _OVERLAY_FIELDS,
     PODRUN_HOST_TMP_MOUNT,
+    _config_sidecar_path,
     _daemon_dir,
     _expand_export_tilde,
     _extract_passthrough_entrypoint,
+    _hash_file,
     _parse_export,
     _parse_image_ref,
     _passthrough_has_exact,
     _passthrough_has_flag,
     _passthrough_has_short_flag,
     _process_volume_args,
+    _read_config_sidecar,
     _read_mount_manifest,
     _staging_dir,
     _volume_mount_destinations,
+    _write_config_sidecar,
     _write_mount_manifest,
     _write_sha_file,
     yes_no_prompt,
@@ -588,3 +592,87 @@ class TestProcessVolumeArgs:
         result, _, _ = _process_volume_args(args, manifest_mounts=mounts)
         # Source is NOT a manifest destination, so untouched
         assert result == args
+
+
+# ---------------------------------------------------------------------------
+# Config sidecar
+# ---------------------------------------------------------------------------
+
+
+class TestConfigSidecar:
+    def test_hash_file(self, tmp_path):
+        """_hash_file returns consistent SHA-256 hex digest."""
+        f = tmp_path / 'test.txt'
+        f.write_text('hello')
+        h1 = _hash_file(str(f))
+        h2 = _hash_file(str(f))
+        assert h1 is not None
+        assert h1 == h2
+        assert len(h1) == 64  # SHA-256 hex length
+
+    def test_hash_file_missing(self):
+        """_hash_file returns None for nonexistent path."""
+        assert _hash_file('/nonexistent/path/to/file') is None
+
+    def test_hash_file_content_change(self, tmp_path):
+        """Different content produces different hashes."""
+        f = tmp_path / 'test.txt'
+        f.write_text('hello')
+        h1 = _hash_file(str(f))
+        f.write_text('world')
+        h2 = _hash_file(str(f))
+        assert h1 != h2
+
+    def test_sidecar_path_format(self, tmp_path):
+        """_config_sidecar_path returns expected naming convention."""
+        path = _config_sidecar_path('mycontainer')
+        assert path.endswith('/config_mycontainer.json')
+
+    def test_write_read_roundtrip(self, tmp_path):
+        """Write and read back a config sidecar, verify structure."""
+        dc_file = tmp_path / 'devcontainer.json'
+        dc_file.write_text('{"image": "ubuntu"}')
+        ns = {
+            'run.name': 'testctr',
+            'internal.config_dc_path': str(dc_file),
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+            'internal.entrypoint_path': str(tmp_path / 'entrypoint_abc123.sh'),
+            'internal.rc_path': str(tmp_path / 'rc_def456.sh'),
+            'internal.exec_entry_path': str(tmp_path / 'exec_entry_ghi789.sh'),
+        }
+        _write_config_sidecar(ns)
+        sidecar = _read_config_sidecar('testctr')
+        assert sidecar is not None
+        assert str(dc_file) in sidecar['config_files']
+        assert sidecar['config_files'][str(dc_file)] == _hash_file(str(dc_file))
+        assert sidecar['entrypoint_path'] == 'entrypoint_abc123.sh'
+        assert sidecar['rc_path'] == 'rc_def456.sh'
+        assert sidecar['exec_entry_path'] == 'exec_entry_ghi789.sh'
+        assert 'created' in sidecar
+
+    def test_read_missing_sidecar(self):
+        """_read_config_sidecar returns None for nonexistent container."""
+        assert _read_config_sidecar('nonexistent_container') is None
+
+    def test_write_no_name_is_noop(self, tmp_path):
+        """_write_config_sidecar does nothing when run.name is not set."""
+        ns = {'run.name': None, 'internal.config_dc_path': None}
+        _write_config_sidecar(ns)
+        # No file created
+        assert not list(tmp_path.glob('config_*.json'))
+
+    def test_write_with_config_scripts(self, tmp_path):
+        """Config script paths are stored with absolute paths."""
+        script = tmp_path / 'setup.py'
+        script.write_text('# config script')
+        ns = {
+            'run.name': 'testctr',
+            'internal.config_dc_path': None,
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [str(script)],
+        }
+        _write_config_sidecar(ns)
+        sidecar = _read_config_sidecar('testctr')
+        assert sidecar is not None
+        assert os.path.abspath(str(script)) in sidecar['config_files']

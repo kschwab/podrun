@@ -60,7 +60,7 @@ import tempfile
 import textwrap
 import time
 import traceback
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 _IS_WINDOWS = sys.platform == 'win32'
 
@@ -427,39 +427,150 @@ def _exec_or_subprocess(cmd: List[str], env: dict) -> None:
         os.execvpe(cmd[0], cmd, env)
 
 
-def _clean_stale_files(directory: str, max_age_days: int = 1) -> None:
-    """Remove files older than *max_age_days* from *directory*.
+def _clean_dir(label: str, directory: str) -> Tuple[List[str], List[str]]:
+    """Remove *directory* if it exists and is non-empty.
 
-    Cross-platform replacement for ``find <dir> -mtime +N -delete``.
-    Silently ignores errors (missing directory, permission denied, etc.).
+    Returns ``(removed, failed)`` lists of human-readable descriptions.
     """
+    removed: List[str] = []
+    failed: List[str] = []
+    if os.path.isdir(directory) and os.listdir(directory):
+        try:
+            shutil.rmtree(directory)
+        except OSError as e:
+            print(f'Error removing {directory}: {e}', file=sys.stderr)
+        if not os.path.isdir(directory):
+            removed.append(f'{label}: {directory}')
+        else:
+            failed.append(f'{label}: {directory}')
+    return removed, failed
+
+
+def _collect_container_staging(container: dict, protected: set) -> None:
+    """Add PODRUN_TMP-resident mount sources from *container* to *protected*.
+
+    For each mount whose source lives under PODRUN_TMP, the *top-level*
+    entry (what ``os.listdir(PODRUN_TMP)`` would show) is added.  This
+    correctly protects nested structures like ``copy-staging/{sha12}``.
+
+    Also protects the config sidecar file for named containers that have
+    staging mounts.
+    """
+    tmp_prefix = PODRUN_TMP + os.sep
+    name = (container.get('Name') or '').lstrip('/')
+    mounts = container.get('Mounts') or []
+    has_staging = False
+    for mount in mounts:
+        src = mount.get('Source', '')
+        if src.startswith(tmp_prefix):
+            # First component relative to PODRUN_TMP — handles both flat
+            # files (entrypoint_abc.sh) and nested dirs (copy-staging/sha).
+            top_level = os.path.relpath(src, PODRUN_TMP).split(os.sep)[0]
+            if top_level:
+                protected.add(top_level)
+                has_staging = True
+    if name and has_staging:
+        sidecar_name = f'config_{name}.json'
+        if os.path.isfile(os.path.join(PODRUN_TMP, sidecar_name)):
+            protected.add(sidecar_name)
+
+
+def _protected_staging_files() -> set:
+    """Return basenames in PODRUN_TMP that are mounted into existing containers.
+
+    Inspects all containers (running or stopped) and collects mount sources
+    under PODRUN_TMP.  Also protects config sidecars for named containers.
+    Returns an empty set if podman is not available or no containers exist.
+    """
+    protected: set = set()
+    podman = shutil.which('podman') or shutil.which('podman-remote')
+    if not podman or not os.path.isdir(PODRUN_TMP):
+        return protected
+
+    r = run_os_cmd(f'{_shell_quote(podman)} ps -aq')
+    if r.returncode != 0 or not r.stdout.strip():
+        return protected
+
+    ids = [cid.strip() for cid in r.stdout.strip().split('\n') if cid.strip()]
+    if not ids:
+        return protected
+
+    ids_str = ' '.join(_shell_quote(cid) for cid in ids)
+    r = run_os_cmd(f'{_shell_quote(podman)} inspect {ids_str}')
+    if r.returncode != 0:
+        return protected
     try:
-        cutoff = time.time() - max_age_days * 86400
-        for dirpath, _dirnames, filenames in os.walk(directory, topdown=False):
-            for name in filenames:
-                fpath = os.path.join(dirpath, name)
-                try:
-                    if os.path.getmtime(fpath) < cutoff:
-                        os.unlink(fpath)
-                except OSError:
-                    pass
-    except OSError:
-        pass
+        containers = json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return protected
+
+    for container in containers:
+        _collect_container_staging(container, protected)
+
+    return protected
 
 
-def _cleanup():  # noqa: C901
-    """Remove all podrun-generated runtime artifacts.
+def _clean_staging() -> Tuple[List[str], List[str]]:
+    """Remove entrypoint scripts and staging files from PODRUN_TMP.
 
-    Cleans PODRUN_TMP, flags cache, and idle store service runtime dirs.
-    Image stores (graphroot), images, and containers are not touched.
-    Store entries with active containers are skipped.
+    Preserves files mounted into existing containers (running or stopped)
+    by inspecting their mount sources.  Falls back to removing everything
+    if podman is not available or no containers reference PODRUN_TMP.
     """
-    removed: list[str] = []
-    removed_entries: list[str] = []
-    failed: list[str] = []
-    # Stop idle store services and remove their runtime dirs.
-    # Skip entries where the socket still serves running containers —
-    # removing the socket would break nested podrun sessions.
+    if not os.path.isdir(PODRUN_TMP) or not os.listdir(PODRUN_TMP):
+        return [], []
+
+    protected = _protected_staging_files()
+    if not protected:
+        return _clean_dir('Entrypoint scripts and staging', PODRUN_TMP)
+
+    # Selective removal: delete everything except protected files.
+    removed_items: List[str] = []
+    preserved_items: List[str] = []
+    failed_items: List[str] = []
+    for entry in os.listdir(PODRUN_TMP):
+        if entry in protected:
+            print(f'  preserved: {entry}', file=sys.stderr)
+            preserved_items.append(entry)
+            continue
+        path = os.path.join(PODRUN_TMP, entry)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+            print(f'  removed: {entry}', file=sys.stderr)
+            removed_items.append(entry)
+        except OSError as e:
+            print(f'  error: {entry}: {e}', file=sys.stderr)
+            failed_items.append(entry)
+
+    removed: List[str] = []
+    failed: List[str] = []
+    if removed_items or preserved_items:
+        removed.append(
+            f'Staging ({len(removed_items)} removed, '
+            f'{len(preserved_items)} preserved): {PODRUN_TMP}'
+        )
+    if failed_items:
+        failed.append(f'Staging files ({len(failed_items)} items): {PODRUN_TMP}')
+    return removed, failed
+
+
+def _clean_cache() -> Tuple[List[str], List[str]]:
+    """Remove podman flags cache directory."""
+    return _clean_dir('Podman flags cache', _flags_cache_dir())
+
+
+def _clean_stores() -> Tuple[List[str], List[str]]:  # noqa: C901
+    """Stop idle store services and remove their runtime dirs.
+
+    Skips entries with active containers (running or stopped).
+    Returns ``(removed, failed)`` lists of human-readable descriptions.
+    """
+    removed: List[str] = []
+    removed_entries: List[str] = []
+    failed: List[str] = []
     if os.path.isdir(_PODRUN_STORES_DIR):
         all_removed = True
         had_entries = False
@@ -550,21 +661,11 @@ def _cleanup():  # noqa: C901
                 removed.append(f'Store service runtime (sockets, PIDs): {_PODRUN_STORES_DIR}')
         elif removed_entries:
             removed.append(f'Store service entries: {", ".join(removed_entries)}')
-    # Remove generated content and cache.
-    cache_dir = _flags_cache_dir()
-    for label, d in (
-        ('Entrypoint scripts and staging', PODRUN_TMP),
-        ('Podman flags cache', cache_dir),
-    ):
-        if os.path.isdir(d) and os.listdir(d):
-            try:
-                shutil.rmtree(d)
-            except OSError as e:
-                print(f'Error removing {d}: {e}', file=sys.stderr)
-            if not os.path.isdir(d):
-                removed.append(f'{label}: {d}')
-            else:
-                failed.append(f'{label}: {d}')
+    return removed, failed
+
+
+def _report_cleanup(removed: List[str], failed: List[str]) -> None:
+    """Print cleanup results to stderr."""
     for item in removed:
         print(f'Removed {item}', file=sys.stderr)
     for item in failed:
@@ -573,6 +674,67 @@ def _cleanup():  # noqa: C901
         print('All cleaned up.', file=sys.stderr)
     elif not removed and not failed:
         print('Nothing to clean.', file=sys.stderr)
+
+
+_CLEANUP_MODES = {'all', 'staging', 'cache', 'stores'}
+
+_CLEANUP_DISPATCH = {
+    'staging': _clean_staging,
+    'cache': _clean_cache,
+    'stores': _clean_stores,
+}
+
+
+def _handle_cleanup(modes: List[str]) -> None:
+    """Dispatch cleanup by *modes* and report results."""
+    all_removed: List[str] = []
+    all_failed: List[str] = []
+    if 'all' in modes:
+        for fn in (_clean_stores, _clean_staging, _clean_cache):
+            r, f = fn()
+            all_removed.extend(r)
+            all_failed.extend(f)
+    else:
+        seen: Set[str] = set()
+        for mode in modes:
+            if mode in seen:
+                continue
+            seen.add(mode)
+            r, f = _CLEANUP_DISPATCH[mode]()
+            all_removed.extend(r)
+            all_failed.extend(f)
+    _report_cleanup(all_removed, all_failed)
+
+
+def _parse_cleanup_modes(raw: List[str]) -> Optional[List[str]]:
+    """Pre-parse *raw* argv for ``--cleanup`` / ``--__cleanup__`` flags.
+
+    Returns a list of mode strings, or ``None`` when no cleanup flag is
+    present.  Prints an error and exits on invalid modes.
+    """
+    modes: List[str] = []
+    i = 0
+    while i < len(raw):
+        arg = raw[i]
+        if arg == '--__cleanup__':
+            modes.append('all')
+        elif arg == '--cleanup' and i + 1 < len(raw):
+            modes.append(raw[i + 1])
+            i += 1
+        elif arg.startswith('--cleanup='):
+            modes.append(arg.split('=', 1)[1])
+        i += 1
+    if not modes:
+        return None
+    for m in modes:
+        if m not in _CLEANUP_MODES:
+            print(
+                f'Error: invalid --cleanup mode {m!r}. '
+                f'Choose from: {", ".join(sorted(_CLEANUP_MODES))}',
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    return modes
 
 
 def _default_podman_path():
@@ -1025,6 +1187,189 @@ def _read_mount_manifest() -> dict:
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         return {'mounts': {}, 'copy_staging': {}}
+
+
+# ---------------------------------------------------------------------------
+# Config sidecar — per-container config file hashes for drift detection
+# ---------------------------------------------------------------------------
+
+
+def _config_sidecar_path(name: str) -> str:
+    """Return the path to the config sidecar JSON for container *name*."""
+    return os.path.join(_staging_dir(), f'config_{name}.json')
+
+
+def _hash_file(path: str) -> Optional[str]:
+    """Return the SHA-256 hex digest of a file's contents, or None if unreadable."""
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _write_config_sidecar(ns: dict) -> None:
+    """Write the config sidecar JSON for a named container.
+
+    Records config file hashes and entrypoint filenames so that
+    attach/restart can detect config drift and clean can find orphans.
+    """
+    name = ns.get('run.name')
+    if not name:
+        return
+
+    config_files: dict = {}
+    dc_path = ns.get('internal.config_dc_path')
+    if dc_path:
+        h = _hash_file(dc_path)
+        if h:
+            config_files[dc_path] = h
+    rc_path = ns.get('internal.config_rc_path')
+    if rc_path:
+        h = _hash_file(rc_path)
+        if h:
+            config_files[rc_path] = h
+    for sp in ns.get('internal.config_script_paths') or []:
+        abs_sp = os.path.abspath(sp)
+        h = _hash_file(abs_sp)
+        if h:
+            config_files[abs_sp] = h
+
+    sidecar: dict = {
+        'config_files': config_files,
+        'created': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+    }
+
+    # Entrypoint references (basenames) for orphan cleanup
+    for key in ('internal.entrypoint_path', 'internal.rc_path', 'internal.exec_entry_path'):
+        val = ns.get(key)
+        if val:
+            sidecar[key.rsplit('.', 1)[1]] = os.path.basename(val)
+
+    path = _config_sidecar_path(name)
+    pathlib.Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(sidecar, f, indent=2)
+
+
+def _read_config_sidecar(name: str) -> Optional[dict]:
+    """Read the config sidecar JSON for container *name*, or None if absent."""
+    path = _config_sidecar_path(name)
+    try:
+        with open(path, encoding='utf-8') as f:
+            data: dict = json.load(f)
+            return data
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _detect_config_drift(ns: dict) -> List[str]:
+    """Compare current config file hashes against stored sidecar.
+
+    Returns a list of changed file paths (empty = no drift).
+    """
+    name = ns.get('run.name')
+    if not name:
+        return []
+
+    sidecar = _read_config_sidecar(name)
+    if sidecar is None:
+        return []  # No sidecar → container predates this feature, skip
+
+    stored_files = sidecar.get('config_files', {})
+    changed: List[str] = []
+
+    # Check stored files for modifications or deletions
+    for path, stored_hash in stored_files.items():
+        current_hash = _hash_file(path)
+        if current_hash != stored_hash:
+            changed.append(path)
+
+    # Check for new config files not in sidecar
+    current_paths: List[str] = []
+    dc_path = ns.get('internal.config_dc_path')
+    if dc_path:
+        current_paths.append(dc_path)
+    rc_path = ns.get('internal.config_rc_path')
+    if rc_path:
+        current_paths.append(rc_path)
+    for sp in ns.get('internal.config_script_paths') or []:
+        current_paths.append(os.path.abspath(sp))
+
+    for cp in current_paths:
+        if cp not in stored_files:
+            changed.append(cp)
+
+    return changed
+
+
+def _config_drift_prompt(
+    name: str, changed_files: List[str], is_interactive: bool
+) -> Optional[str]:
+    """Prompt user about config drift.
+
+    Returns ``'continue'``, ``'replace'``, or ``None`` (quit).
+    """
+    print(
+        f'Warning: Config has changed since container {name!r} was created:',
+        file=sys.stderr,
+    )
+    for f in changed_files:
+        print(f'  modified: {f}', file=sys.stderr)
+
+    if not is_interactive:
+        print('  (non-interactive: continuing with stale config)', file=sys.stderr)
+        return 'continue'
+
+    prompt_str = 'Continue with stale config? [C]ontinue / [R]eplace / [Q]uit: '
+    while True:
+        sys.stderr.write(prompt_str)
+        sys.stderr.flush()
+        answer = input().strip().lower() or 'c'
+        if answer[:1] in ('c', 'r', 'q'):
+            break
+        print('Please answer c, r, or q...', file=sys.stderr)
+
+    if answer[:1] == 'c':
+        return 'continue'
+    if answer[:1] == 'r':
+        return 'replace'
+    return None  # quit
+
+
+def _check_config_drift(ctx: 'PodrunContext', action: str) -> Optional[str]:
+    """Check for config drift on restart/attach and return the (possibly changed) action.
+
+    Returns the action string (``'restart'``, ``'attach'``, ``'replace'``) or
+    ``None`` (exit).  Only called when action is ``'restart'`` or ``'attach'``.
+    """
+    ns = ctx.ns
+    name = ns.get('run.name')
+    if not name or not ns.get('run.user_overlay'):
+        return action
+
+    changed = _detect_config_drift(ns)
+    if not changed:
+        return action
+
+    # Auto-attach: warn and proceed (non-blocking for CI)
+    if ns.get('run.auto_attach'):
+        print(
+            f'Warning: Config has changed since container {name!r} was created:',
+            file=sys.stderr,
+        )
+        for f in changed:
+            print(f'  modified: {f}', file=sys.stderr)
+        print('  (--auto-attach: continuing with stale config)', file=sys.stderr)
+        return action
+
+    # Interactive prompt
+    choice = _config_drift_prompt(name, changed, sys.stdin.isatty())
+    if choice == 'continue':
+        return action
+    if choice == 'replace':
+        return 'replace'
+    return None  # quit
 
 
 # ---------------------------------------------------------------------------
@@ -2184,8 +2529,7 @@ def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
         if os.path.isfile(host_path):
             # File: copy into staging/data at build time (one mount).
             # Use shutil.copy (not copy2) so the data file gets the current
-            # mtime — copy2 preserves the source mtime, and _clean_stale_files
-            # would delete old files before the container starts.
+            # mtime — copy2 preserves the source mtime.
             data_path = os.path.join(staging_dir, 'data')
             shutil.copy(host_path, data_path)
             args.append(f'-v={daemon_staging_dir}:{container_staging}:ro,z')
@@ -3286,11 +3630,11 @@ def _warn_unsupported_lifecycle_fields(dc: dict) -> None:
         )
 
 
-def _load_devcontainer(ns) -> Tuple[dict, dict]:
+def _load_devcontainer(ns) -> Tuple[dict, dict, Optional[str]]:
     """Load devcontainer.json, expand variables, and resolve to ``ns['dc.*']``.
 
-    Returns ``(dc, podrun_cfg)``.  When ``root.no_devconfig`` is set or no
-    devcontainer.json is found, both are empty dicts and ns is unchanged.
+    Returns ``(dc, podrun_cfg, dc_path)``.  When ``root.no_devconfig`` is set
+    or no devcontainer.json is found, both dicts are empty and dc_path is None.
 
     When the devcontainer CLI is driving (detected via the
     ``devcontainer.config_file`` label), ``ns['internal.dc_from_cli']`` is set
@@ -3300,7 +3644,7 @@ def _load_devcontainer(ns) -> Tuple[dict, dict]:
     duplicating args the CLI already passed in.
     """
     if ns.get('root.no_devconfig'):
-        return {}, {}
+        return {}, {}, None
 
     # Check for label-based dc selection (devcontainer CLI passes this label)
     label_config_path = None
@@ -3323,7 +3667,7 @@ def _load_devcontainer(ns) -> Tuple[dict, dict]:
     _resolve_dc_fields(dc, ns, dc_path_str)
 
     podrun_cfg = extract_podrun_config(dc)
-    return dc, podrun_cfg
+    return dc, podrun_cfg, dc_path_str
 
 
 def _discover_podrunrc() -> Optional[str]:
@@ -3342,8 +3686,8 @@ def _discover_podrunrc() -> Optional[str]:
     return str(candidates[0])
 
 
-def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dict, list]:
-    """Find and execute config scripts, return ``(script_ns, script_passthrough)``."""
+def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dict, list, list]:
+    """Find and execute config scripts, return ``(script_ns, script_passthrough, paths)``."""
     ns = ctx.ns
     script_paths: list = []
     dc_script = podrun_cfg.get('configScript')
@@ -3354,10 +3698,11 @@ def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dic
         script_paths.extend(cli_scripts)
 
     if not script_paths:
-        return {}, []
+        return {}, [], []
 
     script_tokens = run_config_scripts(script_paths, ctx=ctx)
-    return parse_config_tokens(script_tokens, flags)
+    ns_dict, pt = parse_config_tokens(script_tokens, flags)
+    return ns_dict, pt, script_paths
 
 
 def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns, rc_ns=None):
@@ -3419,7 +3764,8 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
     ns = ctx.ns
 
     # 1–3. Load devcontainer.json, expand variables, resolve to ns['dc.*']
-    dc, podrun_cfg = _load_devcontainer(ns)
+    dc, podrun_cfg, dc_path = _load_devcontainer(ns)
+    ns['internal.config_dc_path'] = dc_path
 
     # Copy dc_from_cli from ns (set by _load_devcontainer) to ctx
     ctx.dc_from_cli = ns.get('internal.dc_from_cli', False)
@@ -3431,15 +3777,20 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
     # 4. Discover and execute ~/.podrunrc* (lowest priority config)
     rc_ns: dict = {}
     rc_passthrough: list = []
+    rc_path: Optional[str] = None
     no_podrunrc = ns.get('root.no_podrunrc') or podrun_cfg.get('noPodrunrc')
     if not no_podrunrc:
         rc_path = _discover_podrunrc()
         if rc_path:
             rc_tokens = run_config_scripts([rc_path], ctx=ctx)
             rc_ns, rc_passthrough = parse_config_tokens(rc_tokens, flags)
+    ns['internal.config_rc_path'] = rc_path
 
     # 5–6. Determine and execute config scripts
-    script_ns, script_passthrough = _collect_script_config(ctx, podrun_cfg, flags)
+    script_ns, script_passthrough, config_script_paths = _collect_script_config(
+        ctx, podrun_cfg, flags
+    )
+    ns['internal.config_script_paths'] = config_script_paths
 
     # 7. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
     dc_ns = _devcontainer_to_ns(podrun_cfg)
@@ -3679,10 +4030,18 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     opts.add_argument(
+        '--cleanup',
+        dest='root.cleanup',
+        action='append',
+        choices=sorted(_CLEANUP_MODES),
+        metavar='MODE',
+        help='Remove runtime artifacts and exit. MODE: all, staging, cache, stores. Repeatable.',
+    )
+    opts.add_argument(
         '--__cleanup__',
         dest='root.cleanup',
-        action='store_true',
-        default=False,
+        action='append_const',
+        const='all',
         help=argparse.SUPPRESS,
     )
 
@@ -4317,6 +4676,10 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
         entrypoint_path = generate_run_entrypoint(ns, caps_to_drop=compute_caps_to_drop(pt))
         rc_path = generate_rc_sh(ns)
         exec_entry_path = generate_exec_entrypoint(ns)
+        # Store for config sidecar (entrypoint linkage)
+        ns['internal.entrypoint_path'] = entrypoint_path
+        ns['internal.rc_path'] = rc_path
+        ns['internal.exec_entry_path'] = exec_entry_path
         user_args, caps_to_drop = _user_overlay_args(
             ns, pt, entrypoint_path, rc_path, exec_entry_path
         )
@@ -5087,9 +5450,10 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     # Set run.image for _env_args (image ref parsing for PODRUN_IMG_* env vars)
     ns['run.image'] = ctx.trailing_args[0]
 
-    # Default prompt banner to image name
+    # Default prompt banner to image name:tag
     if not ns.get('run.prompt_banner'):
-        ns['run.prompt_banner'] = ns['run.image']
+        _, name, tag = _parse_image_ref(ns['run.image'])
+        ns['run.prompt_banner'] = f'{name}:{tag}'
 
     # Set workspace defaults for _host_overlay_args
     if ns.get('run.host_overlay'):
@@ -5108,6 +5472,12 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     action = handle_container_state(ctx, global_flags=global_flags)
     if action is None:
         sys.exit(0)
+
+    # Config drift check — warn when attach/restart would use stale config
+    if action in ('restart', 'attach') and not ns.get('root.print_cmd'):
+        action = _check_config_drift(ctx, action)
+        if action is None:
+            sys.exit(0)
 
     # Devcontainer initializeCommand — runs on the host during initialization.
     # Fires for every podrun run invocation (create, restart, replace, attach)
@@ -5174,9 +5544,9 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     # Build the full run command with overlay injection
     cmd, _caps_to_drop = build_overlay_run_command(ctx)
 
-    # Clean stale files (>48h) from previous configs
-    if ns.get('run.user_overlay'):
-        _clean_stale_files(_staging_dir(), max_age_days=1)
+    # Write config sidecar for named containers with user overlay
+    if ns.get('run.name') and ns.get('run.user_overlay') and not ns.get('root.print_cmd'):
+        _write_config_sidecar(ns)
 
     if ns.get('root.print_cmd'):
         if replace_rm_cmd:
@@ -5198,8 +5568,9 @@ def main(argv=None):
     # Cleanup: early exit before any podman invocation.  Avoids flag
     # scraping touching the store or regenerating the flags cache right
     # before we delete them.
-    if '--__cleanup__' in raw:
-        _cleanup()
+    cleanup_modes = _parse_cleanup_modes(raw)
+    if cleanup_modes is not None:
+        _handle_cleanup(cleanup_modes)
         sys.exit(0)
 
     podman_path = _default_podman_path()

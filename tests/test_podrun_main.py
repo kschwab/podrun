@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+import json
+
 import podrun.podrun as podrun_mod
 from podrun.podrun import (
     ENV_PODRUN_CONTAINER,
@@ -16,20 +18,27 @@ from podrun.podrun import (
     UNAME,
     PodrunContext,
     _NFS_REMEDIATE_DEFAULT_BASE,
+    _clean_cache,
+    _clean_staging,
     _clean_stale_cache,
+    _clean_stores,
     _default_podman_path,
     _discover_podrunrc,
     _filter_global_args,
     _flags_cache_path,
+    _handle_cleanup,
     _is_network_fs,
     _is_remote,
     _is_vacant_store,
     _nfs_remediate,
+    _parse_cleanup_modes,
+    _protected_staging_files,
+    _read_config_sidecar,
+    _report_cleanup,
     _resolve_overlay_mounts,
     _run_initialize_command,
     _warn_missing_subids,
     _write_flags_cache,
-    _cleanup,
     load_podman_flags,
     main,
     parse_args,
@@ -1057,7 +1066,7 @@ class TestCleanup:
         script = tmp_path / 'test-entrypoint.sh'
         script.write_text('#!/bin/sh\n')
         assert tmp_path.exists()
-        _cleanup()
+        _handle_cleanup(['all'])
         assert not tmp_path.exists()
         err = capsys.readouterr().err
         assert str(tmp_path) in err
@@ -1072,7 +1081,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache_dir))
         # Ensure PODRUN_TMP doesn't exist so it doesn't confuse output.
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
-        _cleanup()
+        _handle_cleanup(['all'])
         assert not cache_dir.exists()
         err = capsys.readouterr().err
         assert str(cache_dir) in err
@@ -1089,7 +1098,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         assert not stores.exists()
         err = capsys.readouterr().err
         assert str(stores) in err
@@ -1121,7 +1130,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         # Service should have been sent SIGTERM.
         assert (fake_pid, signal.SIGTERM) in kills
         # Entry and parent should be removed.
@@ -1149,7 +1158,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         assert entry.exists()
         err = capsys.readouterr().err
         assert 'Skipped: Store service entry (containers exist)' in err
@@ -1168,7 +1177,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         assert entry.exists()
         err = capsys.readouterr().err
         assert 'Skipped: Store service entry (containers exist)' in err
@@ -1185,7 +1194,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         assert not entry.exists()
         err = capsys.readouterr().err
         assert 'Skipped' not in err
@@ -1221,7 +1230,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         # Entry should be gone after unshare fallback.
         assert not entry.exists()
         err = capsys.readouterr().err
@@ -1261,7 +1270,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent2'))
-        _cleanup()
+        _handle_cleanup(['all'])
         assert not entry.exists()
         err = capsys.readouterr().err
         assert 'Failed' not in err
@@ -1287,7 +1296,7 @@ class TestCleanup:
             return real_rmtree(path, **kw)
 
         monkeypatch.setattr(shutil, 'rmtree', racy_rmtree)
-        _cleanup()
+        _handle_cleanup(['all'])
         assert not entry.exists()
         err = capsys.readouterr().err
         assert 'Error removing' not in err
@@ -1297,7 +1306,7 @@ class TestCleanup:
         monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
         monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'nonexistent2'))
         monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'nonexistent3'))
-        _cleanup()
+        _handle_cleanup(['all'])
         err = capsys.readouterr().err
         assert 'Nothing to clean.' in err
 
@@ -1315,7 +1324,7 @@ class TestCleanup:
             raise PermissionError(13, 'Permission denied', path)
 
         monkeypatch.setattr(shutil, 'rmtree', fake_rmtree)
-        _cleanup()
+        _handle_cleanup(['all'])
         err = capsys.readouterr().err
         assert 'Error removing' in err
         assert 'Permission denied' in err
@@ -1324,13 +1333,388 @@ class TestCleanup:
         assert 'All cleaned up.' not in err
 
     def test_cleanup_flag_hidden(self, capsys):
-        """--__cleanup__ does not appear in --help output."""
+        """--__cleanup__ does not appear in --help output; --cleanup is visible."""
         from podrun.podrun import build_root_parser, load_podman_flags
 
         flags = load_podman_flags()
         parser = build_root_parser(flags)
         help_text = parser.format_help()
         assert '__cleanup__' not in help_text
+        assert '--cleanup' in help_text
+
+
+# ---------------------------------------------------------------------------
+# Composable cleanup functions
+# ---------------------------------------------------------------------------
+
+
+class TestComposableCleanup:
+    """Verify the extracted _clean_staging, _clean_cache, _clean_stores helpers."""
+
+    def test_clean_staging_removes_tmp(self, tmp_path, capsys):
+        (tmp_path / 'entrypoint.sh').write_text('#!/bin/sh\n')
+        r, f = _clean_staging()
+        assert len(r) == 1
+        assert 'Entrypoint scripts and staging' in r[0]
+        assert f == []
+        assert not tmp_path.exists()
+
+    def test_clean_staging_noop_when_empty(self, tmp_path):
+        """Nothing to remove when PODRUN_TMP doesn't exist."""
+        import shutil
+
+        shutil.rmtree(tmp_path, ignore_errors=True)
+        r, f = _clean_staging()
+        assert r == []
+        assert f == []
+
+    def test_clean_cache_removes_cache(self, tmp_path, monkeypatch):
+        cache = tmp_path / 'cache'
+        cache.mkdir()
+        (cache / 'podman-flags.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache))
+        r, f = _clean_cache()
+        assert len(r) == 1
+        assert 'Podman flags cache' in r[0]
+        assert not cache.exists()
+
+    def test_clean_cache_noop_when_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'no'))
+        r, f = _clean_cache()
+        assert r == []
+        assert f == []
+
+    def test_clean_stores_noop_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'no'))
+        r, f = _clean_stores()
+        assert r == []
+        assert f == []
+
+    def test_report_cleanup_all_clean(self, capsys):
+        _report_cleanup(['item1'], [])
+        err = capsys.readouterr().err
+        assert 'Removed item1' in err
+        assert 'All cleaned up.' in err
+
+    def test_report_cleanup_nothing(self, capsys):
+        _report_cleanup([], [])
+        err = capsys.readouterr().err
+        assert 'Nothing to clean.' in err
+
+    def test_report_cleanup_with_failures(self, capsys):
+        _report_cleanup(['ok'], ['bad'])
+        err = capsys.readouterr().err
+        assert 'Removed ok' in err
+        assert 'Failed to remove bad' in err
+        assert 'All cleaned up.' not in err
+
+
+class TestStagingProtection:
+    """Verify _clean_staging preserves files for existing named containers."""
+
+    def _inspect_json(self, tmp_path, name, mount_paths):
+        """Build a podman-inspect JSON list for a single container.
+
+        *mount_paths* are relative to tmp_path (e.g. ``'ep.sh'`` or
+        ``'copy-staging/abc123'``).
+        """
+        mounts = [
+            {'Source': str(tmp_path / p), 'Destination': f'/.podrun/{p}'} for p in mount_paths
+        ]
+        return json.dumps([{'Name': name, 'Mounts': mounts}])
+
+    def test_no_containers_removes_all(self, tmp_path, mock_run_os_cmd):
+        """When no containers exist, staging is fully removed."""
+        (tmp_path / 'entrypoint_abc123.sh').write_text('#!/bin/sh\n')
+        (tmp_path / 'rc_def456.sh').write_text('#!/bin/sh\n')
+        # podman ps -aq returns nothing
+        mock_run_os_cmd.set_return(stdout='', returncode=0)
+        r, f = _clean_staging()
+        assert len(r) == 1
+        assert not tmp_path.exists()
+
+    def test_preserves_files_for_existing_container(self, tmp_path, mock_run_os_cmd):
+        """Mounted entrypoints are preserved; orphans removed."""
+        (tmp_path / 'entrypoint_aaa.sh').write_text('#!/bin/sh\n')
+        (tmp_path / 'rc_bbb.sh').write_text('#!/bin/sh\n')
+        (tmp_path / 'exec_entry_ccc.sh').write_text('#!/bin/sh\n')
+        (tmp_path / 'entrypoint_orphan.sh').write_text('#!/bin/sh\n')
+        # Sidecar for the container (should also be preserved)
+        (tmp_path / 'config_mycontainer.json').write_text('{}')
+
+        inspect_out = self._inspect_json(
+            tmp_path,
+            'mycontainer',
+            ['entrypoint_aaa.sh', 'rc_bbb.sh', 'exec_entry_ccc.sh'],
+        )
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess('', 0, stdout='abc123\n', stderr=''),
+                subprocess.CompletedProcess('', 0, stdout=inspect_out, stderr=''),
+            ]
+        )
+
+        r, f = _clean_staging()
+        assert (tmp_path / 'entrypoint_aaa.sh').exists()
+        assert (tmp_path / 'rc_bbb.sh').exists()
+        assert (tmp_path / 'exec_entry_ccc.sh').exists()
+        assert (tmp_path / 'config_mycontainer.json').exists()
+        assert not (tmp_path / 'entrypoint_orphan.sh').exists()
+        assert len(r) == 1
+        assert 'preserved' in r[0]
+
+    def test_no_containers_removes_everything(self, tmp_path, mock_run_os_cmd):
+        """When no containers exist, all staging files are removed."""
+        (tmp_path / 'config_removed.json').write_text('{}')
+        (tmp_path / 'entrypoint_old.sh').write_text('#!/bin/sh\n')
+        mock_run_os_cmd.set_return(stdout='', returncode=0)
+        r, f = _clean_staging()
+        assert not tmp_path.exists()
+
+    def test_protected_staging_files_no_podman(self, tmp_path, monkeypatch):
+        """Returns empty set when podman is not available."""
+        monkeypatch.setattr(shutil, 'which', lambda x: None)
+        (tmp_path / 'config_test.json').write_text('{}')
+        assert _protected_staging_files() == set()
+
+    def test_protected_staging_files_running_container(self, tmp_path, mock_run_os_cmd):
+        """Returns mount basenames for a running container."""
+        (tmp_path / 'config_alive.json').write_text('{}')
+        inspect_out = self._inspect_json(tmp_path, 'alive', ['ep.sh', 'rc.sh'])
+        # Create the files so the sidecar protection path check works
+        (tmp_path / 'ep.sh').write_text('')
+        (tmp_path / 'rc.sh').write_text('')
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess('', 0, stdout='abc123\n', stderr=''),
+                subprocess.CompletedProcess('', 0, stdout=inspect_out, stderr=''),
+            ]
+        )
+        protected = _protected_staging_files()
+        assert 'ep.sh' in protected
+        assert 'rc.sh' in protected
+        assert 'config_alive.json' in protected
+
+    def test_preserves_copy_staging_dir(self, tmp_path, mock_run_os_cmd):
+        """Nested copy-staging dirs are protected by top-level directory name."""
+        cs_dir = tmp_path / 'copy-staging' / '23b49b34db65'
+        cs_dir.mkdir(parents=True)
+        (cs_dir / '.podrun_target').write_text('/home/user/.ssh')
+        (tmp_path / 'entrypoint_aaa.sh').write_text('#!/bin/sh\n')
+        (tmp_path / 'entrypoint_orphan.sh').write_text('#!/bin/sh\n')
+        (tmp_path / 'config_mybox.json').write_text('{}')
+
+        inspect_out = self._inspect_json(
+            tmp_path,
+            'mybox',
+            ['entrypoint_aaa.sh', 'copy-staging/23b49b34db65'],
+        )
+        mock_run_os_cmd.set_side_effect(
+            [
+                subprocess.CompletedProcess('', 0, stdout='abc123\n', stderr=''),
+                subprocess.CompletedProcess('', 0, stdout=inspect_out, stderr=''),
+            ]
+        )
+
+        r, f = _clean_staging()
+        # copy-staging dir and entrypoint preserved
+        assert (tmp_path / 'copy-staging' / '23b49b34db65').exists()
+        assert (tmp_path / 'entrypoint_aaa.sh').exists()
+        assert (tmp_path / 'config_mybox.json').exists()
+        # orphan removed
+        assert not (tmp_path / 'entrypoint_orphan.sh').exists()
+
+
+# ---------------------------------------------------------------------------
+# _parse_cleanup_modes
+# ---------------------------------------------------------------------------
+
+
+class TestParseCleanupModes:
+    def test_absent(self):
+        assert _parse_cleanup_modes([]) is None
+
+    def test_absent_with_other_args(self):
+        assert _parse_cleanup_modes(['run', '--rm', 'alpine']) is None
+
+    def test_space_form(self):
+        assert _parse_cleanup_modes(['--cleanup', 'staging']) == ['staging']
+
+    def test_equals_form(self):
+        assert _parse_cleanup_modes(['--cleanup=cache']) == ['cache']
+
+    def test_all_mode(self):
+        assert _parse_cleanup_modes(['--cleanup', 'all']) == ['all']
+
+    def test_repeatable(self):
+        result = _parse_cleanup_modes(['--cleanup', 'staging', '--cleanup', 'cache'])
+        assert result == ['staging', 'cache']
+
+    def test_legacy_flag(self):
+        assert _parse_cleanup_modes(['--__cleanup__']) == ['all']
+
+    def test_mixed_legacy_and_new(self):
+        result = _parse_cleanup_modes(['--__cleanup__', '--cleanup', 'staging'])
+        assert result == ['all', 'staging']
+
+    def test_invalid_mode_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            _parse_cleanup_modes(['--cleanup', 'bogus'])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert 'invalid --cleanup mode' in err
+        assert 'bogus' in err
+
+
+# ---------------------------------------------------------------------------
+# _handle_cleanup (mode dispatch)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupModes:
+    """Verify _handle_cleanup dispatches to the correct composable functions."""
+
+    def test_staging_only(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / 'test.sh').write_text('#!/bin/sh\n')
+        # Cache must be outside tmp_path — _clean_staging removes PODRUN_TMP
+        # (which _isolate sets to tmp_path) via rmtree.
+        cache = tmp_path.parent / f'{tmp_path.name}-cache'
+        cache.mkdir(exist_ok=True)
+        (cache / 'flags.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache))
+        try:
+            _handle_cleanup(['staging'])
+            assert not (tmp_path / 'test.sh').exists()
+            assert cache.exists(), 'cache should be untouched'
+        finally:
+            if cache.exists():
+                shutil.rmtree(cache)
+
+    def test_cache_only(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / 'test.sh').write_text('#!/bin/sh\n')
+        cache = tmp_path.parent / f'{tmp_path.name}-cache'
+        cache.mkdir(exist_ok=True)
+        (cache / 'flags.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache))
+        try:
+            _handle_cleanup(['cache'])
+            assert not cache.exists()
+            assert (tmp_path / 'test.sh').exists(), 'staging should be untouched'
+        finally:
+            if cache.exists():
+                shutil.rmtree(cache)
+
+    def test_stores_only(self, tmp_path, monkeypatch, capsys):
+        stores = tmp_path / 'stores'
+        stores.mkdir()
+        entry = stores / 'abc'
+        entry.mkdir()
+        (entry / 'podman.pid').write_text('999999999')
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        _handle_cleanup(['stores'])
+        assert not stores.exists()
+
+    def test_all_removes_everything(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / 'test.sh').write_text('#!/bin/sh\n')
+        cache = tmp_path / 'cache'
+        cache.mkdir()
+        (cache / 'flags.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache))
+        _handle_cleanup(['all'])
+        assert not tmp_path.exists()
+        assert not cache.exists()
+        err = capsys.readouterr().err
+        assert 'All cleaned up.' in err
+
+    def test_combined_modes(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / 'test.sh').write_text('#!/bin/sh\n')
+        cache = tmp_path / 'cache'
+        cache.mkdir()
+        (cache / 'flags.json').write_text('{}')
+        stores = tmp_path / 'stores'
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(stores))
+        _handle_cleanup(['staging', 'cache'])
+        assert not tmp_path.exists()
+        assert not cache.exists()
+
+    def test_deduplicates(self, tmp_path, monkeypatch, capsys):
+        """Duplicate modes should only run the cleanup once."""
+        calls = []
+        original = podrun_mod._clean_staging
+
+        def counting_clean():
+            calls.append(1)
+            return original()
+
+        monkeypatch.setattr(
+            podrun_mod,
+            '_CLEANUP_DISPATCH',
+            {**podrun_mod._CLEANUP_DISPATCH, 'staging': counting_clean},
+        )
+        _handle_cleanup(['staging', 'staging'])
+        assert len(calls) == 1
+
+    def test_all_supersedes_individual(self, tmp_path, monkeypatch, capsys):
+        """'all' in modes should clean everything regardless of other modes."""
+        (tmp_path / 'test.sh').write_text('#!/bin/sh\n')
+        cache = tmp_path / 'cache'
+        cache.mkdir()
+        (cache / 'flags.json').write_text('{}')
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(cache))
+        _handle_cleanup(['staging', 'all'])
+        assert not tmp_path.exists()
+        assert not cache.exists()
+
+
+# ---------------------------------------------------------------------------
+# main() integration for --cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupMainIntegration:
+    def test_cleanup_all_early_exit(self, tmp_path, monkeypatch, capsys):
+        """main(['--cleanup', 'all']) exits 0 before podman resolution."""
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'no2'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'no3'))
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--cleanup', 'all'])
+        assert exc_info.value.code == 0
+
+    def test_cleanup_staging_early_exit(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--cleanup', 'staging'])
+        assert exc_info.value.code == 0
+
+    def test_legacy_cleanup_still_works(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_PODRUN_STORES_DIR', str(tmp_path / 'no2'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'no3'))
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--__cleanup__'])
+        assert exc_info.value.code == 0
+        err = capsys.readouterr().err
+        assert 'Nothing to clean.' in err
+
+    def test_cleanup_equals_form(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--cleanup=staging'])
+        assert exc_info.value.code == 0
+
+    def test_cleanup_repeatable(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(podrun_mod, 'PODRUN_TMP', str(tmp_path / 'nonexistent'))
+        monkeypatch.setattr(podrun_mod, '_flags_cache_dir', lambda: str(tmp_path / 'no2'))
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--cleanup', 'staging', '--cleanup', 'cache'])
+        assert exc_info.value.code == 0
+
+    def test_cleanup_invalid_mode(self, tmp_path, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--cleanup', 'bogus'])
+        assert exc_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2055,3 +2439,97 @@ class TestInitializeCommandInHandleRun:
             )
         assert exc.value.code == 0
         assert len(calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Config drift integration
+# ---------------------------------------------------------------------------
+
+
+class TestConfigDriftIntegration:
+    """Integration tests for config sidecar write/skip in _handle_run."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_exec(self, monkeypatch):
+        """Prevent actual exec — capture the command instead."""
+        self.exec_calls = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_exec_or_subprocess',
+            lambda cmd, env=None: self.exec_calls.append(cmd),
+        )
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd, env=None: subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='', stderr=''
+            ),
+        )
+
+    def test_sidecar_written_on_named_session_run(self, tmp_path, monkeypatch):
+        """Sidecar file is written for a named container with user overlay."""
+        dc_file = tmp_path / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine'}))
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        main(['run', '--session', '--name', 'sidecar-test', 'alpine'])
+        sidecar = _read_config_sidecar('sidecar-test')
+        assert sidecar is not None
+        assert 'config_files' in sidecar
+        assert str(dc_file) in sidecar['config_files']
+        assert 'entrypoint_path' in sidecar
+        assert 'rc_path' in sidecar
+        assert 'exec_entry_path' in sidecar
+
+    def test_sidecar_not_written_print_cmd(self, tmp_path, monkeypatch):
+        """--print-cmd skips sidecar write."""
+        dc_file = tmp_path / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine'}))
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_file)
+        with pytest.raises(SystemExit) as exc:
+            main(['--print-cmd', 'run', '--session', '--name', 'sidecar-skip', 'alpine'])
+        assert exc.value.code == 0
+        assert _read_config_sidecar('sidecar-skip') is None
+
+    def test_sidecar_not_written_unnamed(self, tmp_path):
+        """Unnamed container (no --name) skips sidecar write."""
+        main(['run', '--session', 'alpine'])
+        # No config_*.json files should exist
+        assert not list(tmp_path.glob('config_*.json'))
+
+    def test_sidecar_not_written_no_user_overlay(self, tmp_path):
+        """Bare run without user overlay skips sidecar write."""
+        main(['run', '--name', 'bare-test', 'alpine'])
+        assert _read_config_sidecar('bare-test') is None
+
+    def test_restart_with_drift_warns(self, tmp_path, monkeypatch, capsys):
+        """Restart with drifted config shows warning on stderr."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc)
+        # Write sidecar with old hash
+        sidecar = {'config_files': {str(dc): 'oldhash'}, 'created': '2026-04-14T10:00:00'}
+        (tmp_path / 'config_driftctr.json').write_text(json.dumps(sidecar))
+        # Simulate stopped container → auto-attach triggers restart
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        main(['run', '--session', '--name', 'driftctr', '--auto-attach', 'alpine'])
+        err = capsys.readouterr().err
+        assert 'Config has changed' in err
+        assert str(dc) in err
+        assert '--auto-attach' in err
+
+    def test_attach_with_drift_auto_attach_proceeds(self, tmp_path, monkeypatch, capsys):
+        """Auto-attach with drift warns but still proceeds to attach."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        monkeypatch.setattr(podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc)
+        sidecar = {'config_files': {str(dc): 'oldhash'}, 'created': '2026-04-14T10:00:00'}
+        (tmp_path / 'config_attachctr.json').write_text(json.dumps(sidecar))
+        # Simulate running container → auto-attach triggers attach
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'running')
+        # Mock _exec_attach since attach path doesn't use _exec_or_subprocess
+        attach_calls = []
+        monkeypatch.setattr(podrun_mod, '_exec_attach', lambda ctx, gf: attach_calls.append(True))
+        main(['run', '--session', '--name', 'attachctr', '--auto-attach', 'alpine'])
+        err = capsys.readouterr().err
+        assert 'Config has changed' in err
+        assert len(attach_calls) == 1

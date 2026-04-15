@@ -14,6 +14,10 @@ from podrun.podrun import (
     PODRUN_HOST_TMP_MOUNT,
     PODRUN_RC_PATH,
     PodrunContext,
+    _check_config_drift,
+    _config_drift_prompt,
+    _detect_config_drift,
+    _hash_file,
     build_overlay_run_command,
     build_podman_exec_args,
     detect_container_state,
@@ -646,3 +650,250 @@ class TestBuildOverlayRunCommand:
         build_overlay_run_command(r)
         manifest_path = tmp_path / 'mount-manifest.json'
         assert not manifest_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Config drift detection
+# ---------------------------------------------------------------------------
+
+
+class TestConfigDrift:
+    """Tests for config change detection."""
+
+    def _make_sidecar(self, tmp_path, name, files):
+        """Write a sidecar with the given config files dict."""
+        import json
+
+        sidecar = {'config_files': files, 'created': '2026-04-14T10:00:00+0000'}
+        path = tmp_path / f'config_{name}.json'
+        path.write_text(json.dumps(sidecar))
+
+    def test_no_sidecar_no_drift(self):
+        """No sidecar → empty list (graceful for pre-feature containers)."""
+        ns = {
+            'run.name': 'nosidecar',
+            'run.user_overlay': True,
+            'internal.config_dc_path': None,
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        assert _detect_config_drift(ns) == []
+
+    def test_matching_hashes_no_drift(self, tmp_path):
+        """Stored hashes match current files → empty list."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        self._make_sidecar(tmp_path, 'testctr', {str(dc): _hash_file(str(dc))})
+        ns = {
+            'run.name': 'testctr',
+            'internal.config_dc_path': str(dc),
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        assert _detect_config_drift(ns) == []
+
+    def test_changed_file_detected(self, tmp_path):
+        """Modified config file is detected."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        old_hash = _hash_file(str(dc))
+        self._make_sidecar(tmp_path, 'testctr', {str(dc): old_hash})
+        dc.write_text('{"image": "alpine"}')
+        ns = {
+            'run.name': 'testctr',
+            'internal.config_dc_path': str(dc),
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        changed = _detect_config_drift(ns)
+        assert str(dc) in changed
+
+    def test_deleted_file_detected(self, tmp_path):
+        """Deleted config file is detected (hash returns None ≠ stored hash)."""
+        dc_path = str(tmp_path / 'devcontainer.json')
+        self._make_sidecar(tmp_path, 'testctr', {dc_path: 'abc123'})
+        ns = {
+            'run.name': 'testctr',
+            'internal.config_dc_path': None,
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        changed = _detect_config_drift(ns)
+        assert dc_path in changed
+
+    def test_new_config_file_detected(self, tmp_path):
+        """New config file not in sidecar is detected."""
+        self._make_sidecar(tmp_path, 'testctr', {})
+        rc = tmp_path / '.podrunrc'
+        rc.write_text('--user-overlay')
+        ns = {
+            'run.name': 'testctr',
+            'internal.config_dc_path': None,
+            'internal.config_rc_path': str(rc),
+            'internal.config_script_paths': [],
+        }
+        changed = _detect_config_drift(ns)
+        assert str(rc) in changed
+
+    def test_no_name_no_drift(self):
+        """No container name → empty list."""
+        ns = {
+            'run.name': None,
+            'internal.config_dc_path': None,
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        assert _detect_config_drift(ns) == []
+
+
+class TestConfigDriftPrompt:
+    """Tests for the drift prompt function."""
+
+    def test_prompt_continue(self, monkeypatch, capsys):
+        """User answers 'c' → returns 'continue'."""
+        monkeypatch.setattr('builtins.input', lambda: 'c')
+        monkeypatch.setattr('sys.stdin', type('FakeTTY', (), {'isatty': lambda self: True})())
+        result = _config_drift_prompt('testctr', ['/path/to/dc.json'], True)
+        assert result == 'continue'
+        err = capsys.readouterr().err
+        assert 'testctr' in err
+        assert '/path/to/dc.json' in err
+
+    def test_prompt_replace(self, monkeypatch, capsys):
+        """User answers 'r' → returns 'replace'."""
+        monkeypatch.setattr('builtins.input', lambda: 'r')
+        result = _config_drift_prompt('testctr', ['/path/to/dc.json'], True)
+        assert result == 'replace'
+
+    def test_prompt_quit(self, monkeypatch, capsys):
+        """User answers 'q' → returns None."""
+        monkeypatch.setattr('builtins.input', lambda: 'q')
+        result = _config_drift_prompt('testctr', ['/path/to/dc.json'], True)
+        assert result is None
+
+    def test_prompt_non_interactive(self, capsys):
+        """Non-interactive → returns 'continue' with warning."""
+        result = _config_drift_prompt('testctr', ['/path/to/dc.json'], False)
+        assert result == 'continue'
+        err = capsys.readouterr().err
+        assert 'non-interactive' in err
+        assert 'testctr' in err
+
+    def test_prompt_case_insensitive(self, monkeypatch):
+        """Uppercase answers are accepted."""
+        monkeypatch.setattr('builtins.input', lambda: 'R')
+        result = _config_drift_prompt('testctr', ['/path/to/dc.json'], True)
+        assert result == 'replace'
+
+    def test_prompt_empty_defaults_continue(self, monkeypatch):
+        """Empty input defaults to 'c' (continue)."""
+        monkeypatch.setattr('builtins.input', lambda: '')
+        result = _config_drift_prompt('testctr', ['/path/to/dc.json'], True)
+        assert result == 'continue'
+
+
+class TestCheckConfigDrift:
+    """Tests for the _check_config_drift orchestrator."""
+
+    def _make_ctx(self, ns, **kwargs):
+        return PodrunContext(
+            ns=ns,
+            trailing_args=kwargs.get('trailing_args', []),
+            explicit_command=[],
+            raw_argv=[],
+            subcmd_passthrough_args=[],
+            podman_path='podman',
+        )
+
+    def test_no_name_skips(self):
+        """No container name → returns original action unchanged."""
+        ns = {'run.name': None, 'run.user_overlay': True}
+        ctx = self._make_ctx(ns)
+        assert _check_config_drift(ctx, 'restart') == 'restart'
+
+    def test_no_user_overlay_skips(self):
+        """No user_overlay → returns original action unchanged."""
+        ns = {'run.name': 'testctr', 'run.user_overlay': None}
+        ctx = self._make_ctx(ns)
+        assert _check_config_drift(ctx, 'attach') == 'attach'
+
+    def test_no_drift_returns_action(self, tmp_path):
+        """No drift detected → returns original action unchanged."""
+        ns = {
+            'run.name': 'testctr',
+            'run.user_overlay': True,
+            'run.auto_attach': None,
+            'internal.config_dc_path': None,
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        ctx = self._make_ctx(ns)
+        assert _check_config_drift(ctx, 'restart') == 'restart'
+
+    def test_auto_attach_warns_and_proceeds(self, tmp_path, capsys):
+        """--auto-attach with drift: warns but returns original action."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        # Write sidecar with old hash
+        import json
+
+        sidecar = {'config_files': {str(dc): 'oldhash'}, 'created': '2026-04-14T10:00:00'}
+        (tmp_path / 'config_testctr.json').write_text(json.dumps(sidecar))
+        ns = {
+            'run.name': 'testctr',
+            'run.user_overlay': True,
+            'run.auto_attach': True,
+            'internal.config_dc_path': str(dc),
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        ctx = self._make_ctx(ns)
+        result = _check_config_drift(ctx, 'restart')
+        assert result == 'restart'
+        err = capsys.readouterr().err
+        assert '--auto-attach' in err
+        assert str(dc) in err
+
+    def test_interactive_replace(self, tmp_path, monkeypatch, capsys):
+        """Interactive prompt → user chooses replace."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        import json
+
+        sidecar = {'config_files': {str(dc): 'oldhash'}, 'created': '2026-04-14T10:00:00'}
+        (tmp_path / 'config_testctr.json').write_text(json.dumps(sidecar))
+        ns = {
+            'run.name': 'testctr',
+            'run.user_overlay': True,
+            'run.auto_attach': None,
+            'internal.config_dc_path': str(dc),
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        ctx = self._make_ctx(ns)
+        monkeypatch.setattr('builtins.input', lambda: 'r')
+        monkeypatch.setattr('sys.stdin', type('FakeTTY', (), {'isatty': lambda self: True})())
+        result = _check_config_drift(ctx, 'attach')
+        assert result == 'replace'
+
+    def test_interactive_quit(self, tmp_path, monkeypatch, capsys):
+        """Interactive prompt → user chooses quit."""
+        dc = tmp_path / 'devcontainer.json'
+        dc.write_text('{"image": "ubuntu"}')
+        import json
+
+        sidecar = {'config_files': {str(dc): 'oldhash'}, 'created': '2026-04-14T10:00:00'}
+        (tmp_path / 'config_testctr.json').write_text(json.dumps(sidecar))
+        ns = {
+            'run.name': 'testctr',
+            'run.user_overlay': True,
+            'run.auto_attach': None,
+            'internal.config_dc_path': str(dc),
+            'internal.config_rc_path': None,
+            'internal.config_script_paths': [],
+        }
+        ctx = self._make_ctx(ns)
+        monkeypatch.setattr('builtins.input', lambda: 'q')
+        monkeypatch.setattr('sys.stdin', type('FakeTTY', (), {'isatty': lambda self: True})())
+        result = _check_config_drift(ctx, 'restart')
+        assert result is None

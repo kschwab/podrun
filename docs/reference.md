@@ -22,6 +22,7 @@ These flags apply to all subcommands and must appear before the subcommand:
 | `--local-store-destroy` | Remove project-local store before proceeding |
 | `--nfs-remediate MODE` | NFS storage detection/remediation mode: `init` (default), `error`, `mv`, `rm`, `prompt` |
 | `--nfs-remediate-path DIR` | Base path for NFS-remediated storage (default: `/opt/podman-local-storage`) |
+| `--cleanup MODE` | Remove runtime artifacts and exit. MODE: `all`, `staging`, `cache`, `stores`. Repeatable. |
 
 ## Run Flags
 
@@ -291,6 +292,33 @@ Both flags can be set in devcontainer.json:
 
 Skipped automatically when running as a remote client (podman-remote, Windows)
 or inside a nested podrun container.
+
+## Cleanup
+
+`--cleanup MODE` removes podrun's runtime artifacts and exits without
+running any container. It works even when podman is not installed.
+
+```bash
+podrun --cleanup all                       # remove everything
+podrun --cleanup staging                   # entrypoint scripts and staging files only
+podrun --cleanup cache                     # podman flags cache only
+podrun --cleanup stores                    # idle store services and runtime dirs only
+podrun --cleanup staging --cleanup cache   # composable — multiple modes in one call
+```
+
+| Mode | What it removes |
+|------|-----------------|
+| `all` | Everything below (supersedes individual modes) |
+| `staging` | Entrypoint scripts, copy-staging, and other files under `PODRUN_TMP` |
+| `cache` | Podman flags cache (regenerated automatically on next run) |
+| `stores` | Idle local-store service daemons and their runtime directories (skips stores with active containers) |
+
+The flag is repeatable — specify multiple modes to combine them. `all`
+supersedes any individual modes. Duplicate modes are deduplicated.
+
+Staging files are never deleted automatically during normal operation.
+They persist across runs so that `podman start` on stopped named containers
+can reuse their creation-time entrypoint scripts.
 
 ## Subcommand Passthrough
 

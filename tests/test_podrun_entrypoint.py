@@ -170,6 +170,8 @@ class TestGenerateRunEntrypoint:
         assert '.git/modules/' in content
         assert 'cd "$PWD/$_git_prefix"' in content
         assert 'ln -sfn "$PWD" "$_git_parent/$_submod_path"' in content
+        # Nested submodule fix: strip intermediate /modules/ from git path
+        assert "sed 's|/modules/|/|g'" in content
 
     def test_alt_entrypoint_handling(self):
         path = generate_run_entrypoint(_default_ns())

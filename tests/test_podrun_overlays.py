@@ -1046,6 +1046,35 @@ class TestGitSubmoduleArgs:
         # depth=3, walk up /w by 3 → / (PurePosixPath.parent stops at /)
         assert args == [f'-v={root_git}:/.git:z']
 
+    def test_nested_submodule_strips_intermediate_modules(self, tmp_path):
+        """Nested submodules use modules/<name>/modules/<name>/... in git internals.
+
+        The intermediate 'modules' dirs must be stripped to compute the correct
+        filesystem depth.  simulation/cml/veil = depth 3, not 5.
+        """
+        root_git = tmp_path / 'parent' / '.git'
+        # Git stores nested submodule dirs as modules/X/modules/Y/modules/Z
+        modules_dir = root_git / 'modules' / 'simulation' / 'modules' / 'cml' / 'modules' / 'veil'
+        modules_dir.mkdir(parents=True)
+        workspace = tmp_path / 'parent' / 'simulation' / 'cml' / 'veil'
+        workspace.mkdir(parents=True)
+        (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        args = _git_submodule_args(str(workspace), '/workspaces/simulation/cml/veil')
+        # fs depth=3 (simulation/cml/veil), walk up 3 → /workspaces/.git
+        assert args == [f'-v={root_git}:/workspaces/.git:z']
+
+    def test_nested_submodule_depth_two(self, tmp_path):
+        """Two-level nested submodule: modules/a/modules/b → depth 2."""
+        root_git = tmp_path / 'parent' / '.git'
+        modules_dir = root_git / 'modules' / 'a' / 'modules' / 'b'
+        modules_dir.mkdir(parents=True)
+        workspace = tmp_path / 'parent' / 'a' / 'b'
+        workspace.mkdir(parents=True)
+        (workspace / '.git').write_text(f'gitdir: {modules_dir}\n')
+        args = _git_submodule_args(str(workspace), '/w/x/y/z')
+        # fs depth=2, walk up /w/x/y/z by 2 → /w/x/.git
+        assert args == [f'-v={root_git}:/w/x/.git:z']
+
     def test_normal_repo_returns_empty(self, tmp_path):
         workspace = tmp_path / 'project'
         workspace.mkdir()

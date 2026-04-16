@@ -2043,6 +2043,8 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         if [ -f "$PWD/.git" ]; then
           _gitdir_rel="$(sed -n 's/^gitdir: *//p' "$PWD/.git")"
           _submod_path="${{_gitdir_rel##*.git/modules/}}"
+          # Nested submodules: modules/<name>/modules/<name>/... → <name>/<name>/...
+          _submod_path="$(echo "$_submod_path" | sed 's|/modules/|/|g')"
           if [ "$_submod_path" != "$_gitdir_rel" ] && [ -n "$_submod_path" ]; then
             _git_prefix="${{_gitdir_rel%%/modules/*}}"
             _git_dir="$(cd "$PWD/$_git_prefix" 2>/dev/null && pwd)" || true
@@ -2422,12 +2424,18 @@ def _git_submodule_args(workspace_src: str, workspace_folder: str) -> list:
     root_git, subpath = _find_root_git_dir(git_dir)
     if not root_git or not subpath or not os.path.isdir(root_git):
         return []
-    # subpath is like 'modules/simulation/plato/libs'; strip 'modules/' prefix
-    # to get the submodule's repo-relative path, then compute depth.
+    # subpath is the git-internal path under .git/, e.g.:
+    #   flat:   'modules/simulation/plato/libs'
+    #   nested: 'modules/simulation/modules/cml/modules/veil'
+    # Git stores nested submodules as modules/<name>/modules/<name>/...
+    # Strip all 'modules' segments to recover the filesystem submodule path
+    # (e.g. 'simulation/cml/veil') and compute depth from that.
     if not subpath.startswith('modules/'):
         return []
-    submod_repo_path = subpath[len('modules/') :]
-    depth = len(pathlib.PurePosixPath(submod_repo_path).parts)
+    fs_parts = [p for p in pathlib.PurePosixPath(subpath).parts if p != 'modules']
+    if not fs_parts:
+        return []
+    depth = len(fs_parts)
     # Walk workspace_folder up by depth to find the container mount parent.
     # PurePosixPath.parent stops at '/' (POSIX semantics), matching how
     # ../../.. past / resolves to / in the container filesystem.

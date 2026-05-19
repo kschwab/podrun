@@ -76,13 +76,29 @@ if _IS_WINDOWS:
     GID = int(os.environ.get('PODRUN_GID', '1000'))
     UNAME = getpass.getuser()
     USER_HOME = os.path.expanduser('~')
-    PODRUN_TMP = os.path.join(tempfile.gettempdir(), f'podrun-{UNAME}', 'podrun')
 else:
     UID = os.getuid()
     GID = os.getgid()
     UNAME = pwd.getpwuid(UID).pw_name
     USER_HOME = pwd.getpwuid(UID).pw_dir
-    PODRUN_TMP = os.path.join(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/podrun-{UID}'), 'podrun')
+
+
+def _default_podrun_tmp() -> str:
+    """Per-user directory for entrypoint scripts, sidecars, and staging.
+
+    Must survive logout and power cycles — podman bakes absolute paths
+    from this directory into named-container config at creation time
+    (see ``-v <PODRUN_TMP>/entrypoint_*.sh:/.podrun/...``), so a volatile
+    location breaks ``podman start`` after a reboot.
+    """
+    if _IS_WINDOWS:
+        base = os.environ.get('LOCALAPPDATA') or USER_HOME
+        return os.path.join(base, 'podrun', 'state')
+    base = os.environ.get('XDG_STATE_HOME') or os.path.join(USER_HOME, '.local', 'state')
+    return os.path.join(base, 'podrun')
+
+
+PODRUN_TMP = _default_podrun_tmp()
 PODRUN_RC_PATH = '/.podrun/rc.sh'
 PODRUN_ENTRYPOINT_PATH = '/.podrun/run-entrypoint.sh'
 PODRUN_EXEC_ENTRY_PATH = '/.podrun/exec-entrypoint.sh'
@@ -1266,7 +1282,12 @@ def _read_config_sidecar(name: str) -> Optional[dict]:
 def _detect_config_drift(ns: dict) -> List[str]:
     """Compare current config file hashes against stored sidecar.
 
-    Returns a list of changed file paths (empty = no drift).
+    Returns a list of changed file paths (empty = no drift).  The sidecar
+    is the source of truth — only files recorded at container-creation
+    time are checked.  Current-CWD discovery (e.g. a parent-directory
+    ``.devcontainer.json`` surfaced by ``find_devcontainer_json()`` when
+    attaching from a different directory) is intentionally ignored; that
+    is CLI context, not drift against the baked config.
     """
     name = ns.get('run.name')
     if not name:
@@ -1278,28 +1299,10 @@ def _detect_config_drift(ns: dict) -> List[str]:
 
     stored_files = sidecar.get('config_files', {})
     changed: List[str] = []
-
-    # Check stored files for modifications or deletions
     for path, stored_hash in stored_files.items():
         current_hash = _hash_file(path)
         if current_hash != stored_hash:
             changed.append(path)
-
-    # Check for new config files not in sidecar
-    current_paths: List[str] = []
-    dc_path = ns.get('internal.config_dc_path')
-    if dc_path:
-        current_paths.append(dc_path)
-    rc_path = ns.get('internal.config_rc_path')
-    if rc_path:
-        current_paths.append(rc_path)
-    for sp in ns.get('internal.config_script_paths') or []:
-        current_paths.append(os.path.abspath(sp))
-
-    for cp in current_paths:
-        if cp not in stored_files:
-            changed.append(cp)
-
     return changed
 
 
@@ -1380,6 +1383,29 @@ def _check_config_drift(ctx: 'PodrunContext', action: str) -> Optional[str]:
 def _passthrough_has_flag(pt, prefix):
     """Return True if any arg in *pt* starts with *prefix* (e.g. ``--userns``)."""
     return any(a == prefix or a.startswith(prefix + '=') for a in pt)
+
+
+def _passthrough_flag_value(pt, *prefixes):
+    """Return the value of a flag from *pt*, or ``None`` if absent.
+
+    Handles ``--flag=VAL``, ``--flag VAL``, ``-f=VAL``, and ``-f VAL`` forms.
+    When multiple *prefixes* are given (e.g. ``'-w', '--workdir'``), the last
+    match wins.
+    """
+    value = None
+    i = 0
+    while i < len(pt):
+        arg = pt[i]
+        for prefix in prefixes:
+            if arg.startswith(prefix + '='):
+                value = arg.split('=', 1)[1]
+                break
+            if arg == prefix and i + 1 < len(pt):
+                value = pt[i + 1]
+                i += 1
+                break
+        i += 1
+    return value
 
 
 def _passthrough_has_exact(pt, value):
@@ -2475,7 +2501,7 @@ def _host_overlay_args(ns, pt):
     # Auto workspace: only when -w is not already in passthrough (from dc_run_args
     # or devcontainer CLI).  When -w is present, the workspace is already configured.
     if not _passthrough_has_flag(pt, '-w') and not _passthrough_has_flag(pt, '--workdir'):
-        workspace_folder = ns.get('dc.workspace_folder') or '/app'
+        workspace_folder = ns.get('dc.workspace_folder') or ns['run.default_workdir']
         if workspace_folder not in _volume_mount_destinations(pt):
             args.append(f'-v={pathlib.Path.cwd()}:{workspace_folder}:z')
         args.append(f'-w={workspace_folder}')
@@ -2543,8 +2569,10 @@ def _copy_staging_args(items: list, chmod_map: Optional[dict] = None) -> list:
             args.append(f'-v={daemon_staging_dir}:{container_staging}:ro,z')
         elif os.path.isdir(host_path):
             # Directory: bind-mount the host dir as staging/data (two mounts).
-            # In nested-remote mode, _translate_nested_volume_sources will
-            # rewrite host_path to the daemon-visible source.
+            # Pre-create data/ in staging so the nested mount has an existing
+            # target — the parent is mounted :ro, so crun cannot mkdir inside it.
+            data_dir = os.path.join(staging_dir, 'data')
+            pathlib.Path(data_dir).mkdir(exist_ok=True)
             args.append(f'-v={daemon_staging_dir}:{container_staging}:ro,z')
             args.append(f'-v={host_path}:{container_staging}/data:ro,z')
     return args
@@ -2630,7 +2658,12 @@ def _env_args(ns):
     args.append(f'--env={ENV_PODRUN_OVERLAYS}={overlay_str}')
 
     if ns.get('run.host_overlay'):
-        workspace_folder = ns.get('dc.workspace_folder') or '/app'
+        pt = ns.get('run.passthrough_args') or []
+        workspace_folder = (
+            _passthrough_flag_value(pt, '-w', '--workdir')
+            or ns.get('dc.workspace_folder')
+            or ns['run.default_workdir']
+        )
         args.append(f'--env={ENV_PODRUN_WORKDIR}={workspace_folder}')
     if ns.get('run.shell'):
         args.append(f'--env={ENV_PODRUN_SHELL}={ns["run.shell"]}')
@@ -3449,6 +3482,7 @@ _RUN_CONFIG_MAP = {
     'promptBanner': 'run.prompt_banner',
     'autoAttach': 'run.auto_attach',
     'autoReplace': 'run.auto_replace',
+    'defaultWorkdir': 'run.default_workdir',
     'fuseOverlayfs': 'run.fuse_overlayfs',
     'dotFilesOverlay': 'run.dot_files_overlay',
     'noAutoResolveGitSubmodules': 'run.no_auto_resolve_git_submodules',
@@ -3713,14 +3747,17 @@ def _collect_script_config(ctx: 'PodrunContext', podrun_cfg, flags) -> Tuple[dic
     return ns_dict, pt, script_paths
 
 
-def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns, rc_ns=None):
+def _apply_run_specifics(
+    ns, ctx: Optional['PodrunContext'] = None, dc_ns=None, script_ns=None, rc_ns=None
+):
     """Apply run-subcommand-specific merges: overlays, image fallback, exports.
 
     All dc top-level fields are already resolved to ``ns['dc.*']`` by
     ``resolve_config`` before this function is called.
     """
-    if rc_ns is None:
-        rc_ns = {}
+    dc_ns = dc_ns or {}
+    script_ns = script_ns or {}
+    rc_ns = rc_ns or {}
 
     # Overlay implication chain: adhoc→session→host+interactive+dotfiles→user
     if ns.get('run.adhoc'):
@@ -3744,8 +3781,12 @@ def _apply_run_specifics(ns, ctx: 'PodrunContext', dc_ns, script_ns, rc_ns=None)
 
     # Image/command resolution: CLI trailing > devcontainer image
     dc_image = ns.get('dc.image')
-    if not ctx.trailing_args and dc_image:
+    if ctx is not None and not ctx.trailing_args and dc_image:
         ctx.trailing_args = [dc_image]
+
+    # Default workdir: /app unless overridden by --default-workdir or config.
+    if not ns.get('run.default_workdir'):
+        ns['run.default_workdir'] = '/app'
 
     # Exports append: rc + dc + script + cli, with tilde expansion
     rc_exports = rc_ns.get('run.export') or []
@@ -4295,6 +4336,13 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         action='store_true',
         default=None,
         help='Auto replace named container if already running',
+    )
+    opts.add_argument(
+        '--default-workdir',
+        dest='run.default_workdir',
+        default=None,
+        metavar='DIR',
+        help='Set the auto-mount workspace directory (default: /app)',
     )
     opts.add_argument(
         '--export',
@@ -5466,7 +5514,7 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     # Set workspace defaults for _host_overlay_args
     if ns.get('run.host_overlay'):
         if not ns.get('dc.workspace_folder'):
-            ns['dc.workspace_folder'] = '/app'
+            ns['dc.workspace_folder'] = ns['run.default_workdir']
 
     # Container state management
     # For --print-cmd, allow prompts so the printed command reflects the user's choice.

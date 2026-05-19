@@ -19,6 +19,7 @@ from podrun.podrun import (
     UNAME,
     _DOTFILES,
     _OVERLAY_FIELDS,
+    _apply_run_specifics,
     _copy_staging_args,
     _extract_passthrough_user,
     _dot_files_overlay_args,
@@ -43,6 +44,13 @@ from podrun.podrun import (
 
 
 pytestmark = pytest.mark.usefixtures('podman_binary')
+
+
+def _ns(**overrides):
+    """Build a minimal ns dict with run defaults applied."""
+    ns = dict(overrides)
+    _apply_run_specifics(ns)
+    return ns
 
 
 # ---------------------------------------------------------------------------
@@ -210,31 +218,31 @@ class TestHostOverlayArgs:
     def test_hostname(self):
         import platform
 
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         hostname_args = [a for a in args if a.startswith('--hostname=')]
         assert len(hostname_args) == 1
         assert hostname_args[0] == f'--hostname={platform.node()}'
 
     def test_hostname_not_added_if_present(self):
-        args = _host_overlay_args({}, ['--hostname=custom'])
+        args = _host_overlay_args(_ns(), ['--hostname=custom'])
         hostname_args = [a for a in args if a.startswith('--hostname=')]
         assert len(hostname_args) == 0
 
     def test_network_host(self):
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert '--network=host' in args
 
     def test_network_not_added_if_present(self):
-        args = _host_overlay_args({}, ['--network=bridge'])
+        args = _host_overlay_args(_ns(), ['--network=bridge'])
         assert '--network=host' not in args
 
     def test_seccomp_unconfined(self):
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert '--security-opt=seccomp=unconfined' in args
 
     def test_no_init(self):
         """--init is in interactive overlay, not host overlay."""
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert '--init' not in args
 
     def test_workspace_volume_auto(self):
@@ -257,19 +265,50 @@ class TestHostOverlayArgs:
         assert not any(a.startswith('-w=') for a in args)
         assert not any(a.startswith('-v=') and '/app' in a for a in args)
 
+    def test_default_workdir(self):
+        """--default-workdir overrides the default /app workspace folder."""
+        ns = {'run.default_workdir': '/vscodegen'}
+        args = _host_overlay_args(ns, [])
+        cwd = str(pathlib.Path.cwd())
+        assert f'-v={cwd}:/vscodegen:z' in args
+        assert '-w=/vscodegen' in args
+
+    def test_default_workdir_dc_precedence(self):
+        """dc.workspace_folder takes precedence over --default-workdir."""
+        ns = {'run.default_workdir': '/override', 'dc.workspace_folder': '/dc-work'}
+        args = _host_overlay_args(ns, [])
+        cwd = str(pathlib.Path.cwd())
+        assert f'-v={cwd}:/dc-work:z' in args
+        assert '-w=/dc-work' in args
+
+    def test_default_workdir_dc(self):
+        """dc.workspace_folder used when --default-workdir is not set."""
+        ns = {'dc.workspace_folder': '/dc-work'}
+        args = _host_overlay_args(ns, [])
+        cwd = str(pathlib.Path.cwd())
+        assert f'-v={cwd}:/dc-work:z' in args
+        assert '-w=/dc-work' in args
+
+    def test_default_workdir_skipped_when_w_in_passthrough(self):
+        """--default-workdir has no effect when -w is in passthrough."""
+        ns = {'run.default_workdir': '/vscodegen'}
+        args = _host_overlay_args(ns, ['-w=/manual'])
+        assert not any(a.startswith('-w=') for a in args)
+        assert not any(a.startswith('-v=') and '/vscodegen' in a for a in args)
+
     def test_term_env(self):
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert '--env=TERM=xterm-256color' in args
 
     def test_default_workspace_folder(self):
-        """No dc.workspace_folder → defaults to /app."""
-        args = _host_overlay_args({}, [])
+        """No dc.workspace_folder → defaults to /app via run.default_workdir."""
+        args = _host_overlay_args(_ns(), [])
         assert '-w=/app' in args
         cwd = str(pathlib.Path.cwd())
         assert f'-v={cwd}:/app:z' in args
 
     def test_localtime_mount(self):
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         if os.path.exists('/etc/localtime'):
             assert '-v=/etc/localtime:/etc/localtime:ro' in args
 
@@ -389,6 +428,14 @@ class TestCopyStagingArgs:
         # Verify target file
         staging_path = args[0].split('=')[1].split(':')[0]
         assert open(os.path.join(staging_path, '.podrun_target')).read() == '/home/user/.ssh'
+
+    def test_dir_staging_precreates_data_subdir(self, tmp_path):
+        """data/ must exist in staging so crun doesn't need mkdir inside :ro mount."""
+        d = tmp_path / 'ssh'
+        d.mkdir()
+        args = _copy_staging_args([(str(d), '/home/user/.ssh')])
+        staging_path = args[0].split('=')[1].split(':')[0]
+        assert os.path.isdir(os.path.join(staging_path, 'data'))
 
     def test_empty_items(self):
         assert _copy_staging_args([]) == []
@@ -572,7 +619,7 @@ class TestPodmanRemoteArgs:
 
 class TestEnvArgs:
     def test_overlay_tokens(self):
-        ns = {'run.user_overlay': True, 'run.host_overlay': True}
+        ns = _ns(**{'run.user_overlay': True, 'run.host_overlay': True})
         args = _env_args(ns)
         overlay_arg = [a for a in args if 'PODRUN_OVERLAYS=' in a]
         assert len(overlay_arg) == 1
@@ -591,7 +638,7 @@ class TestEnvArgs:
         assert 'dotfiles' in overlay_arg
 
     def test_workdir_env(self):
-        ns = {'run.host_overlay': True, 'dc.workspace_folder': '/work'}
+        ns = {'run.host_overlay': True, 'run.default_workdir': '/work'}
         args = _env_args(ns)
         assert '--env=PODRUN_WORKDIR=/work' in args
 
@@ -644,6 +691,55 @@ class TestEnvArgs:
         args = _env_args({})
         dc_args = [a for a in args if 'DEVCONTAINER_CLI' in a]
         assert dc_args == []
+
+    def test_workdir_default_workdir(self):
+        """--default-workdir overrides the default /app in PODRUN_WORKDIR."""
+        ns = {'run.host_overlay': True, 'run.default_workdir': '/vscodegen'}
+        args = _env_args(ns)
+        assert '--env=PODRUN_WORKDIR=/vscodegen' in args
+
+    def test_workdir_dc_overrides_default_workdir(self):
+        """dc.workspace_folder takes precedence over --default-workdir."""
+        ns = {
+            'run.host_overlay': True,
+            'run.default_workdir': '/override',
+            'dc.workspace_folder': '/dc-work',
+        }
+        args = _env_args(ns)
+        assert '--env=PODRUN_WORKDIR=/dc-work' in args
+
+    def test_workdir_dc_workspace_folder(self):
+        """dc.workspace_folder used when --default-workdir is not set."""
+        ns = {'run.host_overlay': True, 'dc.workspace_folder': '/dc-work'}
+        args = _env_args(ns)
+        assert '--env=PODRUN_WORKDIR=/dc-work' in args
+
+    def test_workdir_default_without_default_workdir(self):
+        """run.default_workdir (/app) used when dc.workspace_folder is not set."""
+        ns = {'run.host_overlay': True, 'run.default_workdir': '/app'}
+        args = _env_args(ns)
+        assert '--env=PODRUN_WORKDIR=/app' in args
+
+    def test_workdir_passthrough_w_wins(self):
+        """-w in passthrough takes precedence over all other sources."""
+        ns = {
+            'run.host_overlay': True,
+            'run.default_workdir': '/default',
+            'dc.workspace_folder': '/dc',
+            'run.passthrough_args': ['-w', '/hello'],
+        }
+        args = _env_args(ns)
+        assert '--env=PODRUN_WORKDIR=/hello' in args
+
+    def test_workdir_passthrough_workdir_equals(self):
+        """--workdir= form in passthrough wins."""
+        ns = {
+            'run.host_overlay': True,
+            'run.default_workdir': '/default',
+            'run.passthrough_args': ['--workdir=/explicit'],
+        }
+        args = _env_args(ns)
+        assert '--env=PODRUN_WORKDIR=/explicit' in args
 
 
 # ---------------------------------------------------------------------------
@@ -897,20 +993,20 @@ class TestGitSubmoduleOverlay:
     def test_normal_repo_no_git_mount(self):
         """.git is a directory → no .git mount in args."""
         (self.workspace / '.git').mkdir()
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert not any('.git' in a and a.startswith('-v=') for a in args)
 
     def test_submodule_mounts_root_git(self):
         """.git file with valid gitdir → root .git/ mounted."""
         self._make_submodule()
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         # Default workspace is /app, depth=1 → mount at /.git
         assert f'-v={self.root_git}:/.git:z' in args
 
     def test_submodule_no_env_vars(self):
         """Submodule mount emits no GIT_DIR/GIT_WORK_TREE/GIT_CEILING_DIRECTORIES."""
         self._make_submodule()
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert not any('--env=GIT_DIR' in a for a in args)
         assert not any('--env=GIT_WORK_TREE' in a for a in args)
         assert not any('--env=GIT_CEILING' in a for a in args)
@@ -918,26 +1014,26 @@ class TestGitSubmoduleOverlay:
     def test_submodule_only_one_arg(self):
         """Submodule detection emits exactly one arg (the mount)."""
         self._make_submodule()
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         git_args = [a for a in args if '.git' in a and a.startswith('-v=')]
         assert len(git_args) == 1
 
     def test_broken_gitdir_pointer_skipped(self):
         """.git file pointing to nonexistent path → no mount."""
         (self.workspace / '.git').write_text('gitdir: /nonexistent/path\n')
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert not any('.git' in a and a.startswith('-v=') for a in args)
 
     def test_no_dot_git_skipped(self):
         """No .git at all → no mount."""
         (self.workspace / '.git').unlink(missing_ok=True)
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert not any('.git' in a and a.startswith('-v=') for a in args)
 
     def test_non_gitdir_file_skipped(self):
         """.git file without gitdir: prefix → no mount."""
         (self.workspace / '.git').write_text('random content\n')
-        args = _host_overlay_args({}, [])
+        args = _host_overlay_args(_ns(), [])
         assert not any('.git' in a and a.startswith('-v=') for a in args)
 
     def test_workspace_mount_submodule_via_dc(self, tmp_path):
@@ -973,7 +1069,7 @@ class TestGitSubmoduleOverlay:
     def test_no_auto_resolve_flag_skips_host_overlay(self):
         """--no-auto-resolve-git-submodules prevents mount in host overlay."""
         self._make_submodule()
-        args = _host_overlay_args({'run.no_auto_resolve_git_submodules': True}, [])
+        args = _host_overlay_args(_ns(**{'run.no_auto_resolve_git_submodules': True}), [])
         assert not any('.git' in a and a.startswith('-v=') for a in args)
 
     def test_no_auto_resolve_flag_skips_dc(self, tmp_path):

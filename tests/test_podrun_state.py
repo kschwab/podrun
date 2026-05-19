@@ -721,8 +721,13 @@ class TestConfigDrift:
         changed = _detect_config_drift(ns)
         assert dc_path in changed
 
-    def test_new_config_file_detected(self, tmp_path):
-        """New config file not in sidecar is detected."""
+    def test_new_config_file_ignored(self, tmp_path):
+        """Config files discovered at attach time but not in the sidecar are ignored.
+
+        The sidecar is the source of truth — a parent-directory
+        ``.devcontainer.json`` that ``find_devcontainer_json()`` surfaces
+        from a different CWD must not be flagged as drift.
+        """
         self._make_sidecar(tmp_path, 'testctr', {})
         rc = tmp_path / '.podrunrc'
         rc.write_text('--user-overlay')
@@ -732,8 +737,7 @@ class TestConfigDrift:
             'internal.config_rc_path': str(rc),
             'internal.config_script_paths': [],
         }
-        changed = _detect_config_drift(ns)
-        assert str(rc) in changed
+        assert _detect_config_drift(ns) == []
 
     def test_no_name_no_drift(self):
         """No container name → empty list."""

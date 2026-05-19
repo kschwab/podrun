@@ -23,12 +23,14 @@ from podrun.podrun import (
     PODRUN_HOST_TMP_MOUNT,
     _config_sidecar_path,
     _daemon_dir,
+    _default_podrun_tmp,
     _expand_export_tilde,
     _extract_passthrough_entrypoint,
     _hash_file,
     _parse_export,
     _parse_image_ref,
     _passthrough_has_exact,
+    _passthrough_flag_value,
     _passthrough_has_flag,
     _passthrough_has_short_flag,
     _process_volume_args,
@@ -80,6 +82,45 @@ class TestConstants:
         """_OVERLAY_FIELDS should use run.* ns-dict keys, not bare field names."""
         for ns_key, _token in _OVERLAY_FIELDS:
             assert ns_key.startswith('run.'), f'{ns_key} missing run. prefix'
+
+
+# ---------------------------------------------------------------------------
+# _default_podrun_tmp
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultPodrunTmp:
+    def test_linux_xdg_state_home_set(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', False)
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        assert _default_podrun_tmp() == os.path.join(str(tmp_path), 'podrun')
+
+    def test_linux_xdg_state_home_unset(self, monkeypatch):
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', False)
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', '/home/alice')
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        assert _default_podrun_tmp() == '/home/alice/.local/state/podrun'
+
+    def test_linux_does_not_use_xdg_runtime_dir(self, monkeypatch):
+        """Prior behavior used $XDG_RUNTIME_DIR (volatile). Must not regress."""
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', False)
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', '/home/bob')
+        monkeypatch.setenv('XDG_RUNTIME_DIR', '/run/user/1000')
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        result = _default_podrun_tmp()
+        assert '/run/user' not in result
+        assert result == '/home/bob/.local/state/podrun'
+
+    def test_windows_localappdata_set(self, monkeypatch):
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', True)
+        monkeypatch.setenv('LOCALAPPDATA', r'C:\Users\x\AppData\Local')
+        assert _default_podrun_tmp() == os.path.join(r'C:\Users\x\AppData\Local', 'podrun', 'state')
+
+    def test_windows_localappdata_unset(self, monkeypatch):
+        monkeypatch.setattr(podrun_mod, '_IS_WINDOWS', True)
+        monkeypatch.setattr(podrun_mod, 'USER_HOME', r'C:\Users\x')
+        monkeypatch.delenv('LOCALAPPDATA', raising=False)
+        assert _default_podrun_tmp() == os.path.join(r'C:\Users\x', 'podrun', 'state')
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +314,38 @@ class TestPassthroughHasFlag:
     def test_partial_no_match(self):
         """--userns-foo should not match --userns (no = or exact)."""
         assert not _passthrough_has_flag(['--userns-foo'], '--userns')
+
+
+class TestPassthroughFlagValue:
+    def test_long_equals(self):
+        assert _passthrough_flag_value(['--workdir=/app'], '--workdir') == '/app'
+
+    def test_long_space(self):
+        assert _passthrough_flag_value(['--workdir', '/app'], '--workdir') == '/app'
+
+    def test_short_equals(self):
+        assert _passthrough_flag_value(['-w=/app'], '-w') == '/app'
+
+    def test_short_space(self):
+        assert _passthrough_flag_value(['-w', '/app'], '-w') == '/app'
+
+    def test_not_found(self):
+        assert _passthrough_flag_value(['--network=host'], '-w', '--workdir') is None
+
+    def test_empty(self):
+        assert _passthrough_flag_value([], '-w') is None
+
+    def test_multiple_prefixes(self):
+        assert _passthrough_flag_value(['-w', '/foo'], '-w', '--workdir') == '/foo'
+        assert _passthrough_flag_value(['--workdir=/bar'], '-w', '--workdir') == '/bar'
+
+    def test_last_wins(self):
+        pt = ['-w', '/first', '--workdir=/second']
+        assert _passthrough_flag_value(pt, '-w', '--workdir') == '/second'
+
+    def test_space_form_at_end(self):
+        """Space form with no following value returns None."""
+        assert _passthrough_flag_value(['-w'], '-w') is None
 
 
 class TestPassthroughHasExact:

@@ -362,6 +362,14 @@ class TestBuildRunParser:
         ns, _ = self._parse_run(['--auto-replace'])
         assert ns['run.auto_replace'] is True
 
+    def test_default_workdir(self):
+        ns, _ = self._parse_run(['--default-workdir', '/vscodegen'])
+        assert ns['run.default_workdir'] == '/vscodegen'
+
+    def test_default_workdir_default(self):
+        ns, _ = self._parse_run([])
+        assert ns['run.default_workdir'] is None
+
     def test_export_append(self):
         ns, _ = self._parse_run(['--export', '/a:/b', '--export', '/c:/d:0'])
         assert ns['run.export'] == ['/a:/b', '/c:/d:0']

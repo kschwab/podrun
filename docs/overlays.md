@@ -114,6 +114,14 @@ Use `--name` for a stable container name:
 podrun run --session --name mydev ubuntu:24.04
 ```
 
+If you don't pass `--name`, podrun assigns a **deterministic** name derived from
+the project root and image (e.g. `podrun_myproject_ubuntu-24.04_a1b2c3d4e5f6`), so
+re-running the same session in the same project converges on one container
+rather than spawning a new anonymous one each time. This is the
+`--auto-name-session` feature (on by default); disable it with
+`--no-auto-name-session` or override it with `--name`. See
+[Reference — Auto Session Naming](reference.md#auto-session-naming).
+
 When you exit, the container stops but is preserved — you can inspect it,
 copy files out, or check logs. Re-running the same command prompts you to
 replace the stopped container with a fresh one.

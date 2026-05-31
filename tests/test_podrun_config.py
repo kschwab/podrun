@@ -4,9 +4,11 @@ import os
 import pytest
 
 from podrun.podrun import (
+    _auto_session_name,
     _config_split,
     _devcontainer_project_dir,
     _devcontainer_to_ns,
+    _inject_dc_workspace,
     _expand_devcontainer_vars,
     _resolve_dc_fields,
     _strip_jsonc,
@@ -1681,12 +1683,27 @@ class TestWorkspaceMount:
         assert f'source={tmp_project}' in mount
 
     def test_workspace_folder_fallback(self, monkeypatch, tmp_project):
-        """No workspaceMount → existing workspaceFolder behavior."""
+        """No workspaceMount → auto-workspace fills one in for the folder."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
         dc_file.write_text(json.dumps({'image': 'alpine', 'workspaceFolder': '/myworkspace'}))
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/myworkspace'
+        # auto-devcontainer-workspace (on by default) supplies the missing mount
+        assert r.ns.get('dc.workspace_mount') == (
+            f'source={tmp_project},target=/myworkspace,type=bind'
+        )
+
+    def test_workspace_folder_fallback_no_auto(self, monkeypatch, tmp_project):
+        """--no-auto-devcontainer-workspace → folder without mount stays unfilled."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'workspaceFolder': '/myworkspace'}))
+        r = self._resolve(
+            ['run', '--no-auto-devcontainer-workspace'], monkeypatch, dc_json_path=dc_file
+        )
         assert r.ns.get('dc.workspace_folder') == '/myworkspace'
         assert r.ns.get('dc.workspace_mount') is None
 
@@ -2257,3 +2274,289 @@ class TestDcNameBridge:
         expected = f'{tmp_project.name}-dev'
         assert r.ns.get('dc.name') == expected
         assert r.ns.get('run.name') == expected
+
+
+# ---------------------------------------------------------------------------
+# TestAutoDevcontainerWorkspace
+# ---------------------------------------------------------------------------
+
+
+class TestAutoDevcontainerWorkspace:
+    """--auto-devcontainer-workspace: fill missing workspaceFolder/workspaceMount."""
+
+    def _resolve(self, argv, monkeypatch, dc_json_path=None):
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
+        )
+        result = parse_args(argv)
+        return resolve_config(result)
+
+    def _write_dc(self, tmp_project, payload):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps(payload))
+        return dc_file
+
+    def test_injects_both_when_neither_present(self, monkeypatch, tmp_project):
+        """Neither field → folder defaults to /app, mount binds the project root."""
+        dc_file = self._write_dc(tmp_project, {'image': 'alpine'})
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/app'
+        assert r.ns.get('dc.workspace_mount') == (f'source={tmp_project},target=/app,type=bind')
+
+    def test_respects_default_workdir(self, monkeypatch, tmp_project):
+        """--default-workdir is honored as the injected workspaceFolder."""
+        dc_file = self._write_dc(tmp_project, {'image': 'alpine'})
+        r = self._resolve(
+            ['run', '--default-workdir', '/workspace'], monkeypatch, dc_json_path=dc_file
+        )
+        assert r.ns.get('dc.workspace_folder') == '/workspace'
+        assert r.ns.get('dc.workspace_mount') == (
+            f'source={tmp_project},target=/workspace,type=bind'
+        )
+
+    def test_folder_only_fills_mount(self, monkeypatch, tmp_project):
+        """workspaceFolder present, mount missing → mount auto-filled to that folder."""
+        dc_file = self._write_dc(tmp_project, {'image': 'alpine', 'workspaceFolder': '/custom'})
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/custom'
+        assert r.ns.get('dc.workspace_mount') == (f'source={tmp_project},target=/custom,type=bind')
+
+    def test_mount_only_leaves_it(self, monkeypatch, tmp_project):
+        """workspaceMount present, folder missing → folder derived from mount, no override."""
+        dc_file = self._write_dc(
+            tmp_project,
+            {'image': 'alpine', 'workspaceMount': 'source=/host,target=/m,type=bind'},
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/m'
+        # Existing mount left intact (source not rewritten to project root)
+        assert r.ns.get('dc.workspace_mount') == 'source=/host,target=/m,type=bind'
+
+    def test_both_present_no_change(self, monkeypatch, tmp_project):
+        """Both fields present → nothing injected/overwritten."""
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'workspaceFolder': '/wf',
+                'workspaceMount': 'source=/host,target=/wf,type=bind',
+            },
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_folder') == '/wf'
+        assert r.ns.get('dc.workspace_mount') == 'source=/host,target=/wf,type=bind'
+
+    def test_empty_mount_disables_injection(self, monkeypatch, tmp_project):
+        """An explicitly-empty workspaceMount is respected (no injection)."""
+        dc_file = self._write_dc(tmp_project, {'image': 'alpine', 'workspaceMount': ''})
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_mount') == ''
+
+    def test_disabled_via_flag(self, monkeypatch, tmp_project):
+        """--no-auto-devcontainer-workspace suppresses injection entirely."""
+        dc_file = self._write_dc(tmp_project, {'image': 'alpine'})
+        r = self._resolve(
+            ['run', '--no-auto-devcontainer-workspace'], monkeypatch, dc_json_path=dc_file
+        )
+        assert r.ns.get('dc.workspace_folder') is None
+        assert r.ns.get('dc.workspace_mount') is None
+
+    def test_disabled_via_config(self, monkeypatch, tmp_project):
+        """customizations.podrun.autoDevcontainerWorkspace=false suppresses injection."""
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'customizations': {'podrun': {'autoDevcontainerWorkspace': False}},
+            },
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('dc.workspace_mount') is None
+
+    def test_cli_overrides_config_false(self, monkeypatch, tmp_project):
+        """CLI --auto-devcontainer-workspace overrides a config false."""
+        dc_file = self._write_dc(
+            tmp_project,
+            {
+                'image': 'alpine',
+                'customizations': {'podrun': {'autoDevcontainerWorkspace': False}},
+            },
+        )
+        r = self._resolve(
+            ['run', '--auto-devcontainer-workspace'], monkeypatch, dc_json_path=dc_file
+        )
+        assert r.ns.get('dc.workspace_mount') == (f'source={tmp_project},target=/app,type=bind')
+
+    def test_skipped_when_dc_from_cli(self, monkeypatch, tmp_project):
+        """No injection when the devcontainer CLI is driving."""
+        dc_file = self._write_dc(tmp_project, {'image': 'alpine'})
+        r = self._resolve(
+            ['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'],
+            monkeypatch,
+        )
+        assert r.ns.get('internal.dc_from_cli') is True
+        assert r.ns.get('dc.workspace_mount') is None
+
+    def test_no_devcontainer_no_injection(self, monkeypatch):
+        """No devcontainer present → nothing injected."""
+        r = self._resolve(['run', 'alpine'], monkeypatch, dc_json_path=None)
+        assert r.ns.get('dc.workspace_mount') is None
+
+    def test_helper_noop_without_dc(self):
+        """_inject_dc_workspace is a no-op for an empty dc dict."""
+        ns = {}
+        _inject_dc_workspace({}, None, ns, {}, {}, {})
+        assert ns == {}
+
+
+# ---------------------------------------------------------------------------
+# TestAutoNameSession
+# ---------------------------------------------------------------------------
+
+
+class TestAutoNameSession:
+    """--auto-name-session: deterministic naming for unnamed session runs."""
+
+    def _resolve(self, argv, monkeypatch, dc_json_path=None):
+        monkeypatch.setattr(
+            podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
+        )
+        result = parse_args(argv)
+        return resolve_config(result)
+
+    def test_session_gets_auto_name(self, monkeypatch):
+        r = self._resolve(['run', '--session', 'ubuntu:24.04'], monkeypatch)
+        name = r.ns.get('run.name')
+        assert name and name.startswith('podrun_')
+
+    def test_name_includes_readable_image_label(self, monkeypatch):
+        """name:tag appears in the name with ':' rendered as '-'."""
+        r = self._resolve(['run', '--session', 'ubuntu:24.04'], monkeypatch)
+        name = r.ns['run.name']
+        # podrun_<proj>_ubuntu-24.04_<sha12>
+        assert '_ubuntu-24.04_' in name
+        assert name.split('_')[-1] != ''  # trailing sha present
+
+    def test_name_drops_registry_host(self, monkeypatch):
+        """Fully-qualified ref → registry host dropped, name+tag retained."""
+        r = self._resolve(
+            ['run', '--session', 'registry.example.com/team/app:40.2'], monkeypatch
+        )
+        name = r.ns['run.name']
+        assert 'team-app-40.2' in name
+        assert 'registry.example.com' not in name
+
+    def test_name_is_deterministic(self, monkeypatch):
+        r1 = self._resolve(['run', '--session', 'ubuntu:24.04'], monkeypatch)
+        r2 = self._resolve(['run', '--session', 'ubuntu:24.04'], monkeypatch)
+        assert r1.ns['run.name'] == r2.ns['run.name']
+
+    def test_different_image_different_name(self, monkeypatch):
+        r1 = self._resolve(['run', '--session', 'ubuntu:24.04'], monkeypatch)
+        r2 = self._resolve(['run', '--session', 'alpine:3'], monkeypatch)
+        assert r1.ns['run.name'] != r2.ns['run.name']
+
+    def test_adhoc_not_named(self, monkeypatch):
+        """--adhoc is throwaway (--rm) → no auto name."""
+        r = self._resolve(['run', '--adhoc', 'ubuntu:24.04'], monkeypatch)
+        assert r.ns.get('run.name') is None
+
+    def test_non_session_overlay_not_named(self, monkeypatch):
+        """Plain --user-overlay (no session) → no auto name."""
+        r = self._resolve(['run', '--user-overlay', 'ubuntu:24.04'], monkeypatch)
+        assert r.ns.get('run.name') is None
+
+    def test_explicit_name_wins(self, monkeypatch):
+        r = self._resolve(['run', '--session', '--name', 'mine', 'ubuntu:24.04'], monkeypatch)
+        assert r.ns['run.name'] == 'mine'
+
+    def test_disabled_via_flag(self, monkeypatch):
+        r = self._resolve(
+            ['run', '--session', '--no-auto-name-session', 'ubuntu:24.04'], monkeypatch
+        )
+        assert r.ns.get('run.name') is None
+
+    def test_disabled_via_config(self, monkeypatch, tmp_project):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'session': True, 'autoNameSession': False}},
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('run.name') is None
+
+    def test_cli_overrides_config_false(self, monkeypatch, tmp_project):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'session': True, 'autoNameSession': False}},
+                }
+            )
+        )
+        r = self._resolve(['run', '--auto-name-session'], monkeypatch, dc_json_path=dc_file)
+        assert (r.ns.get('run.name') or '').startswith('podrun_')
+
+    def test_dc_name_wins_over_auto(self, monkeypatch, tmp_project):
+        """A devcontainer top-level name takes precedence over auto-naming."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'name': 'fromdc',
+                    'customizations': {'podrun': {'session': True}},
+                }
+            )
+        )
+        r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('run.name') == 'fromdc'
+
+    def test_skipped_when_dc_from_cli(self, monkeypatch, tmp_project):
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps({'image': 'alpine', 'customizations': {'podrun': {'session': True}}})
+        )
+        r = self._resolve(
+            ['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'],
+            monkeypatch,
+        )
+        assert r.ns.get('internal.dc_from_cli') is True
+        assert r.ns.get('run.name') is None
+
+    def test_name_satisfies_podman_grammar(self, monkeypatch):
+        r = self._resolve(['run', '--session', 'ubuntu:24.04'], monkeypatch)
+        import re as _re
+
+        assert _re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', r.ns['run.name'])
+
+    def test_helper_returns_none_without_image(self):
+        ctx = parse_args(['run', '--session'])
+        assert _auto_session_name(ctx.ns, ctx) is None
+
+    def test_helper_sanitizes_basename(self, monkeypatch, tmp_path):
+        """Non-alnum chars in the project basename are sanitized."""
+        weird = tmp_path / 'my proj@!'
+        weird.mkdir()
+        monkeypatch.chdir(weird)
+        ctx = parse_args(['run', '--session', 'ubuntu:24.04'])
+        name = _auto_session_name(ctx.ns, ctx)
+        import re as _re
+
+        assert _re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', name)
+        assert 'my_proj' in name

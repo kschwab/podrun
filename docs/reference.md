@@ -6,45 +6,47 @@
 
 These flags apply to all subcommands and must appear before the subcommand:
 
-| Flag | Description |
-|------|-------------|
-| `--print-cmd` / `--dry-run` | Print the podman command instead of executing it |
-| `--devconfig PATH` | Explicit path to devcontainer.json |
-| `--config-script PATH` | Run script and parse its stdout as flags (may be repeated) |
-| `--no-devconfig` | Skip devcontainer.json discovery |
-| `--no-podrunrc` | Skip `~/.podrunrc*` discovery |
-| `--completion SHELL` | Generate shell completion script (`bash`, `zsh`, `fish`) and exit |
-| `--version` / `-v` | Show version and exit |
-| `--local-store DIR` | Use project-local store directory (see [Local Store](local-store.md)) |
-| `--local-store-ignore` | Suppress auto-discovery of project-local store |
-| `--local-store-auto-init` | Auto-create store if missing (uses `--local-store` or auto-discovered path) |
-| `--local-store-info` | Print store information and exit |
-| `--local-store-destroy` | Remove project-local store before proceeding |
-| `--nfs-remediate MODE` | NFS storage detection/remediation mode: `init` (default), `error`, `mv`, `rm`, `prompt` |
-| `--nfs-remediate-path DIR` | Base path for NFS-remediated storage (default: `/opt/podman-local-storage`) |
-| `--cleanup MODE` | Remove runtime artifacts and exit. MODE: `all`, `staging`, `cache`, `stores`. Repeatable. |
+| Flag                        | Description                                                                               |
+|-----------------------------|-------------------------------------------------------------------------------------------|
+| `--print-cmd` / `--dry-run` | Print the podman command instead of executing it                                          |
+| `--devconfig PATH`          | Explicit path to devcontainer.json                                                        |
+| `--config-script PATH`      | Run script and parse its stdout as flags (may be repeated)                                |
+| `--no-devconfig`            | Skip devcontainer.json discovery                                                          |
+| `--no-podrunrc`             | Skip `~/.podrunrc*` discovery                                                             |
+| `--completion SHELL`        | Generate shell completion script (`bash`, `zsh`, `fish`) and exit                         |
+| `--version` / `-v`          | Show version and exit                                                                     |
+| `--local-store DIR`         | Use project-local store directory (see [Local Store](local-store.md))                     |
+| `--local-store-ignore`      | Suppress auto-discovery of project-local store                                            |
+| `--local-store-auto-init`   | Auto-create store if missing (uses `--local-store` or auto-discovered path)               |
+| `--local-store-info`        | Print store information and exit                                                          |
+| `--local-store-destroy`     | Remove project-local store before proceeding                                              |
+| `--nfs-remediate MODE`      | NFS storage detection/remediation mode: `init` (default), `error`, `mv`, `rm`, `prompt`   |
+| `--nfs-remediate-path DIR`  | Base path for NFS-remediated storage (default: `/opt/podman-local-storage`)               |
+| `--cleanup MODE`            | Remove runtime artifacts and exit. MODE: `all`, `staging`, `cache`, `stores`. Repeatable. |
 
 ## Run Flags
 
-| Flag | Description |
-|------|-------------|
-| `--user-overlay` | Map host user identity into container (`--userns=keep-id`, home dir, passwd entry, shell, sudo, bootstrap caps) |
-| `--host-overlay` | Host system context (implies `--user-overlay`; adds hostname, `--network=host`, `seccomp=unconfined`, workspace mount, `/etc/localtime`, git submodule auto-resolution) |
-| `--interactive-overlay` | Interactive terminal (`-it`, `--init`, `--detach-keys=ctrl-q,ctrl-q`) |
-| `--session` | Session overlay (implies `--host-overlay` + `--interactive-overlay` + `--dotfiles`) |
-| `--adhoc` | Ad-hoc overlay (implies `--session` + `--rm`) |
-| `--dot-files-overlay` / `--dotfiles` | Mount host dotfiles into container (implies `--user-overlay`) |
-| `--no-auto-resolve-git-submodules` | Disable automatic git submodule resolution and mounting |
-| `--print-overlays` | Print each overlay group and its settings, then exit |
-| `--x11` | Enable X11 forwarding (DISPLAY + `/tmp/.X11-unix` socket) |
-| `--podman-remote` | Podman socket passthrough into container |
-| `--shell SHELL` | Shell to use inside container (e.g. `bash`, `zsh`) |
-| `--login` / `--no-login` | Run shell as login shell (sources `/etc/profile`). `--no-login` explicitly disables. |
-| `--prompt-banner TEXT` | Custom prompt banner text |
-| `--auto-attach` | Exec into a running named container, or restart a stopped one (see [Container Lifecycle](#container-lifecycle)) |
-| `--auto-replace` | Remove and recreate named container (running or stopped; see [Container Lifecycle](#container-lifecycle)) |
-| `--export SRC:DST[:0]` | Export container path to host (requires `--user-overlay`). Append `:0` for copy-only. May be repeated. |
-| `--fuse-overlayfs` | Use fuse-overlayfs for overlay mount program (see [Fuse-Overlayfs](overlays.md#fuse-overlayfs)) |
+| Flag                                                                 | Description                                                                                                                                                             |
+|----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--user-overlay`                                                     | Map host user identity into container (`--userns=keep-id`, home dir, passwd entry, shell, sudo, bootstrap caps)                                                         |
+| `--host-overlay`                                                     | Host system context (implies `--user-overlay`; adds hostname, `--network=host`, `seccomp=unconfined`, workspace mount, `/etc/localtime`, git submodule auto-resolution) |
+| `--interactive-overlay`                                              | Interactive terminal (`-it`, `--init`, `--detach-keys=ctrl-q,ctrl-q`)                                                                                                   |
+| `--session`                                                          | Session overlay (implies `--host-overlay` + `--interactive-overlay` + `--dotfiles`)                                                                                     |
+| `--adhoc`                                                            | Ad-hoc overlay (implies `--session` + `--rm`)                                                                                                                           |
+| `--dot-files-overlay` / `--dotfiles`                                 | Mount host dotfiles into container (implies `--user-overlay`)                                                                                                           |
+| `--no-auto-resolve-git-submodules`                                   | Disable automatic git submodule resolution and mounting                                                                                                                 |
+| `--print-overlays`                                                   | Print each overlay group and its settings, then exit                                                                                                                    |
+| `--x11`                                                              | Enable X11 forwarding (DISPLAY + `/tmp/.X11-unix` socket)                                                                                                               |
+| `--podman-remote`                                                    | Podman socket passthrough into container                                                                                                                                |
+| `--shell SHELL`                                                      | Shell to use inside container (e.g. `bash`, `zsh`)                                                                                                                      |
+| `--login` / `--no-login`                                             | Run shell as login shell (sources `/etc/profile`). `--no-login` explicitly disables.                                                                                    |
+| `--prompt-banner TEXT`                                               | Custom prompt banner text                                                                                                                                               |
+| `--auto-attach`                                                      | Exec into a running named container, or restart a stopped one (see [Container Lifecycle](#container-lifecycle))                                                         |
+| `--auto-replace`                                                     | Remove and recreate named container (running or stopped; see [Container Lifecycle](#container-lifecycle))                                                               |
+| `--auto-name-session` / `--no-auto-name-session`                     | Deterministically name an unnamed `--session` container (on by default; see [Auto Session Naming](#auto-session-naming))                                                |
+| `--auto-devcontainer-workspace` / `--no-auto-devcontainer-workspace` | Inject workspace into a devcontainer that omits it (on by default; see [Auto Devcontainer Workspace](#auto-devcontainer-workspace))                                     |
+| `--export SRC:DST[:0]`                                               | Export container path to host (requires `--user-overlay`). Append `:0` for copy-only. May be repeated.                                                                  |
+| `--fuse-overlayfs`                                                   | Use fuse-overlayfs for overlay mount program (see [Fuse-Overlayfs](overlays.md#fuse-overlayfs))                                                                         |
 
 All unrecognized flags are passed through to `podman run` directly.
 
@@ -70,77 +72,79 @@ Scalar values use first-set-wins from left to right. Exports append in order:
 
 Keys in `customizations.podrun` of `devcontainer.json`:
 
-| JSON Key | Type | Equivalent Flag |
-|----------|------|-----------------|
-| `userOverlay` | bool | [`--user-overlay`](#run-flags) |
-| `hostOverlay` | bool | [`--host-overlay`](#run-flags) |
-| `interactiveOverlay` | bool | [`--interactive-overlay`](#run-flags) |
-| `session` | bool | [`--session`](#run-flags) |
-| `adhoc` | bool | [`--adhoc`](#run-flags) |
-| `dotFilesOverlay` | bool | [`--dotfiles`](#run-flags) |
-| `x11` | bool | [`--x11`](#run-flags) |
-| `podmanRemote` | bool | [`--podman-remote`](#run-flags) |
-| `shell` | string | [`--shell`](#run-flags) |
-| `login` | bool | [`--login`](#run-flags) |
-| `promptBanner` | string | [`--prompt-banner`](#run-flags) |
-| `autoAttach` | bool | [`--auto-attach`](#run-flags) |
-| `autoReplace` | bool | [`--auto-replace`](#run-flags) |
-| `fuseOverlayfs` | bool | [`--fuse-overlayfs`](#run-flags) |
-| `noAutoResolveGitSubmodules` | bool | [`--no-auto-resolve-git-submodules`](#run-flags) |
-| `exports` | list | [`--export`](#run-flags) |
-| `noPodrunrc` | bool | [`--no-podrunrc`](#global-flags) |
-| `localStore` | string | [`--local-store`](#global-flags) |
-| `localStoreAutoInit` | bool | [`--local-store-auto-init`](#global-flags) |
-| `localStoreIgnore` | bool | [`--local-store-ignore`](#global-flags) |
-| `storageDriver` | string | `--storage-driver` (podman global) |
-| `configScript` | string or list | [`--config-script`](#global-flags) |
-| `nfsRemediate` | string | [`--nfs-remediate`](#global-flags) |
-| `nfsRemediatePath` | string | [`--nfs-remediate-path`](#global-flags) |
+| JSON Key                     | Type           | Equivalent Flag                                  |
+|------------------------------|----------------|--------------------------------------------------|
+| `userOverlay`                | bool           | [`--user-overlay`](#run-flags)                   |
+| `hostOverlay`                | bool           | [`--host-overlay`](#run-flags)                   |
+| `interactiveOverlay`         | bool           | [`--interactive-overlay`](#run-flags)            |
+| `session`                    | bool           | [`--session`](#run-flags)                        |
+| `adhoc`                      | bool           | [`--adhoc`](#run-flags)                          |
+| `dotFilesOverlay`            | bool           | [`--dotfiles`](#run-flags)                       |
+| `x11`                        | bool           | [`--x11`](#run-flags)                            |
+| `podmanRemote`               | bool           | [`--podman-remote`](#run-flags)                  |
+| `shell`                      | string         | [`--shell`](#run-flags)                          |
+| `login`                      | bool           | [`--login`](#run-flags)                          |
+| `promptBanner`               | string         | [`--prompt-banner`](#run-flags)                  |
+| `autoAttach`                 | bool           | [`--auto-attach`](#run-flags)                    |
+| `autoReplace`                | bool           | [`--auto-replace`](#run-flags)                   |
+| `autoNameSession`            | bool           | [`--auto-name-session`](#run-flags) (default true) |
+| `autoDevcontainerWorkspace`  | bool           | [`--auto-devcontainer-workspace`](#run-flags) (default true) |
+| `fuseOverlayfs`              | bool           | [`--fuse-overlayfs`](#run-flags)                 |
+| `noAutoResolveGitSubmodules` | bool           | [`--no-auto-resolve-git-submodules`](#run-flags) |
+| `exports`                    | list           | [`--export`](#run-flags)                         |
+| `noPodrunrc`                 | bool           | [`--no-podrunrc`](#global-flags)                 |
+| `localStore`                 | string         | [`--local-store`](#global-flags)                 |
+| `localStoreAutoInit`         | bool           | [`--local-store-auto-init`](#global-flags)       |
+| `localStoreIgnore`           | bool           | [`--local-store-ignore`](#global-flags)          |
+| `storageDriver`              | string         | `--storage-driver` (podman global)               |
+| `configScript`               | string or list | [`--config-script`](#global-flags)               |
+| `nfsRemediate`               | string         | [`--nfs-remediate`](#global-flags)               |
+| `nfsRemediatePath`           | string         | [`--nfs-remediate-path`](#global-flags)          |
 
 ## Top-Level Devcontainer Fields
 
-| Field | Behavior |
-|-------|----------|
-| `image` | Fallback image when no CLI image is given |
-| `workspaceFolder` | Container working directory (default `/app`) |
-| `workspaceMount` | Custom workspace mount string (target overrides `workspaceFolder`) |
-| `containerEnv` | Environment variables set in the container |
-| `remoteEnv` | Environment variables set in the container (merged with `containerEnv`; wins on conflict) |
-| `mounts` | Additional bind/volume mounts (string or object form) |
-| `runArgs` | Extra podman run args |
-| `capAdd` | Capabilities to add |
-| `securityOpt` | Security options |
-| `privileged` | Run as privileged |
-| `init` | Use `--init` |
-| `initializeCommand` | Run on host during initialization, including creation and subsequent starts (string, array, or object) |
-| `onCreateCommand` | Run in container on first creation (string, array, or object) |
-| `postCreateCommand` | Run in container after `onCreateCommand`, first creation only (string, array, or object) |
-| `postStartCommand` | Run in container on every start (string, array, or object) |
-| `postAttachCommand` | Run in container on every start and exec attach (string, array, or object) |
-| `updateContentCommand` | Not supported (warning printed; use devcontainer CLI) |
-| `waitFor` | Not supported (warning printed; use devcontainer CLI) |
+| Field                  | Behavior                                                                                               |
+|------------------------|--------------------------------------------------------------------------------------------------------|
+| `image`                | Fallback image when no CLI image is given                                                              |
+| `workspaceFolder`      | Container working directory (default `/app`)                                                           |
+| `workspaceMount`       | Custom workspace mount string (target overrides `workspaceFolder`)                                     |
+| `containerEnv`         | Environment variables set in the container                                                             |
+| `remoteEnv`            | Environment variables set in the container (merged with `containerEnv`; wins on conflict)              |
+| `mounts`               | Additional bind/volume mounts (string or object form)                                                  |
+| `runArgs`              | Extra podman run args                                                                                  |
+| `capAdd`               | Capabilities to add                                                                                    |
+| `securityOpt`          | Security options                                                                                       |
+| `privileged`           | Run as privileged                                                                                      |
+| `init`                 | Use `--init`                                                                                           |
+| `initializeCommand`    | Run on host during initialization, including creation and subsequent starts (string, array, or object) |
+| `onCreateCommand`      | Run in container on first creation (string, array, or object)                                          |
+| `postCreateCommand`    | Run in container after `onCreateCommand`, first creation only (string, array, or object)               |
+| `postStartCommand`     | Run in container on every start (string, array, or object)                                             |
+| `postAttachCommand`    | Run in container on every start and exec attach (string, array, or object)                             |
+| `updateContentCommand` | Not supported (warning printed; use devcontainer CLI)                                                  |
+| `waitFor`              | Not supported (warning printed; use devcontainer CLI)                                                  |
 
 ## Devcontainer Lifecycle Commands
 
 Podrun executes a subset of devcontainer lifecycle commands at specific
 points during container creation, start, and attach.
 
-| Command | Runs on | When |
-|---------|---------|------|
-| `initializeCommand` | Host | Every `podrun run` invocation (create, restart, replace, attach) |
-| `onCreateCommand` | Container | First-run entrypoint (once) |
-| `postCreateCommand` | Container | After `onCreateCommand` (once) |
-| `postStartCommand` | Container | Every container start (first run and restart) |
-| `postAttachCommand` | Container | Every container start and every exec attach |
+| Command             | Runs on   | When                                                             |
+|---------------------|-----------|------------------------------------------------------------------|
+| `initializeCommand` | Host      | Every `podrun run` invocation (create, restart, replace, attach) |
+| `onCreateCommand`   | Container | First-run entrypoint (once)                                      |
+| `postCreateCommand` | Container | After `onCreateCommand` (once)                                   |
+| `postStartCommand`  | Container | Every container start (first run and restart)                    |
+| `postAttachCommand` | Container | Every container start and every exec attach                      |
 
 The lifecycle sequence depends on the container state:
 
-| Path | Sequence |
-|------|----------|
-| **First run** | initializeCommand → onCreateCommand → postCreateCommand → postStartCommand → postAttachCommand |
-| **Restart** (stopped container) | initializeCommand → postStartCommand → postAttachCommand |
-| **Exec attach** (running container) | initializeCommand → postAttachCommand |
-| **Replace** | initializeCommand → (same as first run) |
+| Path                                | Sequence                                                                                       |
+|-------------------------------------|------------------------------------------------------------------------------------------------|
+| **First run**                       | initializeCommand → onCreateCommand → postCreateCommand → postStartCommand → postAttachCommand |
+| **Restart** (stopped container)     | initializeCommand → postStartCommand → postAttachCommand                                       |
+| **Exec attach** (running container) | initializeCommand → postAttachCommand                                                          |
+| **Replace**                         | initializeCommand → (same as first run)                                                        |
 
 All three devcontainer command forms are accepted:
 
@@ -190,18 +194,18 @@ Set in every podrun container:
 
 Set when the relevant overlay or option is active:
 
-| Variable | Description |
-|----------|-------------|
-| `PODRUN_WORKDIR` | Workspace folder path (host overlay) |
-| `PODRUN_SHELL` | Shell override |
-| `PODRUN_LOGIN` | Login shell flag (`1` or `0`) |
-| `PODRUN_IMG` | Full image reference |
-| `PODRUN_IMG_NAME` | Image name component |
-| `PODRUN_IMG_REPO` | Image repo component |
-| `PODRUN_IMG_TAG` | Image tag component |
-| `PODRUN_ALT_ENTRYPOINT` | User `--entrypoint` override (extracted and passed as env) |
-| `PODRUN_PODMAN_REMOTE` | Podman remote mode active |
-| `PODRUN_DEVCONTAINER_CLI` | Invoked by devcontainer CLI |
+| Variable                  | Description                                                |
+|---------------------------|------------------------------------------------------------|
+| `PODRUN_WORKDIR`          | Workspace folder path (host overlay)                       |
+| `PODRUN_SHELL`            | Shell override                                             |
+| `PODRUN_LOGIN`            | Login shell flag (`1` or `0`)                              |
+| `PODRUN_IMG`              | Full image reference                                       |
+| `PODRUN_IMG_NAME`         | Image name component                                       |
+| `PODRUN_IMG_REPO`         | Image repo component                                       |
+| `PODRUN_IMG_TAG`          | Image tag component                                        |
+| `PODRUN_ALT_ENTRYPOINT`   | User `--entrypoint` override (extracted and passed as env) |
+| `PODRUN_PODMAN_REMOTE`    | Podman remote mode active                                  |
+| `PODRUN_DEVCONTAINER_CLI` | Invoked by devcontainer CLI                                |
 
 ### Exec-session
 
@@ -213,11 +217,11 @@ Set when the relevant overlay or option is active:
 
 When a `--name` is provided, podrun checks for existing containers:
 
-| Container state | `--auto-attach` | `--auto-replace` | Neither (interactive) |
-|---|---|---|---|
-| **Running** | Exec into container (attach) | Remove + re-run | Prompt: attach? replace? |
-| **Stopped** | Start + attach (restart) | Remove + re-run | Prompt: restart? replace? |
-| **Not found** | Create new | Create new | Create new |
+| Container state | `--auto-attach`              | `--auto-replace` | Neither (interactive)     |
+|-----------------|------------------------------|------------------|---------------------------|
+| **Running**     | Exec into container (attach) | Remove + re-run  | Prompt: attach? replace?  |
+| **Stopped**     | Start + attach (restart)     | Remove + re-run  | Prompt: restart? replace? |
+| **Not found**   | Create new                   | Create new       | Create new                |
 
 **Typical patterns:**
 
@@ -244,6 +248,70 @@ container silently uses stale settings. `--auto-attach` (and the interactive
 restart prompt) use `podman start` for convenience, so be aware that the
 resumed container runs with its creation-time configuration. If you need a
 fresh container with current settings, use `--auto-replace` instead.
+
+## Auto Session Naming
+
+`--auto-name-session` (on by default) gives an unnamed `--session` container a
+deterministic name so that re-running the same session in the same project
+converges on a single container — enabling `--auto-attach` / restart instead of
+spawning a new anonymous container each time.
+
+The name has the form `podrun_<project>_<image>_<sha12>`, e.g.
+`podrun_myproject_ubuntu-24.04_a1b2c3d4e5f6`:
+
+- `<project>` — a sanitized, truncated form of the project root directory name.
+- `<image>` — the image `name:tag` for readability, with the registry host
+  dropped and `/` and `:` rendered as `-` (e.g. `ubuntu:24.04` → `ubuntu-24.04`,
+  `registry.example.com/team/app:40.2` → `team-app-40.2`).
+- `<sha12>` — a 12-char SHA-256 over the **absolute project root path + full
+  image reference** (including registry), which keeps the name collision-free:
+  two same-named directories, or the same image from different registries, never
+  share a name.
+
+The `podrun_` prefix guarantees the name satisfies podman's grammar
+(`[a-zA-Z0-9][a-zA-Z0-9_.-]*`).
+
+- Based on the project root (the directory containing `.devcontainer`, or the
+  current working directory when there is no devcontainer), so re-runs from any
+  subdirectory of the same project produce the same name.
+- The image is part of both the readable label and the hash, so switching the
+  image yields a new container.
+- **Skipped for `--adhoc`** — ad-hoc containers are throwaway (`--rm`), so a
+  stable name serves no purpose. Naming applies to `--session` (and overlays
+  that imply it without `--adhoc`).
+- Any explicit name — CLI `--name`, `customizations.podrun.name`, or a
+  devcontainer top-level `name` — takes precedence and disables auto-naming.
+- Skipped when the devcontainer CLI is driving (it manages naming itself).
+
+Disable with `--no-auto-name-session` or
+`"autoNameSession": false` in `customizations.podrun`.
+
+## Auto Devcontainer Workspace
+
+`--auto-devcontainer-workspace` (on by default) ensures a devcontainer always
+has a defined workspace. When a `devcontainer.json` is present but provides
+**neither** `workspaceFolder` **nor** `workspaceMount`, podrun injects both,
+mirroring its normal workspace handling:
+
+- `workspaceFolder` ← `--default-workdir` (default `/app`)
+- `workspaceMount` ← a bind of the **project root** (the directory containing
+  `.devcontainer`, i.e. `${localWorkspaceFolder}`) to that folder
+
+If only one of the two fields is present, the **missing one is filled in**: a
+lone `workspaceFolder` gets a matching bind mount; a lone `workspaceMount` keeps
+its folder (derived from the mount target) untouched. When both are present,
+nothing is changed. An explicitly-empty `workspaceMount` (`""`) is honored as a
+deliberate "no workspace mount" and suppresses injection.
+
+The injected fields flow through podrun's existing devcontainer machinery
+(emitting `--mount`, `-w`, and git-submodule mounts), so the host overlay's
+own cwd→workspace mount is automatically suppressed — there is no double mount.
+Note this binds the **project root**, which differs from a plain
+`--host-overlay` run (no devcontainer) that mounts the current directory.
+
+Disable with `--no-auto-devcontainer-workspace` or
+`"autoDevcontainerWorkspace": false` in `customizations.podrun`. Skipped when
+the devcontainer CLI is driving.
 
 ## NFS Storage Remediation
 
@@ -306,12 +374,12 @@ podrun --cleanup stores                    # idle store services and runtime dir
 podrun --cleanup staging --cleanup cache   # composable — multiple modes in one call
 ```
 
-| Mode | What it removes |
-|------|-----------------|
-| `all` | Everything below (supersedes individual modes) |
-| `staging` | Entrypoint scripts, copy-staging, and other files under `PODRUN_TMP` |
-| `cache` | Podman flags cache (regenerated automatically on next run) |
-| `stores` | Idle local-store service daemons and their runtime directories (skips stores with active containers) |
+| Mode      | What it removes                                                                                      |
+|-----------|------------------------------------------------------------------------------------------------------|
+| `all`     | Everything below (supersedes individual modes)                                                       |
+| `staging` | Entrypoint scripts, copy-staging, and other files under `PODRUN_TMP`                                 |
+| `cache`   | Podman flags cache (regenerated automatically on next run)                                           |
+| `stores`  | Idle local-store service daemons and their runtime directories (skips stores with active containers) |
 
 The flag is repeatable — specify multiple modes to combine them. `all`
 supersedes any individual modes. Duplicate modes are deduplicated.

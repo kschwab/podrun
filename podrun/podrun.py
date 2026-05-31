@@ -3482,6 +3482,8 @@ _RUN_CONFIG_MAP = {
     'promptBanner': 'run.prompt_banner',
     'autoAttach': 'run.auto_attach',
     'autoReplace': 'run.auto_replace',
+    'autoNameSession': 'run.auto_name_session',
+    'autoDevcontainerWorkspace': 'run.auto_dc_workspace',
     'defaultWorkdir': 'run.default_workdir',
     'fuseOverlayfs': 'run.fuse_overlayfs',
     'dotFilesOverlay': 'run.dot_files_overlay',
@@ -3798,6 +3800,127 @@ def _apply_run_specifics(
         ns['run.export'] = _expand_export_tilde(combined_exports)
 
 
+def _inject_dc_workspace(
+    dc: dict, dc_path: Optional[str], ns: dict, script_ns: dict, dc_ns: dict, rc_ns: dict
+) -> None:
+    """Fill missing workspaceFolder/workspaceMount in *dc* (auto-workspace feature).
+
+    When ``--auto-devcontainer-workspace`` is effective (the default) and a
+    devcontainer config is present but omits ``workspaceFolder`` and/or
+    ``workspaceMount``, inject podrun's normal workspace defaults *into the dc
+    dict* so they flow through :func:`devcontainer_run_args` (emitting the
+    ``--mount``, ``-w``, and git-submodule args).  Because ``-w`` then lands in
+    passthrough before :func:`_host_overlay_args` runs, that builder skips its
+    own cwd-mount/``-w`` block — no duplicate workspace.
+
+    No-op when the devcontainer CLI is driving (it manages the workspace
+    itself), when no dc is present, or when both fields are already set.
+
+    The injected mount binds the *project root* (the directory containing
+    ``.devcontainer``, via :func:`_devcontainer_project_dir`), which matches
+    ``${localWorkspaceFolder}`` and is correct when launched from a subdir.
+    Variable expansion already ran in :func:`_resolve_dc_fields`, so resolved
+    literal paths are injected.
+    """
+    # Effective value with _first(cli, script, dc, rc) precedence — the step-8
+    # merge has not run yet, so the CLI value in ns is not authoritative on its
+    # own (a customizations.podrun ``false`` lives in dc_ns until merged).
+    auto = next(
+        (
+            v
+            for v in (
+                ns.get('run.auto_dc_workspace'),
+                script_ns.get('run.auto_dc_workspace'),
+                dc_ns.get('run.auto_dc_workspace'),
+                rc_ns.get('run.auto_dc_workspace'),
+            )
+            if v is not None
+        ),
+        True,
+    )
+    if not auto or not dc or ns.get('internal.dc_from_cli'):
+        return
+
+    # An explicitly-present but empty workspaceMount is a deliberate "no
+    # workspace mount" signal (see test_workspace_mount_empty_disables) —
+    # respect it and inject nothing.
+    if 'workspaceMount' in dc and not dc.get('workspaceMount'):
+        return
+
+    has_folder = bool(dc.get('workspaceFolder'))
+    has_mount = bool(dc.get('workspaceMount'))
+    if has_folder and has_mount:
+        return
+
+    # Default workdir, mirroring the _first(cli, script, dc, rc) precedence that
+    # _apply_run_specifics will finalize at step 10 (run.default_workdir is not
+    # set yet at this point in resolve_config).
+    workdir = (
+        ns.get('run.default_workdir')
+        or script_ns.get('run.default_workdir')
+        or dc_ns.get('run.default_workdir')
+        or rc_ns.get('run.default_workdir')
+        or '/app'
+    )
+
+    if has_folder:
+        folder = dc['workspaceFolder']
+    elif has_mount:
+        folder = _parse_mount_spec(dc['workspaceMount'])[1] or workdir
+    else:
+        folder = workdir
+
+    project_dir = _devcontainer_project_dir(dc_path) or str(pathlib.Path.cwd())
+
+    if not has_folder:
+        dc['workspaceFolder'] = folder
+        ns['dc.workspace_folder'] = folder
+    if not has_mount:
+        dc['workspaceMount'] = f'source={project_dir},target={folder},type=bind'
+        ns['dc.workspace_mount'] = dc['workspaceMount']
+
+
+def _sanitize_name_part(part: str, fallback: str = 'x', limit: int = 32) -> str:
+    """Sanitize *part* into a podman-name-safe segment, truncated to *limit*.
+
+    Replaces any character outside ``[a-zA-Z0-9_.-]`` with ``_``, strips
+    leading non-alphanumerics, and falls back to *fallback* if nothing remains.
+    """
+    safe = re.sub(r'[^a-zA-Z0-9_.-]', '_', part)
+    safe = re.sub(r'^[^a-zA-Z0-9]+', '', safe)[:limit]
+    return safe or fallback
+
+
+def _auto_session_name(ns: dict, ctx: 'PodrunContext') -> Optional[str]:
+    """Build a deterministic container name for an unnamed --session run.
+
+    Form: ``podrun_<project>_<image>_<sha12>`` where *project* is the sanitized
+    basename of the project root (so re-runs from any subdirectory converge),
+    *image* is the sanitized ``name:tag`` of the image (registry host dropped,
+    ``/`` and ``:`` rendered as ``-``) for readability, and *sha12* is a hash
+    of the absolute project root + full image reference for collision-resistance
+    (distinct paths or registries never share a name).  The literal ``podrun_``
+    prefix guarantees the result satisfies podman's name grammar
+    ``[a-zA-Z0-9][a-zA-Z0-9_.-]*``.
+
+    Returns ``None`` when no image is available yet (the missing-image error is
+    raised later in :func:`_handle_run`).
+    """
+    if not ctx.trailing_args:
+        return None
+    image = ctx.trailing_args[0]
+    project_dir = _devcontainer_project_dir(ns.get('internal.config_dc_path')) or str(
+        pathlib.Path.cwd()
+    )
+    project_dir = str(pathlib.Path(project_dir).resolve())
+    sha = hashlib.sha256(f'{project_dir}\x00{image}'.encode()).hexdigest()[:12]
+    proj = _sanitize_name_part(os.path.basename(project_dir.rstrip('/')), fallback='root')
+    # Readable image label: name + tag (registry host dropped), ':'/'/'→'-'.
+    _, img_name, img_tag = _parse_image_ref(image)
+    img_label = _sanitize_name_part(f'{img_name}-{img_tag}'.replace('/', '-'), fallback='img')
+    return f'podrun_{proj}_{img_label}_{sha}'
+
+
 def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa: C901
     """Four-way merge: CLI > config-script > devcontainer.json > ~/.podrunrc*.
 
@@ -3841,8 +3964,14 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
     )
     ns['internal.config_script_paths'] = config_script_paths
 
-    # 7. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
+    # 6.5. Auto-workspace: fill missing workspaceFolder/workspaceMount in the dc
+    #      dict before devcontainer_run_args reads them, so the injected workspace
+    #      flows through the existing dc machinery (and suppresses the duplicate
+    #      host-overlay mount via the -w-present guard).
     dc_ns = _devcontainer_to_ns(podrun_cfg)
+    _inject_dc_workspace(dc, dc_path, ns, script_ns, dc_ns, rc_ns)
+
+    # 7. Convert devcontainer config → _devcontainer_to_ns() + devcontainer_run_args()
     dc_run_args = devcontainer_run_args(dc, ns)
 
     # 8. Merge scalars — _first(cli_ns, script_ns, dc_ns, rc_ns) per key
@@ -3883,6 +4012,26 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
     #     or when run.name is already set (CLI --name or customizations.podrun.name).
     if ns.get('dc.name') and not ns.get('run.name') and not ns.get('internal.dc_from_cli'):
         ns['run.name'] = ns['dc.name']
+
+    # 12. Auto-name-session: give an unnamed --session run a deterministic name
+    #     so re-runs in the same context converge on one container (enabling
+    #     auto-attach/restart).  Runs after the dc.name bridge (so any explicit
+    #     name wins) and before handle_container_state reads run.name.  Skipped
+    #     for --adhoc (throwaway, --rm) and when the devcontainer CLI is driving.
+    if ns.get('subcommand') == 'run':
+        auto_name = ns.get('run.auto_name_session')
+        if auto_name is None:
+            auto_name = True
+        if (
+            auto_name
+            and ns.get('run.session')
+            and not ns.get('run.adhoc')
+            and not ns.get('run.name')
+            and not ns.get('internal.dc_from_cli')
+        ):
+            name = _auto_session_name(ns, ctx)
+            if name:
+                ns['run.name'] = name
 
     return ctx
 
@@ -4323,6 +4472,44 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     opts.add_argument(
         '--prompt-banner', dest='run.prompt_banner', metavar='TEXT', help='Prompt banner text'
     )
+
+    auto_name_group = opts.add_mutually_exclusive_group()
+    auto_name_group.add_argument(
+        '--auto-name-session',
+        action='store_const',
+        const=True,
+        default=None,
+        dest='run.auto_name_session',
+        help='Give an unnamed --session container a deterministic name (on by default)',
+    )
+    auto_name_group.add_argument(
+        '--no-auto-name-session',
+        action='store_const',
+        const=False,
+        dest='run.auto_name_session',
+        help='Disable deterministic auto-naming of session containers',
+    )
+
+    auto_ws_group = opts.add_mutually_exclusive_group()
+    auto_ws_group.add_argument(
+        '--auto-devcontainer-workspace',
+        action='store_const',
+        const=True,
+        default=None,
+        dest='run.auto_dc_workspace',
+        help=(
+            'Inject workspaceFolder/workspaceMount into a devcontainer.json that '
+            'omits them (binds the project root; on by default)'
+        ),
+    )
+    auto_ws_group.add_argument(
+        '--no-auto-devcontainer-workspace',
+        action='store_const',
+        const=False,
+        dest='run.auto_dc_workspace',
+        help='Disable devcontainer.json workspace injection',
+    )
+
     opts.add_argument(
         '--auto-attach',
         dest='run.auto_attach',

@@ -2492,7 +2492,8 @@ class TestConfigDriftIntegration:
 
     def test_sidecar_not_written_unnamed(self, tmp_path):
         """Unnamed container (no --name) skips sidecar write."""
-        main(['run', '--session', 'alpine'])
+        # Disable auto-name-session so the container stays genuinely unnamed.
+        main(['run', '--session', '--no-auto-name-session', 'alpine'])
         # No config_*.json files should exist
         assert not list(tmp_path.glob('config_*.json'))
 

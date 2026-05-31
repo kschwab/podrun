@@ -53,42 +53,53 @@ skip discovery entirely.
 
 ### Top-Level Fields
 
-| Field | Behavior |
-|-------|----------|
-| `image` | Fallback image when no CLI image is given |
-| `workspaceFolder` | Container working directory (default `/app`) |
-| `workspaceMount` | Custom workspace mount (target overrides `workspaceFolder`) |
-| `containerEnv` | Environment variables set in the container |
-| `remoteEnv` | Environment variables set in the container (merged with `containerEnv`; wins on conflict) |
-| `mounts` | Additional bind/volume mounts (string or object form) |
-| `runArgs` | Extra podman run args |
-| `capAdd` | Capabilities to add |
-| `securityOpt` | Security options |
-| `privileged` | Run as privileged |
-| `init` | Use `--init` |
-| `initializeCommand` | Run on host before container creation (string, array, or object) |
-| `onCreateCommand` | Run in container on first creation only (string, array, or object) |
-| `postCreateCommand` | Run in container after `onCreateCommand`, first creation only (string, array, or object) |
-| `postStartCommand` | Run in container on every start (string, array, or object) |
-| `postAttachCommand` | Run in container on every exec attach (string, array, or object) |
-| `updateContentCommand` | **Not supported** (warning printed; use devcontainer CLI) |
-| `waitFor` | **Not supported** (warning printed; use devcontainer CLI) |
+| Field                  | Behavior                                                                                  |
+|------------------------|-------------------------------------------------------------------------------------------|
+| `image`                | Fallback image when no CLI image is given                                                 |
+| `workspaceFolder`      | Container working directory (default `/app`)                                              |
+| `workspaceMount`       | Custom workspace mount (target overrides `workspaceFolder`)                               |
+| `containerEnv`         | Environment variables set in the container                                                |
+| `remoteEnv`            | Environment variables set in the container (merged with `containerEnv`; wins on conflict) |
+| `mounts`               | Additional bind/volume mounts (string or object form)                                     |
+| `runArgs`              | Extra podman run args                                                                     |
+| `capAdd`               | Capabilities to add                                                                       |
+| `securityOpt`          | Security options                                                                          |
+| `privileged`           | Run as privileged                                                                         |
+| `init`                 | Use `--init`                                                                              |
+| `initializeCommand`    | Run on host before container creation (string, array, or object)                          |
+| `onCreateCommand`      | Run in container on first creation only (string, array, or object)                        |
+| `postCreateCommand`    | Run in container after `onCreateCommand`, first creation only (string, array, or object)  |
+| `postStartCommand`     | Run in container on every start (string, array, or object)                                |
+| `postAttachCommand`    | Run in container on every exec attach (string, array, or object)                          |
+| `updateContentCommand` | **Not supported** (warning printed; use devcontainer CLI)                                 |
+| `waitFor`              | **Not supported** (warning printed; use devcontainer CLI)                                 |
 
 Top-level fields are converted to podman flags at the lowest precedence level
 within the devcontainer.json source.
+
+### Auto Workspace
+
+When a `devcontainer.json` is present but omits both `workspaceFolder` and
+`workspaceMount`, podrun fills them in automatically — `workspaceFolder`
+defaults to `--default-workdir` (`/app`) and `workspaceMount` binds the project
+root. If only one of the two is set, the missing one is supplied. This is the
+`--auto-devcontainer-workspace` feature (on by default); see
+[Reference — Auto Devcontainer Workspace](reference.md#auto-devcontainer-workspace).
+Disable with `--no-auto-devcontainer-workspace` or
+`"autoDevcontainerWorkspace": false`.
 
 ### Lifecycle Commands
 
 Podrun supports a subset of devcontainer lifecycle commands. These run
 setup scripts at specific points in the container's life.
 
-| Command | Runs on | When | Frequency |
-|---------|---------|------|-----------|
-| `initializeCommand` | Host | Before container creation | Every `podrun run` |
-| `onCreateCommand` | Container | During first-run entrypoint | Once (first creation) |
-| `postCreateCommand` | Container | After `onCreateCommand` | Once (first creation) |
-| `postStartCommand` | Container | After first-run setup completes | Every start |
-| `postAttachCommand` | Container | When exec-ing into a running container | Every attach |
+| Command             | Runs on   | When                                   | Frequency             |
+|---------------------|-----------|----------------------------------------|-----------------------|
+| `initializeCommand` | Host      | Before container creation              | Every `podrun run`    |
+| `onCreateCommand`   | Container | During first-run entrypoint            | Once (first creation) |
+| `postCreateCommand` | Container | After `onCreateCommand`                | Once (first creation) |
+| `postStartCommand`  | Container | After first-run setup completes        | Every start           |
+| `postAttachCommand` | Container | When exec-ing into a running container | Every attach          |
 
 **Command forms** — all three devcontainer spec forms are accepted:
 
@@ -131,33 +142,35 @@ support.
 
 ### `customizations.podrun` Keys
 
-| JSON Key | Type | Equivalent Flag |
-|----------|------|-----------------|
-| `name` | string | `--name` |
-| `userOverlay` | bool | [`--user-overlay`](reference.md#run-flags) |
-| `hostOverlay` | bool | [`--host-overlay`](reference.md#run-flags) |
-| `interactiveOverlay` | bool | [`--interactive-overlay`](reference.md#run-flags) |
-| `session` | bool | [`--session`](reference.md#run-flags) |
-| `adhoc` | bool | [`--adhoc`](reference.md#run-flags) |
-| `dotFilesOverlay` | bool | [`--dotfiles`](reference.md#run-flags) |
-| `x11` | bool | [`--x11`](reference.md#run-flags) |
-| `podmanRemote` | bool | [`--podman-remote`](reference.md#run-flags) |
-| `shell` | string | [`--shell`](reference.md#run-flags) |
-| `login` | bool | [`--login`](reference.md#run-flags) |
-| `promptBanner` | string | [`--prompt-banner`](reference.md#run-flags) |
-| `autoAttach` | bool | [`--auto-attach`](reference.md#run-flags) |
-| `autoReplace` | bool | [`--auto-replace`](reference.md#run-flags) |
-| `fuseOverlayfs` | bool | [`--fuse-overlayfs`](reference.md#run-flags) |
-| `noAutoResolveGitSubmodules` | bool | [`--no-auto-resolve-git-submodules`](reference.md#run-flags) |
-| `exports` | list | [`--export`](reference.md#run-flags) |
-| `noPodrunrc` | bool | [`--no-podrunrc`](reference.md#global-flags) |
-| `localStore` | string | [`--local-store`](reference.md#global-flags) |
-| `localStoreAutoInit` | bool | [`--local-store-auto-init`](reference.md#global-flags) |
-| `localStoreIgnore` | bool | [`--local-store-ignore`](reference.md#global-flags) |
-| `storageDriver` | string | `--storage-driver` (podman global) |
-| `configScript` | string or list | [`--config-script`](reference.md#global-flags) |
-| `nfsRemediate` | string | [`--nfs-remediate`](reference.md#global-flags) |
-| `nfsRemediatePath` | string | [`--nfs-remediate-path`](reference.md#global-flags) |
+| JSON Key                     | Type           | Equivalent Flag                                                          |
+|------------------------------|----------------|--------------------------------------------------------------------------|
+| `name`                       | string         | `--name`                                                                 |
+| `userOverlay`                | bool           | [`--user-overlay`](reference.md#run-flags)                               |
+| `hostOverlay`                | bool           | [`--host-overlay`](reference.md#run-flags)                               |
+| `interactiveOverlay`         | bool           | [`--interactive-overlay`](reference.md#run-flags)                        |
+| `session`                    | bool           | [`--session`](reference.md#run-flags)                                    |
+| `adhoc`                      | bool           | [`--adhoc`](reference.md#run-flags)                                      |
+| `dotFilesOverlay`            | bool           | [`--dotfiles`](reference.md#run-flags)                                   |
+| `x11`                        | bool           | [`--x11`](reference.md#run-flags)                                        |
+| `podmanRemote`               | bool           | [`--podman-remote`](reference.md#run-flags)                              |
+| `shell`                      | string         | [`--shell`](reference.md#run-flags)                                      |
+| `login`                      | bool           | [`--login`](reference.md#run-flags)                                      |
+| `promptBanner`               | string         | [`--prompt-banner`](reference.md#run-flags)                              |
+| `autoAttach`                 | bool           | [`--auto-attach`](reference.md#run-flags)                                |
+| `autoReplace`                | bool           | [`--auto-replace`](reference.md#run-flags)                               |
+| `autoNameSession`            | bool           | [`--auto-name-session`](reference.md#run-flags) (default true)           |
+| `autoDevcontainerWorkspace`  | bool           | [`--auto-devcontainer-workspace`](reference.md#run-flags) (default true) |
+| `fuseOverlayfs`              | bool           | [`--fuse-overlayfs`](reference.md#run-flags)                             |
+| `noAutoResolveGitSubmodules` | bool           | [`--no-auto-resolve-git-submodules`](reference.md#run-flags)             |
+| `exports`                    | list           | [`--export`](reference.md#run-flags)                                     |
+| `noPodrunrc`                 | bool           | [`--no-podrunrc`](reference.md#global-flags)                             |
+| `localStore`                 | string         | [`--local-store`](reference.md#global-flags)                             |
+| `localStoreAutoInit`         | bool           | [`--local-store-auto-init`](reference.md#global-flags)                   |
+| `localStoreIgnore`           | bool           | [`--local-store-ignore`](reference.md#global-flags)                      |
+| `storageDriver`              | string         | `--storage-driver` (podman global)                                       |
+| `configScript`               | string or list | [`--config-script`](reference.md#global-flags)                           |
+| `nfsRemediate`               | string         | [`--nfs-remediate`](reference.md#global-flags)                           |
+| `nfsRemediatePath`           | string         | [`--nfs-remediate-path`](reference.md#global-flags)                      |
 
 `customizations.podrun` values override top-level fields, and CLI flags
 override both.
@@ -169,16 +182,16 @@ Devcontainer.json variables are expanded in `workspaceFolder`,
 `customizations`.
 Supported variables:
 
-| Variable | Value |
-|----------|-------|
-| `${localWorkspaceFolder}` | Host path containing devcontainer.json |
-| `${localWorkspaceFolderBasename}` | Basename of the host path |
-| `${containerWorkspaceFolder}` | Resolved `workspaceFolder` value |
-| `${containerWorkspaceFolderBasename}` | Basename of the container path |
-| `${localEnv:VAR}` | Host environment variable (empty string if unset) |
-| `${localEnv:VAR:default}` | Host environment variable with default |
-| `${containerEnv:VAR}` | Left as-is (only available at container runtime) |
-| `${devcontainerId}` | SHA-256 hash derived from `localWorkspaceFolder` |
+| Variable                              | Value                                             |
+|---------------------------------------|---------------------------------------------------|
+| `${localWorkspaceFolder}`             | Host path containing devcontainer.json            |
+| `${localWorkspaceFolderBasename}`     | Basename of the host path                         |
+| `${containerWorkspaceFolder}`         | Resolved `workspaceFolder` value                  |
+| `${containerWorkspaceFolderBasename}` | Basename of the container path                    |
+| `${localEnv:VAR}`                     | Host environment variable (empty string if unset) |
+| `${localEnv:VAR:default}`             | Host environment variable with default            |
+| `${containerEnv:VAR}`                 | Left as-is (only available at container runtime)  |
+| `${devcontainerId}`                   | SHA-256 hash derived from `localWorkspaceFolder`  |
 
 ### Full Example
 
@@ -240,10 +253,10 @@ scripts taking higher priority.
 
 **Available environment variables** during script execution:
 
-| Variable | Set When |
-|----------|----------|
+| Variable                  | Set When                                        |
+|---------------------------|-------------------------------------------------|
 | `PODRUN_DEVCONTAINER_CLI` | Invoked via `devcontainer --docker-path podrun` |
-| `PODRUN_PODMAN_REMOTE` | Resolved podman binary is `podman-remote` |
+| `PODRUN_PODMAN_REMOTE`    | Resolved podman binary is `podman-remote`       |
 
 **Forbidden tokens:** Config scripts cannot output `--devconfig`,
 `--config-script`, or `--no-devconfig`.

@@ -175,6 +175,11 @@ support.
 `customizations.podrun` values override top-level fields, and CLI flags
 override both.
 
+> **Note on `name`:** the `name` key above lives under `customizations.podrun`
+> and maps to podman `--name` — the actual container name. The devcontainer
+> spec's **top-level** `name` field is a user-facing *display label* only;
+> podrun ignores it and never uses it as the container name.
+
 ### Variable Expansion
 
 Devcontainer.json variables are expanded in `workspaceFolder`,

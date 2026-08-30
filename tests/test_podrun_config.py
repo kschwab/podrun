@@ -2193,11 +2193,16 @@ class TestUnsupportedLifecycleWarning:
 
 
 # ---------------------------------------------------------------------------
-# TestDcNameBridge — dc top-level "name" → run.name fallback
+# TestDcTopLevelName — devcontainer top-level "name" is display-only (ignored)
 # ---------------------------------------------------------------------------
 
 
-class TestDcNameBridge:
+class TestDcTopLevelName:
+    """The devcontainer spec's top-level ``name`` is a user-facing display
+    label, not a container name.  podrun ignores it; the container name comes
+    only from CLI ``--name`` or ``customizations.podrun.name`` (which maps to
+    podman ``--name``, the actual container name)."""
+
     def _resolve(self, argv, monkeypatch, dc_json_path=None):
         monkeypatch.setattr(
             podrun_mod, 'find_devcontainer_json', lambda start_dir=None: dc_json_path
@@ -2205,28 +2210,18 @@ class TestDcNameBridge:
         result = parse_args(argv)
         return resolve_config(result)
 
-    def test_dc_name_sets_run_name(self, monkeypatch, tmp_project):
-        """dc top-level 'name' sets run.name when no CLI --name."""
+    def test_top_level_name_ignored(self, monkeypatch, tmp_project):
+        """dc top-level 'name' does NOT set run.name (it is display-only)."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
         dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'myproject'}))
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
-        assert r.ns.get('dc.name') == 'myproject'
-        assert r.ns.get('run.name') == 'myproject'
+        assert r.ns.get('dc.name') is None
+        assert r.ns.get('run.name') is None
 
-    def test_cli_name_overrides_dc_name(self, monkeypatch, tmp_project):
-        """CLI --name overrides dc top-level 'name'."""
-        dc_dir = tmp_project / '.devcontainer'
-        dc_dir.mkdir()
-        dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'dc-name'}))
-        r = self._resolve(['run', '--name=cli-name'], monkeypatch, dc_json_path=dc_file)
-        assert r.ns.get('dc.name') == 'dc-name'
-        assert r.ns.get('run.name') == 'cli-name'
-
-    def test_podrun_cfg_name_overrides_dc_name(self, monkeypatch, tmp_project):
-        """customizations.podrun.name overrides dc top-level 'name'."""
+    def test_podrun_cfg_name_sets_run_name(self, monkeypatch, tmp_project):
+        """customizations.podrun.name sets run.name (the container name)."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -2234,31 +2229,17 @@ class TestDcNameBridge:
             json.dumps(
                 {
                     'image': 'alpine',
-                    'name': 'dc-name',
+                    'name': 'display-name',
                     'customizations': {'podrun': {'name': 'podrun-name'}},
                 }
             )
         )
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
-        assert r.ns.get('dc.name') == 'dc-name'
+        # Top-level display name is ignored; container name comes from podrun cfg.
         assert r.ns.get('run.name') == 'podrun-name'
 
-    def test_dc_name_skipped_when_dc_cli_drives(self, monkeypatch, tmp_project):
-        """dc top-level 'name' is NOT applied when dc_from_cli is true."""
-        dc_dir = tmp_project / '.devcontainer'
-        dc_dir.mkdir()
-        dc_file = dc_dir / 'devcontainer.json'
-        dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'dc-name'}))
-        r = self._resolve(
-            ['run', '-l', f'devcontainer.config_file={dc_file}', 'alpine'],
-            monkeypatch,
-        )
-        assert r.ns.get('dc.name') == 'dc-name'
-        assert r.ns.get('internal.dc_from_cli') is True
-        assert r.ns.get('run.name') is None
-
-    def test_dc_name_variable_expansion(self, monkeypatch, tmp_project):
-        """Variable expansion works in dc 'name' (e.g. ${localWorkspaceFolderBasename}-dev)."""
+    def test_cli_name_wins_over_podrun_cfg_name(self, monkeypatch, tmp_project):
+        """CLI --name overrides customizations.podrun.name."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -2266,14 +2247,41 @@ class TestDcNameBridge:
             json.dumps(
                 {
                     'image': 'alpine',
-                    'name': '${localWorkspaceFolderBasename}-dev',
+                    'customizations': {'podrun': {'name': 'podrun-name'}},
+                }
+            )
+        )
+        r = self._resolve(['run', '--name=cli-name'], monkeypatch, dc_json_path=dc_file)
+        assert r.ns.get('run.name') == 'cli-name'
+
+    def test_top_level_name_does_not_disable_auto_naming(self, monkeypatch, tmp_project):
+        """A top-level 'name' alone leaves run.name unset, so an unnamed
+        --session run still gets a deterministic auto-name."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(json.dumps({'image': 'alpine', 'name': 'display-name'}))
+        r = self._resolve(['run', '--session', 'alpine'], monkeypatch, dc_json_path=dc_file)
+        name = r.ns.get('run.name')
+        assert name is not None
+        assert name != 'display-name'
+        assert name.startswith('podrun_')
+
+    def test_podrun_cfg_name_variable_expansion(self, monkeypatch, tmp_project):
+        """Variable expansion works in customizations.podrun.name."""
+        dc_dir = tmp_project / '.devcontainer'
+        dc_dir.mkdir()
+        dc_file = dc_dir / 'devcontainer.json'
+        dc_file.write_text(
+            json.dumps(
+                {
+                    'image': 'alpine',
+                    'customizations': {'podrun': {'name': '${localWorkspaceFolderBasename}-dev'}},
                 }
             )
         )
         r = self._resolve(['run'], monkeypatch, dc_json_path=dc_file)
-        expected = f'{tmp_project.name}-dev'
-        assert r.ns.get('dc.name') == expected
-        assert r.ns.get('run.name') == expected
+        assert r.ns.get('run.name') == f'{tmp_project.name}-dev'
 
 
 # ---------------------------------------------------------------------------
@@ -2441,9 +2449,7 @@ class TestAutoNameSession:
 
     def test_name_drops_registry_host(self, monkeypatch):
         """Fully-qualified ref → registry host dropped, name+tag retained."""
-        r = self._resolve(
-            ['run', '--session', 'registry.example.com/team/app:40.2'], monkeypatch
-        )
+        r = self._resolve(['run', '--session', 'registry.example.com/team/app:40.2'], monkeypatch)
         name = r.ns['run.name']
         assert 'team-app-40.2' in name
         assert 'registry.example.com' not in name
@@ -2508,8 +2514,8 @@ class TestAutoNameSession:
         r = self._resolve(['run', '--auto-name-session'], monkeypatch, dc_json_path=dc_file)
         assert (r.ns.get('run.name') or '').startswith('podrun_')
 
-    def test_dc_name_wins_over_auto(self, monkeypatch, tmp_project):
-        """A devcontainer top-level name takes precedence over auto-naming."""
+    def test_explicit_name_wins_over_auto(self, monkeypatch, tmp_project):
+        """An explicit customizations.podrun.name takes precedence over auto-naming."""
         dc_dir = tmp_project / '.devcontainer'
         dc_dir.mkdir()
         dc_file = dc_dir / 'devcontainer.json'
@@ -2517,8 +2523,7 @@ class TestAutoNameSession:
             json.dumps(
                 {
                     'image': 'alpine',
-                    'name': 'fromdc',
-                    'customizations': {'podrun': {'session': True}},
+                    'customizations': {'podrun': {'session': True, 'name': 'fromdc'}},
                 }
             )
         )

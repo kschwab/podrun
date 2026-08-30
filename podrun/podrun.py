@@ -2287,7 +2287,12 @@ def generate_exec_entrypoint(ns: Optional[dict] = None) -> str:
 
 {lifecycle_post_attach}
         # --- Exec ---
-        shift 2 2>/dev/null || true
+        # Consume the shell/login positionals ($1, $2) so any remaining args
+        # are the command.  Guard the count: `shift 2` when fewer than two
+        # positionals are set is an error in the `shift` special built-in,
+        # which aborts non-interactive dash/ash/busybox shells (exit 2) before
+        # a trailing `|| true` can run.  This guarded form never overflows.
+        if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi
         if [ $# -gt 0 ]; then
           exec "$@"
         elif [ "$_login" = "1" ]; then
@@ -3494,7 +3499,6 @@ _RUN_CONFIG_MAP = {
 # Top-level devcontainer.json fields → ns['dc.*'] keys.
 # These are resolved in resolve_config after variable expansion.
 _DC_CONFIG_MAP = {
-    'name': 'dc.name',
     'workspaceMount': 'dc.workspace_mount',
     'workspaceFolder': 'dc.workspace_folder',
     'containerEnv': 'dc.container_env',
@@ -3546,7 +3550,6 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
         # Second pass: use resolved containerWorkspaceFolder for remaining fields
         var_context['containerWorkspaceFolder'] = dc.get('workspaceFolder', '')
         for field in (
-            'name',
             'workspaceMount',
             'mounts',
             'runArgs',
@@ -4007,17 +4010,12 @@ def resolve_config(ctx: 'PodrunContext', flags=None) -> 'PodrunContext':  # noqa
     if ns.get('subcommand') == 'run':
         _apply_run_specifics(ns, ctx, dc_ns, script_ns, rc_ns)
 
-    # 11. Bridge dc top-level name → run.name (lowest priority fallback).
-    #     Skipped when the devcontainer CLI is driving (it manages naming)
-    #     or when run.name is already set (CLI --name or customizations.podrun.name).
-    if ns.get('dc.name') and not ns.get('run.name') and not ns.get('internal.dc_from_cli'):
-        ns['run.name'] = ns['dc.name']
-
-    # 12. Auto-name-session: give an unnamed --session run a deterministic name
+    # 11. Auto-name-session: give an unnamed --session run a deterministic name
     #     so re-runs in the same context converge on one container (enabling
-    #     auto-attach/restart).  Runs after the dc.name bridge (so any explicit
-    #     name wins) and before handle_container_state reads run.name.  Skipped
-    #     for --adhoc (throwaway, --rm) and when the devcontainer CLI is driving.
+    #     auto-attach/restart).  Runs before handle_container_state reads
+    #     run.name, so any explicit name (CLI --name or
+    #     customizations.podrun.name) wins.  Skipped for --adhoc (throwaway,
+    #     --rm) and when the devcontainer CLI is driving.
     if ns.get('subcommand') == 'run':
         auto_name = ns.get('run.auto_name_session')
         if auto_name is None:

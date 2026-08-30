@@ -279,8 +279,9 @@ The `podrun_` prefix guarantees the name satisfies podman's grammar
 - **Skipped for `--adhoc`** — ad-hoc containers are throwaway (`--rm`), so a
   stable name serves no purpose. Naming applies to `--session` (and overlays
   that imply it without `--adhoc`).
-- Any explicit name — CLI `--name`, `customizations.podrun.name`, or a
-  devcontainer top-level `name` — takes precedence and disables auto-naming.
+- Any explicit name — CLI `--name` or `customizations.podrun.name` — takes
+  precedence and disables auto-naming. (The devcontainer spec's top-level
+  `name` is a display-only label and is **not** used as the container name.)
 - Skipped when the devcontainer CLI is driving (it manages naming itself).
 
 Disable with `--no-auto-name-session` or

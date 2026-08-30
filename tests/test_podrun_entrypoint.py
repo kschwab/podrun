@@ -1,7 +1,10 @@
 """Tests for Phase 2.2 — entrypoint generation (run, rc, exec)."""
 
 import os
+import shutil
 import stat
+import subprocess
+import textwrap
 
 import pytest
 
@@ -617,6 +620,57 @@ class TestGenerateExecEntrypoint:
         with open(path) as f:
             content = f.read()
         assert 'exec "$SHELL"' in content
+
+    def test_shift_is_overflow_guarded(self):
+        """The shift must be guarded so it never overflows $#.
+
+        ``shift 2`` when fewer than two positionals are set is an error in the
+        ``shift`` special built-in, which aborts non-interactive dash/ash/
+        busybox shells (exit 2) *before* a trailing ``|| true`` can run.  Since
+        _exec_attach invokes the entrypoint with no positional args, an
+        unguarded ``shift 2`` drops the user straight back to the host.
+        """
+        path = generate_exec_entrypoint()
+        with open(path) as f:
+            content = f.read()
+        # The dangerous unguarded form must be gone.
+        assert 'shift 2 2>/dev/null' not in content
+        # The guarded form must be present.
+        assert 'if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi' in content
+
+    @pytest.mark.parametrize('shell', ['sh', 'dash', 'ash', 'busybox'])
+    def test_exec_block_no_args_does_not_abort(self, shell, tmp_path):
+        """The exec block must reach ``exec "$SHELL"`` (not abort) with 0 args.
+
+        Runs the real generated exec block under each available POSIX shell
+        with no positional args, stubbing ``$SHELL`` so the terminal ``exec``
+        is a harmless command.  A shell where the shift overflow is fatal would
+        exit 2 here; the guarded form exits 0.
+        """
+        which = shutil.which(shell)
+        if which is None:
+            pytest.skip(f'{shell} not installed')
+
+        path = generate_exec_entrypoint()
+        with open(path) as f:
+            content = f.read()
+        # Extract everything from the exec marker onward (the shift + branches).
+        marker = '# --- Exec ---'
+        assert marker in content
+        exec_block = textwrap.dedent(content[content.index(marker) :])
+
+        # Harness: no positional args, non-login, SHELL stubbed to `true`.
+        script = tmp_path / 'block.sh'
+        script.write_text(
+            'set --\n_login=0\nSHELL="$(command -v true)"\n' + exec_block,
+            encoding='utf-8',
+            newline='\n',
+        )
+        argv = [which, 'sh', str(script)] if shell == 'busybox' else [which, str(script)]
+        result = subprocess.run(argv, capture_output=True, timeout=10)
+        assert result.returncode == 0, (
+            f'{shell} aborted (rc={result.returncode}): {result.stderr.decode()}'
+        )
 
 
 # ---------------------------------------------------------------------------

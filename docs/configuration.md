@@ -142,35 +142,36 @@ support.
 
 ### `customizations.podrun` Keys
 
-| JSON Key                     | Type           | Equivalent Flag                                                          |
-|------------------------------|----------------|--------------------------------------------------------------------------|
-| `name`                       | string         | `--name`                                                                 |
-| `userOverlay`                | bool           | [`--user-overlay`](reference.md#run-flags)                               |
-| `hostOverlay`                | bool           | [`--host-overlay`](reference.md#run-flags)                               |
-| `interactiveOverlay`         | bool           | [`--interactive-overlay`](reference.md#run-flags)                        |
-| `session`                    | bool           | [`--session`](reference.md#run-flags)                                    |
-| `adhoc`                      | bool           | [`--adhoc`](reference.md#run-flags)                                      |
-| `dotFilesOverlay`            | bool           | [`--dotfiles`](reference.md#run-flags)                                   |
-| `x11`                        | bool           | [`--x11`](reference.md#run-flags)                                        |
-| `podmanRemote`               | bool           | [`--podman-remote`](reference.md#run-flags)                              |
-| `shell`                      | string         | [`--shell`](reference.md#run-flags)                                      |
-| `login`                      | bool           | [`--login`](reference.md#run-flags)                                      |
-| `promptBanner`               | string         | [`--prompt-banner`](reference.md#run-flags)                              |
-| `autoAttach`                 | bool           | [`--auto-attach`](reference.md#run-flags)                                |
-| `autoReplace`                | bool           | [`--auto-replace`](reference.md#run-flags)                               |
-| `autoNameSession`            | bool           | [`--auto-name-session`](reference.md#run-flags) (default true)           |
-| `autoDevcontainerWorkspace`  | bool           | [`--auto-devcontainer-workspace`](reference.md#run-flags) (default true) |
-| `fuseOverlayfs`              | bool           | [`--fuse-overlayfs`](reference.md#run-flags)                             |
-| `noAutoResolveGitSubmodules` | bool           | [`--no-auto-resolve-git-submodules`](reference.md#run-flags)             |
-| `exports`                    | list           | [`--export`](reference.md#run-flags)                                     |
-| `noPodrunrc`                 | bool           | [`--no-podrunrc`](reference.md#global-flags)                             |
-| `localStore`                 | string         | [`--local-store`](reference.md#global-flags)                             |
-| `localStoreAutoInit`         | bool           | [`--local-store-auto-init`](reference.md#global-flags)                   |
-| `localStoreIgnore`           | bool           | [`--local-store-ignore`](reference.md#global-flags)                      |
-| `storageDriver`              | string         | `--storage-driver` (podman global)                                       |
-| `configScript`               | string or list | [`--config-script`](reference.md#global-flags)                           |
-| `nfsRemediate`               | string         | [`--nfs-remediate`](reference.md#global-flags)                           |
-| `nfsRemediatePath`           | string         | [`--nfs-remediate-path`](reference.md#global-flags)                      |
+| JSON Key                     | Type           | Equivalent Flag                                                                                      |
+|------------------------------|----------------|------------------------------------------------------------------------------------------------------|
+| `name`                       | string         | `--name`                                                                                             |
+| `userOverlay`                | bool           | [`--user-overlay`](reference.md#run-flags)                                                           |
+| `hostOverlay`                | bool           | [`--host-overlay`](reference.md#run-flags)                                                           |
+| `interactiveOverlay`         | bool           | [`--interactive-overlay`](reference.md#run-flags)                                                    |
+| `session`                    | bool           | [`--session`](reference.md#run-flags)                                                                |
+| `adhoc`                      | bool           | [`--adhoc`](reference.md#run-flags)                                                                  |
+| `dotFilesOverlay`            | bool           | [`--dotfiles`](reference.md#run-flags)                                                               |
+| `x11`                        | bool           | [`--x11`](reference.md#run-flags)                                                                    |
+| `podmanRemote`               | bool           | [`--podman-remote`](reference.md#run-flags)                                                          |
+| `shell`                      | string         | [`--shell`](reference.md#run-flags)                                                                  |
+| `login`                      | bool           | [`--login`](reference.md#run-flags)                                                                  |
+| `promptBanner`               | string         | [`--prompt-banner`](reference.md#run-flags)                                                          |
+| `autoAttach`                 | bool           | [`--auto-attach`](reference.md#run-flags)                                                            |
+| `autoReplace`                | bool           | [`--auto-replace`](reference.md#run-flags)                                                           |
+| `autoNameSession`            | bool           | [`--auto-name-session`](reference.md#run-flags) (default true)                                       |
+| `autoDevcontainerWorkspace`  | bool           | [`--auto-devcontainer-workspace`](reference.md#run-flags) (default true)                             |
+| `fuseOverlayfs`              | bool           | [`--fuse-overlayfs`](reference.md#run-flags)                                                         |
+| `noAutoResolveGitSubmodules` | bool           | [`--no-auto-resolve-git-submodules`](reference.md#run-flags)                                         |
+| `exports`                    | list           | [`--export`](reference.md#run-flags)                                                                 |
+| `startGrace`                 | int (seconds)  | keep-alive idle grace (see [Keep-alive & devcontainer adoption](#keep-alive--devcontainer-adoption)) |
+| `noPodrunrc`                 | bool           | [`--no-podrunrc`](reference.md#global-flags)                                                         |
+| `localStore`                 | string         | [`--local-store`](reference.md#global-flags)                                                         |
+| `localStoreAutoInit`         | bool           | [`--local-store-auto-init`](reference.md#global-flags)                                               |
+| `localStoreIgnore`           | bool           | [`--local-store-ignore`](reference.md#global-flags)                                                  |
+| `storageDriver`              | string         | `--storage-driver` (podman global)                                                                   |
+| `configScript`               | string or list | [`--config-script`](reference.md#global-flags)                                                       |
+| `nfsRemediate`               | string         | [`--nfs-remediate`](reference.md#global-flags)                                                       |
+| `nfsRemediatePath`           | string         | [`--nfs-remediate-path`](reference.md#global-flags)                                                  |
 
 `customizations.podrun` values override top-level fields, and CLI flags
 override both.
@@ -288,6 +289,68 @@ wrapper:
 #!/bin/bash
 exec python3 -m podrun "$@"
 ```
+
+## Keep-alive & devcontainer adoption
+
+A container podrun created with a user overlay can be **adopted** later by the
+devcontainer CLI (which discovers a container by label, `start`s it, then
+`exec`s into it). For that to work the container has to stay up when started —
+but a shell as PID 1, started **detached** (no TTY), reads EOF and exits
+immediately, stopping the container. **Keep-alive** solves this: on a detached
+`start`, podrun's entrypoint runs a small idle loop as PID 1 that stays up
+while any `exec` is attached and exits `startGrace` seconds after the last one
+detaches (the idle grace also covers the gap between `start` and the first
+`exec`).
+
+Keep-alive engages **only when both** are true:
+
+1. the `start` is **detached** (no `-a`/`--attach`) — a **foreground**
+   `podman start -a` (podrun's own re-attach) is unaffected and drops you into
+   a shell; and
+2. the container has **no baked command** — if you created it with a command
+   (`podrun run … -- <cmd>`), a detached `start` re-runs that command
+   (standard `podman start` semantics), *not* keep-alive.
+
+So:
+
+```bash
+podrun run --session --name X            # no command → detached start keeps alive (adoptable)
+podrun run --session --name X -- <cmd>   # has command → detached start re-runs <cmd>
+```
+
+**`startGrace`** sets the idle-grace window (seconds). It **defaults to 15s**,
+so devcontainer-CLI adoption of a command-less container works out of the box.
+Set it in `customizations.podrun` (or per-invocation via `podrun run --grace
+<n>` / `podrun start --grace <n>`):
+
+```jsonc
+{
+  "image": "ubuntu:24.04",
+  "customizations": { "podrun": { "startGrace": 60 } }
+}
+```
+
+Set `startGrace: 0` to **disable** keep-alive (a detached start then behaves
+like a plain `podman start`). Existing behavior is unchanged either way,
+because podrun's own re-attach is foreground and never keep-alives.
+
+**Adoption:** when a `devcontainer.json` is present, podrun stamps the two
+labels the devcontainer CLI discovers by (`devcontainer.local_folder` /
+`devcontainer.config_file`). The flow:
+
+```bash
+podrun run --session --name myproj            # create the container
+devcontainer up --docker-path podrun --workspace-folder .   # later: adopt it
+```
+
+Because the devcontainer CLI runs through podrun (`--docker-path podrun`), its
+`start` is podrun's `start`, which writes the grace value; the CLI then execs
+its setup + server into the kept-alive container — no second container is
+created.
+
+> **Note:** the container is discovered by the *absolute workspace path*
+> (symlinks not resolved). Launch `podrun` and `devcontainer up` from the same
+> workspace path so the labels match.
 
 ---
 

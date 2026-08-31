@@ -480,6 +480,11 @@ class TestDevcontainerToNs:
         ns = _devcontainer_to_ns(cfg)
         assert ns['run.no_auto_resolve_git_submodules'] is True
 
+    def test_start_grace_key(self):
+        cfg = {'startGrace': 30}
+        ns = _devcontainer_to_ns(cfg)
+        assert ns['run.start_grace'] == 30
+
     def test_non_none_only(self):
         cfg = {'name': 'test'}
         ns = _devcontainer_to_ns(cfg)
@@ -1786,6 +1791,52 @@ class TestDevcontainerRunArgsContainerEnv:
 # ---------------------------------------------------------------------------
 # TestDevcontainerCliDetection — skip dc→args when devcontainer CLI drives
 # ---------------------------------------------------------------------------
+
+
+class TestAdoptLabels:
+    """_add_adopt_labels — devcontainer id-labels (design section 4c)."""
+
+    def _make_dc(self, base):
+        dc = base / '.devcontainer' / 'devcontainer.json'
+        dc.parent.mkdir(parents=True)
+        dc.write_text('{}')
+        return dc
+
+    def test_stamps_devcontainer_labels(self, tmp_path):
+        dc = self._make_dc(tmp_path)
+        ns = {'internal.config_dc_path': str(dc)}
+        podrun_mod._add_adopt_labels(ns)
+        labels = ns['internal.extra_labels']
+        lf = next(x.split('=', 1)[1] for x in labels if x.startswith('devcontainer.local_folder='))
+        cf = next(x.split('=', 1)[1] for x in labels if x.startswith('devcontainer.config_file='))
+        assert os.path.isabs(lf) and os.path.isabs(cf)
+        assert cf.endswith('/.devcontainer/devcontainer.json')
+        assert lf == os.path.dirname(os.path.dirname(cf))
+
+    def test_labels_keep_symlink_not_resolved(self, tmp_path):
+        real = tmp_path / 'real'
+        (real / '.devcontainer').mkdir(parents=True)
+        (real / '.devcontainer' / 'devcontainer.json').write_text('{}')
+        link = tmp_path / 'link'
+        link.symlink_to(real)
+        ns = {'internal.config_dc_path': str(link / '.devcontainer' / 'devcontainer.json')}
+        podrun_mod._add_adopt_labels(ns)
+        lf = next(
+            x for x in ns['internal.extra_labels'] if x.startswith('devcontainer.local_folder=')
+        )
+        # abspath keeps the symlink path; it must NOT resolve to .../real
+        assert lf == f'devcontainer.local_folder={link}'
+
+    def test_skipped_when_dc_from_cli(self, tmp_path):
+        dc = self._make_dc(tmp_path)
+        ns = {'internal.config_dc_path': str(dc), 'internal.dc_from_cli': True}
+        podrun_mod._add_adopt_labels(ns)
+        assert ns.get('internal.extra_labels') is None
+
+    def test_no_devcontainer_no_labels(self):
+        ns = {}
+        podrun_mod._add_adopt_labels(ns)
+        assert ns.get('internal.extra_labels') is None
 
 
 class TestDevcontainerCliDetection:

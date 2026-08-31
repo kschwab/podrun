@@ -13,6 +13,7 @@ from podrun.podrun import (
     BOOTSTRAP_CAPS,
     ENV_PODRUN_DEVCONTAINER_CLI,
     GID,
+    PODRUN_GRACE_PATH,
     PODRUN_RC_PATH,
     PODRUN_READY_PATH,
     UID,
@@ -181,6 +182,58 @@ class TestGenerateRunEntrypoint:
         with open(path) as f:
             content = f.read()
         assert 'PODRUN_ALT_ENTRYPOINT' in content
+
+    def test_keepalive_branch_present_and_gated(self):
+        """Entrypoint keep-alives only when grace>0 AND there's no baked command."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        assert PODRUN_GRACE_PATH in content
+        # gated on grace > 0 AND no baked command ($# -eq 0)
+        assert '"$_grace" -gt 0' in content
+        assert '[ $# -eq 0 ]' in content
+        # presence loop over /proc, counting PPID-0 processes (attached iff >1)
+        assert '/proc/' in content
+        assert '"$_n" -gt 1' in content
+        # clean stop on SIGTERM
+        assert "trap 'exit 0' TERM INT" in content
+
+    @staticmethod
+    def _keepalive_block(path):
+        """Extract the keep-alive `if [ "$_grace"... ] ...; then ... fi` block."""
+        with open(path) as f:
+            content = f.read()
+        start = content.index('if [ "$_grace" -gt 0 ]')
+        done_idx = content.index('done', start)
+        fi_idx = content.index('\nfi\n', done_idx)
+        return content[start : fi_idx + 3]
+
+    def test_keepalive_skipped_when_baked_command_present(self):
+        """With a baked command ($# > 0), keep-alive is skipped so the command
+        runs (preserving `podman start` semantics — the user's concern)."""
+        block = self._keepalive_block(generate_run_entrypoint(_default_ns()))
+        # $# > 0 → gate false → block does nothing → reaches DONE immediately.
+        harness = f'_grace=99\nset -- somecommand\n{block}\necho DONE\n'
+        result = subprocess.run(['sh', '-c', harness], capture_output=True, text=True, timeout=5)
+        assert result.returncode == 0
+        assert 'DONE' in result.stdout
+
+    def test_keepalive_engaged_when_no_command(self):
+        """With no baked command ($# == 0) and grace>0, keep-alive loops (holds
+        the container) — so it does not fall through to DONE."""
+        block = self._keepalive_block(generate_run_entrypoint(_default_ns()))
+        harness = f'_grace=99\n{block}\necho DONE\n'  # no `set --` → $# == 0
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run(['sh', '-c', harness], capture_output=True, text=True, timeout=3)
+
+    def test_keepalive_runs_on_every_start_not_first_run_only(self):
+        """The keep-alive branch is in the shared tail, outside the READY guard."""
+        path = generate_run_entrypoint(_default_ns())
+        with open(path) as f:
+            content = f.read()
+        guard_close = content.index('# --- End first-run setup ---')
+        keepalive_idx = content.index(PODRUN_GRACE_PATH)
+        assert keepalive_idx > guard_close
 
     def test_shell_detect_default(self):
         """Without run.shell, script auto-detects (prefers bash over sh)."""

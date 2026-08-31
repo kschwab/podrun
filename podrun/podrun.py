@@ -60,6 +60,7 @@ import tempfile
 import textwrap
 import time
 import traceback
+import uuid
 from typing import List, Optional, Set, Tuple
 
 _IS_WINDOWS = sys.platform == 'win32'
@@ -103,10 +104,29 @@ PODRUN_RC_PATH = '/.podrun/rc.sh'
 PODRUN_ENTRYPOINT_PATH = '/.podrun/run-entrypoint.sh'
 PODRUN_EXEC_ENTRY_PATH = '/.podrun/exec-entrypoint.sh'
 PODRUN_READY_PATH = '/.podrun/READY'
+PODRUN_GRACE_PATH = '/.podrun/grace'  # container-side keep-alive control file
 PODRUN_SOCKET_PATH = '/.podrun/podman/podman.sock'
 PODRUN_CONTAINER_HOST = f'unix://{PODRUN_SOCKET_PATH}'
 PODRUN_HOST_TMP_MOUNT = '/.podrun/host-tmp'
 BOOTSTRAP_CAPS = ['CAP_DAC_OVERRIDE', 'CAP_CHOWN', 'CAP_FOWNER', 'CAP_SETPCAP']
+
+# Default keep-alive idle grace (seconds) written on a detached ``podman start``
+# when no ``--grace``/``startGrace`` is given.  Covers the CLI's start→exec gap
+# and a short reconnect window; the entrypoint's presence loop holds the
+# container up for the real session duration regardless.
+DEFAULT_START_GRACE = 15
+
+# ---------------------------------------------------------------------------
+# Container label names
+# ---------------------------------------------------------------------------
+# Generic grace capability (stamped on every user-overlay container):
+LABEL_PODRUN_GRACE = 'podrun.grace'  # host path of the keep-alive control file
+LABEL_PODRUN_START_GRACE = 'podrun.start_grace'  # configured idle-grace seconds
+# devcontainer id-labels (stamped when a devcontainer.json is present) — the
+# keys the devcontainer CLI discovers containers by.  ``config_file`` doubles
+# as podrun's existing "CLI is driving" signal on the ``run`` command line.
+LABEL_DEVCONTAINER_LOCAL_FOLDER = 'devcontainer.local_folder'
+LABEL_DEVCONTAINER_CONFIG_FILE = 'devcontainer.config_file'
 
 _NFS_REMEDIATE_DEFAULT_BASE = '/opt/podman-local-storage'
 _NETWORK_FS_TYPES = frozenset(
@@ -225,6 +245,8 @@ class PodmanFlags:
     subcommands: frozenset
     run_value_flags: frozenset
     run_boolean_flags: frozenset
+    start_value_flags: frozenset
+    start_boolean_flags: frozenset
     bool_short_to_long: dict = dataclasses.field(default_factory=dict)  # e.g. {'-d': '--detach'}
 
 
@@ -282,8 +304,14 @@ def _scrape_all_flags(podman_path):
 
     run_value, run_bool, _, run_stl = run_result
 
-    # Merge short→long mappings from both global and run scopes.
-    bool_short_to_long = {**global_stl, **run_stl}
+    start_result = _scrape_podman_help(podman_path, subcmd='start')
+    if start_result is None:
+        raise RuntimeError(f'Failed to scrape {podman_path} start --help')
+
+    start_value, start_bool, _, start_stl = start_result
+
+    # Merge short→long mappings from global, run, and start scopes.
+    bool_short_to_long = {**global_stl, **run_stl, **start_stl}
 
     return PodmanFlags(
         global_value_flags=frozenset(global_value),
@@ -291,6 +319,8 @@ def _scrape_all_flags(podman_path):
         subcommands=frozenset(subcmds),
         run_value_flags=frozenset(run_value),
         run_boolean_flags=frozenset(run_bool),
+        start_value_flags=frozenset(start_value),
+        start_boolean_flags=frozenset(start_bool),
         bool_short_to_long=bool_short_to_long,
     )
 
@@ -306,6 +336,8 @@ def _read_flags_cache(path):
             subcommands=frozenset(data['subcommands']),
             run_value_flags=frozenset(data['run_value_flags']),
             run_boolean_flags=frozenset(data['run_boolean_flags']),
+            start_value_flags=frozenset(data['start_value_flags']),
+            start_boolean_flags=frozenset(data['start_boolean_flags']),
             bool_short_to_long=data.get('bool_short_to_long', {}),
         )
     except (OSError, KeyError, json.JSONDecodeError):
@@ -325,6 +357,8 @@ def _write_flags_cache(path, flags):
         'subcommands': sorted(flags.subcommands),
         'run_value_flags': sorted(flags.run_value_flags),
         'run_boolean_flags': sorted(flags.run_boolean_flags),
+        'start_value_flags': sorted(flags.start_value_flags),
+        'start_boolean_flags': sorted(flags.start_boolean_flags),
         'bool_short_to_long': flags.bool_short_to_long,
     }
     try:
@@ -1163,6 +1197,57 @@ def _daemon_dir() -> str:
     if host_tmp and os.environ.get(ENV_PODRUN_CONTAINER):
         return host_tmp
     return PODRUN_TMP
+
+
+def _grace_key(ns: dict) -> str:
+    """Return a filesystem-safe key for this container's grace control file.
+
+    Keyed on ``run.name`` (stable across re-create, so podrun's own restart can
+    recompute the path without an ``inspect``) or a per-run uuid for unnamed
+    containers (found later only via the ``podrun.grace`` label).
+    """
+    key = ns.get('run.name')
+    if not key:
+        key = ns.get('internal.grace_key')
+        if not key:
+            key = uuid.uuid4().hex[:12]
+            ns['internal.grace_key'] = key
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', str(key))
+
+
+def _write_grace(ns: dict, value: int) -> str:
+    """Create/overwrite this container's grace control file and return its
+    daemon-visible host path.
+
+    The file holds the keep-alive idle-grace seconds the entrypoint reads on
+    ``start`` (``0`` = keep-alive off).  Mirrors :func:`_write_sha_file`'s
+    staging/daemon split for nested-remote correctness.
+    """
+    filename = f'grace_{_grace_key(ns)}'
+    write_dir = os.path.join(_staging_dir(), 'grace')
+    pathlib.Path(write_dir).mkdir(parents=True, exist_ok=True)
+    _set_grace_value(os.path.join(write_dir, filename), value)
+    return os.path.join(_daemon_dir(), 'grace', filename)
+
+
+def _set_grace_value(host_path: str, value: int) -> None:
+    """Overwrite the grace control file at *host_path* with *value* seconds."""
+    with open(host_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(f'{int(value)}\n')
+
+
+def _coerce_grace(value, default: int = DEFAULT_START_GRACE) -> int:
+    """Coerce a grace value (str/int/None) to a non-negative int.
+
+    Returns *default* when *value* is None; clamps negatives to 0; falls back
+    to *default* on a non-numeric value.
+    """
+    if value is None:
+        return default
+    try:
+        return max(0, int(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 def _write_mount_manifest(mount_map: dict, copy_staging: Optional[list] = None) -> str:
@@ -2118,6 +2203,44 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
         # ensure user identity and home directory are ready.
         if [ -n "$PODRUN_ALT_ENTRYPOINT" ]; then
           set -- "$PODRUN_ALT_ENTRYPOINT" "$@"
+        fi
+
+        # Keep-alive: on a detached `start`, podrun writes the grace control
+        # file with an idle-grace > 0. Hold the container up while any exec
+        # is attached (exec roots and PID 1 show PPID 0 in the container PID
+        # namespace, so "attached" means the PPID-0 count > 1), exiting
+        # `_grace` seconds after the last exec detaches. A foreground start
+        # leaves grace at 0 and falls through to the normal shell/exec.
+        #
+        # Only engage when there is NO baked command ($# -eq 0): with a command
+        # we run it (preserving `podman start` semantics); without one the
+        # fallback is a shell, which on a detached start has no TTY, reads EOF
+        # and exits immediately — so keep-alive is exactly what's needed to hold
+        # the container for an incoming exec.
+
+        if [ -f {PODRUN_GRACE_PATH} ]; then
+          _grace=$(cat {PODRUN_GRACE_PATH} 2>/dev/null || echo 0)
+        else
+          _grace=0
+        fi
+        if [ "$_grace" -gt 0 ] 2>/dev/null && [ $# -eq 0 ]; then
+          trap 'exit 0' TERM INT
+          _idle=""
+          while :; do
+            _n=0
+            for _st in /proc/[0-9]*/stat; do
+              _ppid=$(awk '{{print $4}}' "$_st" 2>/dev/null) || continue
+              if [ "$_ppid" = 0 ]; then _n=$((_n + 1)); fi
+            done
+            if [ "$_n" -gt 1 ]; then
+              _idle=""
+            else
+              _now=$(date +%s)
+              if [ -z "$_idle" ]; then _idle=$_now; fi
+              if [ "$((_now - _idle))" -ge "$_grace" ]; then exit 0; fi
+            fi
+            sleep 2
+          done
         fi
 
 {cap_drop_block}
@@ -3494,6 +3617,7 @@ _RUN_CONFIG_MAP = {
     'dotFilesOverlay': 'run.dot_files_overlay',
     'noAutoResolveGitSubmodules': 'run.no_auto_resolve_git_submodules',
     'exports': 'run.export',
+    'startGrace': 'run.start_grace',
 }
 
 # Top-level devcontainer.json fields → ns['dc.*'] keys.
@@ -3586,17 +3710,23 @@ def _resolve_dc_fields(dc: dict, ns: dict, dc_path: Optional[str] = None) -> Non
 _DC_VAR_RE = re.compile(r'\$\{([^}]+)\}')
 
 
-def _devcontainer_project_dir(dc_path) -> Optional[str]:
+def _devcontainer_project_dir(dc_path, resolve: bool = True) -> Optional[str]:
     """Derive the project root directory from a devcontainer.json path.
 
     Returns None if *dc_path* is None.  Always returns an absolute path
     so that ``${localWorkspaceFolder}`` is unambiguous — relative paths
     would be resolved by the daemon relative to *its* CWD, which breaks
     nested-remote mode.
+
+    *resolve* (default True) canonicalizes symlinks (via ``Path.resolve``) —
+    correct for ``${localWorkspaceFolder}`` expansion and the container-name
+    hash.  Pass ``resolve=False`` to keep symlinks (plain ``os.path.abspath``)
+    when computing devcontainer id-labels, which must byte-match the CLI's
+    ``path.resolve`` (a no-op on non-Windows, i.e. symlinks NOT resolved).
     """
     if dc_path is None:
         return None
-    p = pathlib.Path(dc_path).resolve()
+    p = pathlib.Path(dc_path).resolve() if resolve else pathlib.Path(os.path.abspath(dc_path))
     if not p.is_file():
         return str(p)
     # Walk up looking for .devcontainer parent dir
@@ -3608,6 +3738,26 @@ def _devcontainer_project_dir(dc_path) -> Optional[str]:
         return str(p.parent)
     # Explicit path: use parent directory
     return str(p.parent)
+
+
+def _add_adopt_labels(ns: dict) -> None:
+    """Stamp devcontainer id-labels into ``internal.extra_labels`` so the
+    devcontainer CLI can discover this container later.
+
+    No-op when no ``devcontainer.json`` is present, or when the CLI is already
+    driving (``dc_from_cli`` — it stamps its own labels via the command line).
+    Kept out of ``run.label`` so re-reading them never trips ``dc_from_cli``.
+    Paths use ``resolve=False`` (symlinks kept) to match the CLI's label paths.
+    """
+    if ns.get('internal.dc_from_cli'):
+        return
+    dc_path = ns.get('internal.config_dc_path')
+    if not dc_path:
+        return
+    anchor = _devcontainer_project_dir(dc_path, resolve=False)
+    extra = ns.setdefault('internal.extra_labels', [])
+    extra.append(f'{LABEL_DEVCONTAINER_LOCAL_FOLDER}={anchor}')
+    extra.append(f'{LABEL_DEVCONTAINER_CONFIG_FILE}={os.path.abspath(dc_path)}')
 
 
 def _expand_devcontainer_vars(value, context: dict):  # noqa: C901
@@ -3693,11 +3843,14 @@ def _load_devcontainer(ns) -> Tuple[dict, dict, Optional[str]]:
     if ns.get('root.no_devconfig'):
         return {}, {}, None
 
-    # Check for label-based dc selection (devcontainer CLI passes this label)
+    # Check for label-based dc selection (devcontainer CLI passes this label).
+    # Only command-line labels (ns['run.label']) are scanned here — podrun's own
+    # adoption labels live in ns['internal.extra_labels'] and are NOT read, so
+    # stamping devcontainer.config_file for adoption never trips dc_from_cli.
     label_config_path = None
     for lbl in ns.get('run.label') or []:
         key, _, value = lbl.partition('=')
-        if key == 'devcontainer.config_file':
+        if key == LABEL_DEVCONTAINER_CONFIG_FILE:
             label_config_path = value
             # Mark that devcontainer CLI is driving
             ns['internal.dc_from_cli'] = True
@@ -4334,9 +4487,10 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
 
     # Real subparsers for podrun commands (full flag parsing)
     run_parser = _build_run_subparser(subs, flags.run_value_flags, flags.run_boolean_flags)
+    start_parser = _build_start_subparser(subs, flags.start_value_flags, flags.start_boolean_flags)
 
     # Empty subparsers for podman passthrough commands
-    for subcmd in sorted(flags.subcommands - {'run'}):
+    for subcmd in sorted(flags.subcommands - {'run', 'start'}):
         subs.add_parser(subcmd, add_help=False)
 
     # Docker-compat aliases that podman accepts but omits from ``podman --help``
@@ -4345,6 +4499,7 @@ def build_root_parser(flags=None) -> argparse.ArgumentParser:
 
     # Stash for help/completion access
     parser._run_subparser = run_parser  # type: ignore[attr-defined]
+    parser._start_subparser = start_parser  # type: ignore[attr-defined]
 
     return parser
 
@@ -4530,6 +4685,13 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
         help='Set the auto-mount workspace directory (default: /app)',
     )
     opts.add_argument(
+        '--grace',
+        dest='run.start_grace',
+        default=None,
+        metavar='SECONDS',
+        help='Keep-alive idle grace (seconds) for devcontainer-CLI adoption (default 0)',
+    )
+    opts.add_argument(
         '--export',
         dest='run.export',
         action='append',
@@ -4581,6 +4743,67 @@ def _build_run_subparser(subs, run_value_flags, run_boolean_flags) -> argparse.A
     # REMAINDER stops flag parsing at the first positional so that command
     # args like ``bash -c echo`` are not consumed as podman flags.
     parser.add_argument('run.trailing', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
+    return parser  # type: ignore[no-any-return]
+
+
+def _build_start_subparser(subs, start_value_flags, start_boolean_flags) -> argparse.ArgumentParser:
+    """Add ``start`` subparser: podrun's ``--grace`` + podman start passthrough.
+
+    Mirrors :func:`_build_run_subparser` so the value/boolean split and
+    container positionals come from the live ``podman start --help`` scrape
+    (``flags.start_*``) rather than a hardcoded flag list. Podman start flags
+    are collected via :class:`_PassthroughAction` into
+    ``ns['start.passthrough_args']`` (forwarded verbatim); container names land
+    in ``ns['start.containers']``; podrun's ``--grace`` goes to
+    ``ns['start.grace']`` and is consumed (not forwarded).
+    """
+    parser = subs.add_parser(
+        'start',
+        add_help=False,
+        allow_abbrev=False,
+        description='Start a container; podrun adds keep-alive grace for adoption.',
+    )
+    opts = parser.add_argument_group('Options')
+    opts.add_argument(
+        '--grace',
+        dest='start.grace',
+        default=None,
+        metavar='SECONDS',
+        help='Keep-alive idle grace (seconds) for a detached start (devcontainer-CLI adoption)',
+    )
+
+    # -- Podman start value flags (passthrough, dest='start.passthrough_args') --
+    for flag in sorted(start_value_flags):
+        opts.add_argument(
+            flag,
+            action=_PassthroughAction,
+            dest='start.passthrough_args',
+            nargs=1,
+            help=argparse.SUPPRESS,
+        )
+
+    # -- Podman start boolean flags (passthrough, dest='start.passthrough_args') --
+    for flag in sorted(start_boolean_flags):
+        opts.add_argument(
+            flag,
+            action=_PassthroughAction,
+            dest='start.passthrough_args',
+            nargs=0,
+            help=argparse.SUPPRESS,
+        )
+        # Explicit-value variant (--flag=true/false → --__bool_pt__flag=value).
+        if flag.startswith('--'):
+            opts.add_argument(
+                _BOOL_PT_PREFIX + flag[2:],
+                action=_PassthroughAction,
+                dest='start.passthrough_args',
+                nargs=1,
+                help=argparse.SUPPRESS,
+            )
+
+    # -- CONTAINER [CONTAINER...] positionals ---------------------------------
+    parser.add_argument('start.containers', nargs='*', help=argparse.SUPPRESS)
 
     return parser  # type: ignore[no-any-return]
 
@@ -4653,7 +4876,9 @@ def parse_args(argv: List[str], flags=None) -> PodrunContext:
     # them.  Explicit-value forms are rewritten to --__bool_pt__flag=value variants
     # that argparse handles via nargs=1.  _strip_pt_bool_flags() restores
     # them after parsing so downstream code sees clean flag names.
-    all_bool_flags = flags.global_boolean_flags | flags.run_boolean_flags
+    all_bool_flags = (
+        flags.global_boolean_flags | flags.run_boolean_flags | flags.start_boolean_flags
+    )
     flag_section = _normalize_bool_flags(flag_section, all_bool_flags, flags.bool_short_to_long)
 
     # Single-pass parse: root parser handles global flags + subcommand routing;
@@ -4666,12 +4891,14 @@ def parse_args(argv: List[str], flags=None) -> PodrunContext:
     # in the original argv order.
     if ns.get('run.passthrough_args'):
         ns['run.passthrough_args'] = _strip_pt_bool_flags(ns['run.passthrough_args'])
+    if ns.get('start.passthrough_args'):
+        ns['start.passthrough_args'] = _strip_pt_bool_flags(ns['start.passthrough_args'])
     if ns.get('podman_global_args'):
         ns['podman_global_args'] = _strip_pt_bool_flags(ns['podman_global_args'])
 
     subcmd = ns['subcommand']
     trailing_args = []
-    subcmd_passthrough_args = []
+    subcmd_passthrough_args: List[str] = []
 
     if subcmd == 'run':
         # REMAINDER captured everything from the image onward (IMAGE + COMMAND).
@@ -4679,6 +4906,17 @@ def parse_args(argv: List[str], flags=None) -> PodrunContext:
         # they're still forwarded to podman.
         run_trailing = ns.pop('run.trailing', None) or []
         trailing_args = list(unknowns) + run_trailing
+
+    elif subcmd == 'start':
+        # Start subparser peeled off podrun's --grace (ns['start.grace']) and
+        # collected podman flags (ns['start.passthrough_args']) + container
+        # positionals (ns['start.containers']).  The args to forward to podman
+        # are those flags + unrecognized flags + container names.
+        subcmd_passthrough_args = (
+            (ns.get('start.passthrough_args') or [])
+            + list(unknowns)
+            + (ns.get('start.containers') or [])
+        )
 
     elif subcmd is not None:
         # Passthrough subcommand: unknowns are the raw args after the
@@ -4802,6 +5040,33 @@ def query_container_info(
     return workdir, overlays
 
 
+def _query_grace_labels(
+    name: str,
+    global_flags=None,
+    podman_path: str = 'podman',
+) -> Tuple[Optional[str], Optional[str]]:
+    """Read the ``podrun.grace`` / ``podrun.start_grace`` labels via inspect.
+
+    Returns ``(grace_host_path, start_grace)`` — the host path of the grace
+    control file and the configured idle-grace seconds — or ``(None, None)``
+    when the container isn't grace-eligible or inspect fails.
+    """
+    gf = ' '.join(_shell_quote(f) for f in global_flags) + ' ' if global_flags else ''
+    fmt = _shell_quote('{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}')
+    result = run_os_cmd(
+        f'{_shell_quote(podman_path)} {gf}inspect --format={fmt} {_shell_quote(name)}'
+    )
+    grace_path: Optional[str] = None
+    start_grace: Optional[str] = None
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith(f'{LABEL_PODRUN_GRACE}='):
+                grace_path = line.split('=', 1)[1]
+            elif line.startswith(f'{LABEL_PODRUN_START_GRACE}='):
+                start_grace = line.split('=', 1)[1]
+    return grace_path or None, start_grace or None
+
+
 def build_podman_exec_args(
     ns,
     name: str,
@@ -4865,6 +5130,10 @@ def build_run_command(ctx: PodrunContext) -> List[str]:
         cmd.append(f'--name={ns["run.name"]}')
     for lbl in ns.get('run.label') or []:
         cmd.append(f'--label={lbl}')
+    # podrun-stamped labels (grace capability + devcontainer adoption).  Kept
+    # separate from run.label so the dc_from_cli scan never reads them back.
+    for lbl in ns.get('internal.extra_labels') or []:
+        cmd.append(f'--label={lbl}')
 
     # Passthrough args (podman value + boolean flags)
     cmd.extend(ns.get('run.passthrough_args') or [])
@@ -4927,6 +5196,19 @@ def build_overlay_run_command(ctx: PodrunContext) -> Tuple[List[str], List[str]]
         overlay_args.extend(user_args)
         if alt_entrypoint:
             overlay_args.append(f'--env={ENV_PODRUN_ALT_ENTRYPOINT}={alt_entrypoint}')
+        # Grace / keep-alive capability: mount a writable control file the
+        # entrypoint reads on start (>0 → keep-alive loop; 0 → shell), created
+        # "off"; a detached `start` writes the value. Record its host path + the
+        # configured idle-grace seconds as labels so an external `podrun start`
+        # (incl. the devcontainer CLI via docker-path) can locate and honor
+        # them. Skipped when remote (Linux-container feature).
+        if not _is_remote(ctx.podman_path):
+            grace_path = _write_grace(ns, 0)
+            overlay_args.append(f'-v={grace_path}:{PODRUN_GRACE_PATH}:z')
+            extra = ns.setdefault('internal.extra_labels', [])
+            extra.append(f'{LABEL_PODRUN_GRACE}={grace_path}')
+            extra.append(f'{LABEL_PODRUN_START_GRACE}={_coerce_grace(ns.get("run.start_grace"))}')
+            _add_adopt_labels(ns)
 
     if ns.get('run.interactive_overlay'):
         overlay_args.extend(_interactive_overlay_args(ns, pt))
@@ -5025,6 +5307,48 @@ def build_passthrough_command(ctx: PodrunContext) -> List[str]:
     return cmd
 
 
+def _handle_start(ctx: 'PodrunContext') -> None:
+    """Handle ``podrun start``: a thin wrapper over ``podman start``.
+
+    The start subparser (``_build_start_subparser``) has already separated
+    podrun's ``--grace`` (``ns['start.grace']``) from podman's own flags
+    (``ns['start.passthrough_args']``) and the container positionals
+    (``ns['start.containers']``), driven by the live ``podman start --help``
+    scrape rather than a hardcoded flag list.
+
+    For a grace-eligible container (one carrying a ``podrun.grace`` label), a
+    **detached** start (no ``-a``/``--attach``) writes the configured idle-grace
+    so the entrypoint's keep-alive loop holds the container for an incoming
+    ``exec``; a **foreground** start writes ``0`` → normal shell. Containers
+    without the label pass straight through unchanged. The grace write is
+    skipped when remote (Linux-container feature).
+    """
+    ns = ctx.ns
+    global_flags = ns.get('podman_global_args') or []
+    override = ns.get('start.grace')
+    passthrough = ns.get('start.passthrough_args') or []
+    containers = ns.get('start.containers') or []
+
+    if not _is_remote(ctx.podman_path) and not ns.get('root.print_cmd'):
+        foreground = '-a' in passthrough or '--attach' in passthrough
+        if len(containers) == 1:
+            grace_path, start_grace = _query_grace_labels(
+                containers[0], global_flags=global_flags, podman_path=ctx.podman_path
+            )
+            if grace_path:
+                if foreground and override is None:
+                    value = 0
+                else:
+                    value = _coerce_grace(override if override is not None else start_grace)
+                _set_grace_value(grace_path, value)
+
+    cmd = [ctx.podman_path] + global_flags + ['start'] + list(ctx.subcmd_passthrough_args)
+    if ns.get('root.print_cmd'):
+        print(shlex.join(cmd))
+        sys.exit(0)
+    _exec_or_subprocess(cmd, os.environ.copy())
+
+
 # ---------------------------------------------------------------------------
 # Help system
 # ---------------------------------------------------------------------------
@@ -5037,7 +5361,7 @@ def print_help(subcmd, argv, podman_path):
     is not handled by podrun (store uses argparse built-in help; other
     podman subcommands are passed through).
     """
-    if subcmd not in (None, 'run'):
+    if subcmd not in (None, 'run', 'start'):
         return
 
     sep_idx = argv.index('--') if '--' in argv else len(argv)
@@ -5048,6 +5372,10 @@ def print_help(subcmd, argv, podman_path):
         podman_cmd = f'{_shell_quote(podman_path)} run --help'
         replace_from, replace_to = 'podman run', 'podrun run'
         podrun_parser = build_root_parser()._run_subparser  # type: ignore[attr-defined]
+    elif subcmd == 'start':
+        podman_cmd = f'{_shell_quote(podman_path)} start --help'
+        replace_from, replace_to = 'podman start', 'podrun start'
+        podrun_parser = build_root_parser()._start_subparser  # type: ignore[attr-defined]
     else:
         podman_cmd = f'{_shell_quote(podman_path)} --help'
         replace_from, replace_to = 'podman', 'podrun'
@@ -5740,14 +6068,37 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
 
     if action == 'restart':
         name = ns['run.name']
-        cmd = [ctx.podman_path] + global_flags + ['start', '-a']
         pt = ns.get('run.passthrough_args') or []
+        has_cmd = bool(ctx.explicit_command) or len(ctx.trailing_args or []) > 1
+        grace_managed = bool(ns.get('run.user_overlay')) and not _is_remote(ctx.podman_path)
+        if has_cmd and grace_managed:
+            # An explicit command on re-attach → start the container detached
+            # with keep-alive so it stays up, then exec the command (reusing
+            # _exec_attach). Bare `podrun run` (no command) keeps the foreground
+            # restart below.
+            start_cmd = [ctx.podman_path] + global_flags + ['start', name]
+            if ns.get('root.print_cmd'):
+                print(shlex.join(start_cmd))
+                _exec_attach(ctx, global_flags)  # prints the exec command, exits
+                return
+            _write_grace(ns, _coerce_grace(ns.get('run.start_grace')))
+            res = run_os_cmd(shlex.join(start_cmd))
+            if res.returncode != 0:
+                print(res.stderr or f'Error: failed to start {name!r}', file=sys.stderr)
+                sys.exit(res.returncode or 1)
+            _exec_attach(ctx, global_flags)
+            return
+        # Bare restart: foreground re-attach (unchanged behavior), but reset the
+        # grace file to 0 first so a stale keep-alive value can't hijack PID 1.
+        cmd = [ctx.podman_path] + global_flags + ['start', '-a']
         if ns.get('run.interactive_overlay') or '-i' in pt or '--interactive' in pt:
             cmd.append('-i')
         cmd.append(name)
         if ns.get('root.print_cmd'):
             print(shlex.join(cmd))
             sys.exit(0)
+        if grace_managed:
+            _write_grace(ns, 0)
         _exec_or_subprocess(cmd, os.environ.copy())
 
     if action == 'attach':
@@ -5854,6 +6205,8 @@ def main(argv=None):
     # Route
     if ns['subcommand'] == 'run':
         _handle_run(ctx)
+    elif ns['subcommand'] == 'start':
+        _handle_start(ctx)
     elif ns['subcommand'] is not None:
         # Passthrough to podman
         cmd = build_passthrough_command(ctx)

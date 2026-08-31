@@ -338,6 +338,10 @@ class TestBuildRunParser:
         ns, _ = self._parse_run(['--shell', '/bin/zsh'])
         assert ns['run.shell'] == '/bin/zsh'
 
+    def test_grace(self):
+        ns, _ = self._parse_run(['--grace', '30'])
+        assert ns['run.start_grace'] == '30'
+
     def test_login(self):
         ns, _ = self._parse_run(['--login'])
         assert ns['run.login'] is True
@@ -1014,6 +1018,14 @@ class TestHelp:
         out = capsys.readouterr().out
         assert 'podrun' in out
         assert 'store' in out
+
+    def test_start_help_shows_grace(self, capsys, podman_binary):
+        with pytest.raises(SystemExit) as exc_info:
+            print_help('start', ['--help'], podman_binary)
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert 'Podrun:' in out
+        assert '--grace' in out
 
     def test_help_after_separator_ignored(self):
         print_help('run', ['image', '--', '--help'], 'podman')
@@ -3955,6 +3967,8 @@ class TestWriteFlagsCacheFaultTolerance:
                 subcommands=frozenset(),
                 run_value_flags=frozenset(),
                 run_boolean_flags=frozenset(),
+                start_value_flags=frozenset(),
+                start_boolean_flags=frozenset(),
             )
             # Should not raise
             _write_flags_cache(cache_path, flags)
@@ -3971,6 +3985,8 @@ class TestWriteFlagsCacheFaultTolerance:
             subcommands=frozenset(['ps', 'run']),
             run_value_flags=frozenset(['-e']),
             run_boolean_flags=frozenset(['--rm']),
+            start_value_flags=frozenset(),
+            start_boolean_flags=frozenset(),
         )
         _write_flags_cache(cache_path, flags)
         assert os.path.exists(cache_path)

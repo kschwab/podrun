@@ -523,6 +523,30 @@ class TestBuildOverlayRunCommand:
         cmd, _ = build_overlay_run_command(r)
         assert '--name=myc' in cmd
 
+    def test_user_overlay_adds_grace_mount(self, podman_only):
+        r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
+        cmd, _ = build_overlay_run_command(r)
+        grace_mounts = [c for c in cmd if c.endswith(f':{podrun_mod.PODRUN_GRACE_PATH}:z')]
+        assert len(grace_mounts) == 1
+
+    def test_user_overlay_adds_grace_labels(self, podman_only):
+        r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
+        cmd, _ = build_overlay_run_command(r)
+        assert any(c.startswith(f'--label={podrun_mod.LABEL_PODRUN_GRACE}=') for c in cmd)
+        assert f'--label={podrun_mod.LABEL_PODRUN_START_GRACE}=15' in cmd
+
+    def test_start_grace_config_in_label(self, podman_only):
+        r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
+        r.ns['run.start_grace'] = 42
+        cmd, _ = build_overlay_run_command(r)
+        assert f'--label={podrun_mod.LABEL_PODRUN_START_GRACE}=42' in cmd
+
+    def test_no_grace_without_user_overlay(self):
+        r = self._parse_and_resolve(['run', 'alpine'])
+        cmd, _ = build_overlay_run_command(r)
+        assert not any(podrun_mod.PODRUN_GRACE_PATH in c for c in cmd)
+        assert not any(f'{podrun_mod.LABEL_PODRUN_GRACE}=' in c for c in cmd)
+
     def test_env_args_always_present(self):
         r = self._parse_and_resolve(['run', '--user-overlay', 'alpine'])
         cmd, _ = build_overlay_run_command(r)

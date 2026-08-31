@@ -517,6 +517,167 @@ class TestHandleRunViaPrintCmd:
 
 
 # ---------------------------------------------------------------------------
+# Start-grace helpers + `podrun start` interception
+# ---------------------------------------------------------------------------
+
+
+class TestStartGraceHelpers:
+    def test_coerce_grace_default(self):
+        assert podrun_mod._coerce_grace(None) == podrun_mod.DEFAULT_START_GRACE
+
+    def test_coerce_grace_int_and_str(self):
+        assert podrun_mod._coerce_grace(30) == 30
+        assert podrun_mod._coerce_grace('45') == 45
+        assert podrun_mod._coerce_grace(' 12 ') == 12
+
+    def test_coerce_grace_negative_clamped(self):
+        assert podrun_mod._coerce_grace(-5) == 0
+
+    def test_coerce_grace_invalid_falls_back(self):
+        assert podrun_mod._coerce_grace('abc', default=7) == 7
+
+
+class TestStartSubparser:
+    """The `start` subparser peels off --grace / containers from podman flags,
+    driven by the live `podman start --help` scrape (not a hardcoded list)."""
+
+    def test_grace_space_form(self):
+        ctx = parse_args(['start', '--grace', '30', 'X'])
+        assert ctx.ns['start.grace'] == '30'
+        assert ctx.ns.get('start.containers') == ['X']
+        # --grace is consumed, not forwarded to podman
+        assert '--grace' not in ctx.subcmd_passthrough_args
+        assert ctx.subcmd_passthrough_args == ['X']
+
+    def test_grace_equals_form(self):
+        ctx = parse_args(['start', '--grace=20', 'X'])
+        assert ctx.ns['start.grace'] == '20'
+        assert ctx.ns.get('start.containers') == ['X']
+
+    def test_grace_absent(self):
+        ctx = parse_args(['start', '-a', 'X'])
+        assert ctx.ns.get('start.grace') is None
+
+    def test_multiple_containers(self):
+        ctx = parse_args(['start', 'X', 'Y'])
+        assert ctx.ns.get('start.containers') == ['X', 'Y']
+
+    def test_attach_flag_captured_as_passthrough(self, podman_only):
+        ctx = parse_args(['start', '-a', 'X'])
+        assert '-a' in (ctx.ns.get('start.passthrough_args') or [])
+        assert ctx.ns.get('start.containers') == ['X']
+
+    def test_value_flag_consumes_its_value_not_container(self, podman_only):
+        # --detach-keys is a scraped value flag; its value must not be mistaken
+        # for a container positional.
+        ctx = parse_args(['start', '--detach-keys', 'ctrl-x,ctrl-x', 'X'])
+        assert ctx.ns.get('start.containers') == ['X']
+        assert '--detach-keys' in (ctx.ns.get('start.passthrough_args') or [])
+
+
+class TestQueryGraceLabels:
+    def test_reads_labels(self, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(
+            stdout='podrun.grace=/tmp/g/grace_X\npodrun.start_grace=15\nother=z\n',
+            returncode=0,
+        )
+        path, secs = podrun_mod._query_grace_labels('X', podman_path='podman')
+        assert path == '/tmp/g/grace_X'
+        assert secs == '15'
+
+    def test_absent_labels(self, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='other=z\n', returncode=0)
+        path, secs = podrun_mod._query_grace_labels('X', podman_path='podman')
+        assert path is None
+        assert secs is None
+
+    def test_inspect_failure(self, mock_run_os_cmd):
+        mock_run_os_cmd.set_return(stdout='', returncode=1)
+        assert podrun_mod._query_grace_labels('X', podman_path='podman') == (None, None)
+
+
+class TestHandleStart:
+    """`podrun start` interception via main(['--print-cmd', 'start', ...])."""
+
+    def _run(self, argv, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            main(['--print-cmd'] + argv)
+        assert exc_info.value.code == 0
+        return shlex.split(capsys.readouterr().out)
+
+    def test_start_passthrough(self, capsys):
+        cmd = self._run(['start', 'X'], capsys)
+        assert cmd[-2:] == ['start', 'X']
+
+    def test_grace_flag_stripped(self, capsys):
+        cmd = self._run(['start', '--grace', '30', 'X'], capsys)
+        assert '--grace' not in cmd
+        assert '30' not in cmd
+        assert cmd[-2:] == ['start', 'X']
+
+    def test_attach_flag_passes_through(self, capsys):
+        cmd = self._run(['start', '-a', 'X'], capsys)
+        assert '-a' in cmd
+        assert 'start' in cmd
+
+    def test_detached_start_writes_grace_when_eligible(self, monkeypatch, podman_only):
+        writes = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_query_grace_labels',
+            lambda name, global_flags=None, podman_path='podman': ('/tmp/g/grace_X', '25'),
+        )
+        monkeypatch.setattr(podrun_mod, '_set_grace_value', lambda p, v: writes.append((p, v)))
+        monkeypatch.setattr(podrun_mod, '_exec_or_subprocess', lambda cmd, env: None)
+        ctx = parse_args(['start', 'X'])
+        ctx.podman_path = 'podman'
+        podrun_mod._handle_start(ctx)
+        assert writes == [('/tmp/g/grace_X', 25)]
+
+    def test_foreground_start_writes_zero(self, monkeypatch, podman_only):
+        writes = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_query_grace_labels',
+            lambda name, global_flags=None, podman_path='podman': ('/tmp/g/grace_X', '25'),
+        )
+        monkeypatch.setattr(podrun_mod, '_set_grace_value', lambda p, v: writes.append((p, v)))
+        monkeypatch.setattr(podrun_mod, '_exec_or_subprocess', lambda cmd, env: None)
+        ctx = parse_args(['start', '-a', 'X'])
+        ctx.podman_path = 'podman'
+        podrun_mod._handle_start(ctx)
+        assert writes == [('/tmp/g/grace_X', 0)]
+
+    def test_non_eligible_container_no_write(self, monkeypatch, podman_only):
+        writes = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_query_grace_labels',
+            lambda name, global_flags=None, podman_path='podman': (None, None),
+        )
+        monkeypatch.setattr(podrun_mod, '_set_grace_value', lambda p, v: writes.append((p, v)))
+        monkeypatch.setattr(podrun_mod, '_exec_or_subprocess', lambda cmd, env: None)
+        ctx = parse_args(['start', 'X'])
+        ctx.podman_path = 'podman'
+        podrun_mod._handle_start(ctx)
+        assert writes == []
+
+    def test_grace_override_wins(self, monkeypatch, podman_only):
+        writes = []
+        monkeypatch.setattr(
+            podrun_mod,
+            '_query_grace_labels',
+            lambda name, global_flags=None, podman_path='podman': ('/tmp/g/grace_X', '25'),
+        )
+        monkeypatch.setattr(podrun_mod, '_set_grace_value', lambda p, v: writes.append((p, v)))
+        monkeypatch.setattr(podrun_mod, '_exec_or_subprocess', lambda cmd, env: None)
+        ctx = parse_args(['start', '--grace', '99', 'X'])
+        ctx.podman_path = 'podman'
+        podrun_mod._handle_start(ctx)
+        assert writes == [('/tmp/g/grace_X', 99)]
+
+
+# ---------------------------------------------------------------------------
 # _handle_run — error cases
 # ---------------------------------------------------------------------------
 
@@ -606,6 +767,100 @@ class TestHandleRunContainerState:
         assert '-a' in cmd
         assert '-i' not in cmd
         assert '-ai' not in cmd
+
+    def test_restart_with_command_starts_detached_then_execs(
+        self, monkeypatch, capsys, podman_only
+    ):
+        """Option A: `podrun run --name X -- cmd` on a stopped container →
+        detached start (keep-alive) + exec, not a foreground `start -a`."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(
+            podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    '--print-cmd',
+                    'run',
+                    '--name=myc',
+                    '--auto-attach',
+                    '--session',
+                    'alpine',
+                    '--',
+                    'ls',
+                ]
+            )
+        assert exc_info.value.code == 0
+        lines = capsys.readouterr().out.strip().split('\n')
+        # line 1: detached start (no -a); line 2: exec running the command
+        start_cmd = shlex.split(lines[0])
+        assert 'start' in start_cmd and 'myc' in start_cmd
+        assert '-a' not in start_cmd
+        exec_cmd = shlex.split(lines[1])
+        assert 'exec' in exec_cmd and 'ls' in exec_cmd
+
+    def test_restart_with_command_nonprint_writes_grace_and_execs(self, monkeypatch, podman_only):
+        """Non-print Option-A path: write grace, detached start, then _exec_attach."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, '_check_config_drift', lambda ctx, action: action)
+        monkeypatch.setattr(
+            podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
+        )
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd, env=None: subprocess.CompletedProcess(cmd, 0, '', ''),
+        )
+        rec = {}
+        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v: rec.setdefault('grace', v))
+        monkeypatch.setattr(
+            podrun_mod, '_exec_attach', lambda ctx, gf: rec.setdefault('exec_attach', True)
+        )
+        main(['run', '--name=myc', '--auto-attach', '--session', 'alpine', '--', 'ls'])
+        assert rec.get('grace') == podrun_mod.DEFAULT_START_GRACE
+        assert rec.get('exec_attach') is True
+
+    def test_restart_with_command_start_failure_exits(self, monkeypatch, podman_only):
+        """A failed detached start aborts before exec."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, '_check_config_drift', lambda ctx, action: action)
+        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v: None)
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd, env=None: subprocess.CompletedProcess(cmd, 1, '', 'boom'),
+        )
+        called = {}
+        monkeypatch.setattr(
+            podrun_mod, '_exec_attach', lambda ctx, gf: called.setdefault('exec', True)
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--name=myc', '--auto-attach', '--session', 'alpine', '--', 'ls'])
+        assert exc_info.value.code == 1
+        assert 'exec' not in called
+
+    def test_restart_bare_nonprint_resets_grace(self, monkeypatch, podman_only):
+        """Bare restart resets grace to 0 before the foreground start."""
+        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, '_check_config_drift', lambda ctx, action: action)
+        monkeypatch.setattr(
+            podrun_mod,
+            'run_os_cmd',
+            lambda cmd, env=None: subprocess.CompletedProcess(cmd, 0, '', ''),
+        )
+        rec = {}
+        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v: rec.setdefault('grace', v))
+
+        def _stop(cmd, env):
+            rec['exec'] = cmd
+            raise SystemExit(0)
+
+        monkeypatch.setattr(podrun_mod, '_exec_or_subprocess', _stop)
+        with pytest.raises(SystemExit) as exc_info:
+            main(['run', '--name=myc', '--auto-attach', '--session', 'alpine'])
+        assert exc_info.value.code == 0
+        assert rec.get('grace') == 0
+        assert 'start' in rec['exec'] and '-a' in rec['exec']
 
     def test_restart_passthrough_interactive(self, monkeypatch, capsys):
         """When restarting with -i via passthrough (no overlay), -i is passed."""
@@ -782,6 +1037,8 @@ class TestFilterGlobalArgs:
             subcommands=frozenset(),
             run_value_flags=frozenset(),
             run_boolean_flags=frozenset(),
+            start_value_flags=frozenset(),
+            start_boolean_flags=frozenset(),
         )
 
     def test_drops_unknown_value_flags(self, flags):
@@ -1736,6 +1993,8 @@ class TestStatBasedCache:
             subcommands=frozenset(['ps', 'run']),
             run_value_flags=frozenset(['-e']),
             run_boolean_flags=frozenset(['--rm']),
+            start_value_flags=frozenset(),
+            start_boolean_flags=frozenset(),
         )
         _write_flags_cache(cache_path, flags)
 

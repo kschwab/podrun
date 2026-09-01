@@ -742,27 +742,29 @@ class TestHandleRunContainerState:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert 'not created with podrun user overlay' in capsys.readouterr().err
 
-    def test_restart_prints_start_attach(self, monkeypatch, capsys):
-        """When restarting, --print-cmd should show start -a -i command (session is interactive)."""
+    def test_restart_user_overlay_detached_then_exec(self, monkeypatch, capsys, podman_only):
+        """A user-overlay (--session) re-attach starts DETACHED (no -a) + exec,
+        so PID 1 stays the keep-alive loop (not a foreground shell)."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(
+            podrun_mod, 'query_container_info', lambda *a, **kw: ('/work', 'user,host')
+        )
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        cmd = shlex.split(out.strip())
-        assert 'start' in cmd
-        assert '-a' in cmd
-        assert '-i' in cmd
-        assert 'myc' in cmd
+        lines = capsys.readouterr().out.strip().split('\n')
+        start_cmd = shlex.split(lines[0])
+        assert 'start' in start_cmd and 'myc' in start_cmd
+        assert '-a' not in start_cmd  # detached, not foreground
+        assert 'exec' in shlex.split(lines[1])
 
-    def test_restart_non_interactive_no_stdin(self, monkeypatch, capsys):
-        """When restarting without interactive overlay or -i, -i is not passed."""
+    def test_restart_non_overlay_foreground(self, monkeypatch, capsys):
+        """A non-user-overlay named container still uses foreground `start -a`."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         with pytest.raises(SystemExit) as exc_info:
             main(['--print-cmd', 'run', '--name=myc', '--auto-attach', 'alpine'])
         assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        cmd = shlex.split(out.strip())
+        cmd = shlex.split(capsys.readouterr().out.strip())
         assert 'start' in cmd
         assert '-a' in cmd
         assert '-i' not in cmd
@@ -799,8 +801,9 @@ class TestHandleRunContainerState:
         exec_cmd = shlex.split(lines[1])
         assert 'exec' in exec_cmd and 'ls' in exec_cmd
 
-    def test_restart_with_command_nonprint_writes_grace_and_execs(self, monkeypatch, podman_only):
-        """Non-print Option-A path: write grace, detached start, then _exec_attach."""
+    def test_restart_nonprint_forces_grace_and_execs(self, monkeypatch, podman_only):
+        """Non-print re-attach: force keep-alive (grace + force), detached start,
+        then _exec_attach — uniform for bare and `-- cmd`."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr(podrun_mod, '_check_config_drift', lambda ctx, action: action)
         monkeypatch.setattr(
@@ -812,19 +815,26 @@ class TestHandleRunContainerState:
             lambda cmd, env=None: subprocess.CompletedProcess(cmd, 0, '', ''),
         )
         rec = {}
-        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v: rec.setdefault('grace', v))
+
+        def _wg(ns, v, force=False):
+            rec['grace'] = v
+            rec['force'] = force
+
+        monkeypatch.setattr(podrun_mod, '_write_grace', _wg)
         monkeypatch.setattr(
             podrun_mod, '_exec_attach', lambda ctx, gf: rec.setdefault('exec_attach', True)
         )
-        main(['run', '--name=myc', '--auto-attach', '--session', 'alpine', '--', 'ls'])
+        # bare (no command) still force keep-alives
+        main(['run', '--name=myc', '--auto-attach', '--session', 'alpine'])
         assert rec.get('grace') == podrun_mod.DEFAULT_START_GRACE
+        assert rec.get('force') is True
         assert rec.get('exec_attach') is True
 
-    def test_restart_with_command_start_failure_exits(self, monkeypatch, podman_only):
+    def test_restart_start_failure_exits(self, monkeypatch, podman_only):
         """A failed detached start aborts before exec."""
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
         monkeypatch.setattr(podrun_mod, '_check_config_drift', lambda ctx, action: action)
-        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v: None)
+        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v, force=False: None)
         monkeypatch.setattr(
             podrun_mod,
             'run_os_cmd',
@@ -838,29 +848,6 @@ class TestHandleRunContainerState:
             main(['run', '--name=myc', '--auto-attach', '--session', 'alpine', '--', 'ls'])
         assert exc_info.value.code == 1
         assert 'exec' not in called
-
-    def test_restart_bare_nonprint_resets_grace(self, monkeypatch, podman_only):
-        """Bare restart resets grace to 0 before the foreground start."""
-        monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
-        monkeypatch.setattr(podrun_mod, '_check_config_drift', lambda ctx, action: action)
-        monkeypatch.setattr(
-            podrun_mod,
-            'run_os_cmd',
-            lambda cmd, env=None: subprocess.CompletedProcess(cmd, 0, '', ''),
-        )
-        rec = {}
-        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v: rec.setdefault('grace', v))
-
-        def _stop(cmd, env):
-            rec['exec'] = cmd
-            raise SystemExit(0)
-
-        monkeypatch.setattr(podrun_mod, '_exec_or_subprocess', _stop)
-        with pytest.raises(SystemExit) as exc_info:
-            main(['run', '--name=myc', '--auto-attach', '--session', 'alpine'])
-        assert exc_info.value.code == 0
-        assert rec.get('grace') == 0
-        assert 'start' in rec['exec'] and '-a' in rec['exec']
 
     def test_restart_passthrough_interactive(self, monkeypatch, capsys):
         """When restarting with -i via passthrough (no overlay), -i is passed."""
@@ -2769,8 +2756,11 @@ class TestConfigDriftIntegration:
         # Write sidecar with old hash
         sidecar = {'config_files': {str(dc): 'oldhash'}, 'created': '2026-04-14T10:00:00'}
         (tmp_path / 'config_driftctr.json').write_text(json.dumps(sidecar))
-        # Simulate stopped container → auto-attach triggers restart
+        # Simulate stopped container → auto-attach triggers restart, which now
+        # detached-starts + execs (mock the exec so we only check the warning).
         monkeypatch.setattr(podrun_mod, 'detect_container_state', lambda *a, **kw: 'stopped')
+        monkeypatch.setattr(podrun_mod, '_write_grace', lambda ns, v, force=False: None)
+        monkeypatch.setattr(podrun_mod, '_exec_attach', lambda ctx, gf: None)
         main(['run', '--session', '--name', 'driftctr', '--auto-attach', 'alpine'])
         err = capsys.readouterr().err
         assert 'Config has changed' in err

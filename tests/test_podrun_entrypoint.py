@@ -184,14 +184,15 @@ class TestGenerateRunEntrypoint:
         assert 'PODRUN_ALT_ENTRYPOINT' in content
 
     def test_keepalive_branch_present_and_gated(self):
-        """Entrypoint keep-alives only when grace>0 AND there's no baked command."""
+        """Keep-alive gate: grace>0 AND ($# -eq 0 OR force)."""
         path = generate_run_entrypoint(_default_ns())
         with open(path) as f:
             content = f.read()
         assert PODRUN_GRACE_PATH in content
-        # gated on grace > 0 AND no baked command ($# -eq 0)
+        assert 'read -r _grace _force' in content
         assert '"$_grace" -gt 0' in content
         assert '[ $# -eq 0 ]' in content
+        assert '[ "$_force" = force ]' in content
         # presence loop over /proc, counting PPID-0 processes (attached iff >1)
         assert '/proc/' in content
         assert '"$_n" -gt 1' in content
@@ -199,32 +200,48 @@ class TestGenerateRunEntrypoint:
         assert "trap 'exit 0' TERM INT" in content
 
     @staticmethod
-    def _keepalive_block(path):
-        """Extract the keep-alive `if [ "$_grace"... ] ...; then ... fi` block."""
+    def _keepalive_block(path, grace_file):
+        """Extract the keep-alive block, re-pointed at *grace_file* for testing."""
         with open(path) as f:
             content = f.read()
-        start = content.index('if [ "$_grace" -gt 0 ]')
+        start = content.index('_grace=0')
         done_idx = content.index('done', start)
         fi_idx = content.index('\nfi\n', done_idx)
-        return content[start : fi_idx + 3]
+        block = content[start : fi_idx + 3]
+        return block.replace(PODRUN_GRACE_PATH, grace_file)
 
-    def test_keepalive_skipped_when_baked_command_present(self):
-        """With a baked command ($# > 0), keep-alive is skipped so the command
-        runs (preserving `podman start` semantics — the user's concern)."""
-        block = self._keepalive_block(generate_run_entrypoint(_default_ns()))
-        # $# > 0 → gate false → block does nothing → reaches DONE immediately.
-        harness = f'_grace=99\nset -- somecommand\n{block}\necho DONE\n'
-        result = subprocess.run(['sh', '-c', harness], capture_output=True, text=True, timeout=5)
-        assert result.returncode == 0
-        assert 'DONE' in result.stdout
+    def _run_keepalive(self, tmp_path, grace_contents, argv):
+        """Run the extracted keep-alive block with a grace file + positional args.
 
-    def test_keepalive_engaged_when_no_command(self):
-        """With no baked command ($# == 0) and grace>0, keep-alive loops (holds
-        the container) — so it does not fall through to DONE."""
-        block = self._keepalive_block(generate_run_entrypoint(_default_ns()))
-        harness = f'_grace=99\n{block}\necho DONE\n'  # no `set --` → $# == 0
-        with pytest.raises(subprocess.TimeoutExpired):
-            subprocess.run(['sh', '-c', harness], capture_output=True, text=True, timeout=3)
+        Returns 'keepalive' if it looped (timed out) or 'fell-through' if it
+        passed the gate and reached the marker.
+        """
+        gf = tmp_path / 'grace'
+        gf.write_text(grace_contents)
+        block = self._keepalive_block(generate_run_entrypoint(_default_ns()), str(gf))
+        setargs = ('set -- ' + ' '.join(argv) + '\n') if argv else ''
+        harness = f'{setargs}{block}\necho FELL_THROUGH\n'
+        try:
+            r = subprocess.run(['sh', '-c', harness], capture_output=True, text=True, timeout=3)
+            return 'fell-through' if 'FELL_THROUGH' in r.stdout else 'unknown'
+        except subprocess.TimeoutExpired:
+            return 'keepalive'
+
+    def test_keepalive_no_command(self, tmp_path):
+        """No baked command + grace>0 → keep-alive."""
+        assert self._run_keepalive(tmp_path, '15\n', []) == 'keepalive'
+
+    def test_keepalive_skipped_when_baked_command(self, tmp_path):
+        """Baked command + grace>0 (no force) → skip keep-alive, run the command."""
+        assert self._run_keepalive(tmp_path, '15\n', ['somecommand']) == 'fell-through'
+
+    def test_keepalive_forced_over_baked_command(self, tmp_path):
+        """`force` token → keep-alive even with a baked command (podrun re-attach)."""
+        assert self._run_keepalive(tmp_path, '15 force\n', ['somecommand']) == 'keepalive'
+
+    def test_keepalive_disabled_when_grace_zero(self, tmp_path):
+        """grace=0 → never keep-alive."""
+        assert self._run_keepalive(tmp_path, '0\n', []) == 'fell-through'
 
     def test_keepalive_runs_on_every_start_not_first_run_only(self):
         """The keep-alive branch is in the shared tail, outside the READY guard."""

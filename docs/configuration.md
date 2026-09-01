@@ -302,24 +302,27 @@ while any `exec` is attached and exits `startGrace` seconds after the last one
 detaches (the idle grace also covers the gap between `start` and the first
 `exec`).
 
-Keep-alive engages **only when both** are true:
+Whether a `start` keeps alive depends on **who is driving it**:
 
-1. the `start` is **detached** (no `-a`/`--attach`) — a **foreground**
-   `podman start -a` (podrun's own re-attach) is unaffected and drops you into
-   a shell; and
-2. the container has **no baked command** — if you created it with a command
-   (`podrun run … -- <cmd>`), a detached `start` re-runs that command
-   (standard `podman start` semantics), *not* keep-alive.
-
-So:
+- **`podrun run` re-attach** (podrun is about to `exec` — it *knows* a session
+  is coming): always keep-alive, **bypassing any baked command**, then exec
+  your shell/command. PID 1 stays the keep-alive loop, so closing your shell
+  can't tear the container down under a coexisting devcontainer-CLI session.
+- **External `start`** (devcontainer CLI, or a manual `podman start` — no exec
+  is guaranteed): keep-alive only when the container has **no baked command**;
+  if you created it with a command (`podrun run … -- <cmd>`), an external
+  `start` re-runs that command (standard `podman start` semantics).
 
 ```bash
-podrun run --session --name X            # no command → detached start keeps alive (adoptable)
-podrun run --session --name X -- <cmd>   # has command → detached start re-runs <cmd>
+podrun run --session --name X            # re-attach → keep-alive + exec shell
+podrun run --session --name X -- <cmd>   # re-attach → keep-alive + exec <cmd>
+devcontainer up --docker-path podrun …   # external → keep-alive (adoptable)
+podman start X                           # external, X baked with a cmd → runs the cmd
 ```
 
-**`startGrace`** sets the idle-grace window (seconds). It **defaults to 15s**,
-so devcontainer-CLI adoption of a command-less container works out of the box.
+**`startGrace`** sets the idle-grace window (seconds) — how long the container
+lingers after the last `exec` detaches. It **defaults to 15s**, so
+devcontainer-CLI adoption of a command-less container works out of the box.
 Set it in `customizations.podrun` (or per-invocation via `podrun run --grace
 <n>` / `podrun start --grace <n>`):
 
@@ -330,9 +333,11 @@ Set it in `customizations.podrun` (or per-invocation via `podrun run --grace
 }
 ```
 
-Set `startGrace: 0` to **disable** keep-alive (a detached start then behaves
-like a plain `podman start`). Existing behavior is unchanged either way,
-because podrun's own re-attach is foreground and never keep-alives.
+Set `startGrace: 0` to **disable** keep-alive for *external* starts (a detached
+`podman start` then behaves like a plain start). Existing usage is unaffected:
+a non-user-overlay named container still re-attaches with foreground
+`podman start -a`, and `podrun run` re-attach only ever *adds* the keep-alive
+loop as PID 1 (your shell runs via `exec` on top).
 
 **Adoption:** when a `devcontainer.json` is present, podrun stamps the two
 labels the devcontainer CLI discovers by (`devcontainer.local_folder` /

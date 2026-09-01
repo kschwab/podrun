@@ -1215,25 +1215,32 @@ def _grace_key(ns: dict) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]', '_', str(key))
 
 
-def _write_grace(ns: dict, value: int) -> str:
+def _write_grace(ns: dict, value: int, force: bool = False) -> str:
     """Create/overwrite this container's grace control file and return its
     daemon-visible host path.
 
     The file holds the keep-alive idle-grace seconds the entrypoint reads on
-    ``start`` (``0`` = keep-alive off).  Mirrors :func:`_write_sha_file`'s
-    staging/daemon split for nested-remote correctness.
+    ``start`` (``0`` = keep-alive off).  When *force* is set, a ``force`` token
+    is appended so the entrypoint keep-alives even when a command is baked
+    (used by podrun's own re-attach, which always follows the start with an
+    ``exec``).  Mirrors :func:`_write_sha_file`'s staging/daemon split for
+    nested-remote correctness.
     """
     filename = f'grace_{_grace_key(ns)}'
     write_dir = os.path.join(_staging_dir(), 'grace')
     pathlib.Path(write_dir).mkdir(parents=True, exist_ok=True)
-    _set_grace_value(os.path.join(write_dir, filename), value)
+    _set_grace_value(os.path.join(write_dir, filename), value, force=force)
     return os.path.join(_daemon_dir(), 'grace', filename)
 
 
-def _set_grace_value(host_path: str, value: int) -> None:
-    """Overwrite the grace control file at *host_path* with *value* seconds."""
+def _set_grace_value(host_path: str, value: int, force: bool = False) -> None:
+    """Overwrite the grace control file with ``<value> [force]``.
+
+    *force* makes the entrypoint keep-alive regardless of a baked command
+    (see :func:`generate_run_entrypoint`).
+    """
     with open(host_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(f'{int(value)}\n')
+        f.write(f'{int(value)} force\n' if force else f'{int(value)}\n')
 
 
 def _coerce_grace(value, default: int = DEFAULT_START_GRACE) -> int:
@@ -2205,26 +2212,38 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
           set -- "$PODRUN_ALT_ENTRYPOINT" "$@"
         fi
 
-        # Keep-alive: on a detached `start`, podrun writes the grace control
-        # file with an idle-grace > 0. Hold the container up while any exec
-        # is attached (exec roots and PID 1 show PPID 0 in the container PID
-        # namespace, so "attached" means the PPID-0 count > 1), exiting
-        # `_grace` seconds after the last exec detaches. A foreground start
-        # leaves grace at 0 and falls through to the normal shell/exec.
+        # Keep-alive: podrun writes the grace control file (``<seconds> [force]``)
+        # before a `start`. Hold the container up while any exec is attached
+        # (exec roots and PID 1 show PPID 0 in the container PID namespace, so
+        # "attached" means the PPID-0 count > 1), exiting `_grace` seconds after
+        # the last exec detaches.
         #
-        # Only engage when there is NO baked command ($# -eq 0): with a command
-        # we run it (preserving `podman start` semantics); without one the
-        # fallback is a shell, which on a detached start has no TTY, reads EOF
-        # and exits immediately — so keep-alive is exactly what's needed to hold
-        # the container for an incoming exec.
+        # Engage when grace>0 AND ($# -eq 0 OR force). Without a baked command
+        # the fallback is a shell, which on a detached start has no TTY, reads
+        # EOF and exits immediately — so keep-alive holds the container for an
+        # incoming exec. With a baked command we normally run it (preserving
+        # `podman start` semantics), UNLESS `force` is set: podrun's own
+        # re-attach forces it, because it always follows the start with an exec
+        # and must not run the baked command as PID 1 (which, if closed, would
+        # kill a coexisting devcontainer-CLI session).
 
+        _grace=0
+        _force=""
         if [ -f {PODRUN_GRACE_PATH} ]; then
-          _grace=$(cat {PODRUN_GRACE_PATH} 2>/dev/null || echo 0)
-        else
-          _grace=0
+          read -r _grace _force < {PODRUN_GRACE_PATH} 2>/dev/null || true
         fi
-        if [ "$_grace" -gt 0 ] 2>/dev/null && [ $# -eq 0 ]; then
+        _keepalive=0
+        if [ "$_grace" -gt 0 ] 2>/dev/null; then
+          if [ $# -eq 0 ] || [ "$_force" = force ]; then _keepalive=1; fi
+        fi
+        if [ "$_keepalive" = 1 ]; then
           trap 'exit 0' TERM INT
+          # Poll every ~5s (capped below grace for tiny windows): the poll is the
+          # sampling rate for detecting an exec leaving — a seconds-scale concern
+          # independent of the (possibly large) idle grace.  A negligible /proc
+          # scan, not a busy spin.
+          _poll=5
+          if [ "$_grace" -lt 5 ]; then _poll=$_grace; fi
           _idle=""
           while :; do
             _n=0
@@ -2239,7 +2258,7 @@ def generate_run_entrypoint(ns: dict, caps_to_drop: Optional[list] = None) -> st
               if [ -z "$_idle" ]; then _idle=$_now; fi
               if [ "$((_now - _idle))" -ge "$_grace" ]; then exit 0; fi
             fi
-            sleep 2
+            sleep "$_poll"
           done
         fi
 
@@ -6069,27 +6088,27 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
     if action == 'restart':
         name = ns['run.name']
         pt = ns.get('run.passthrough_args') or []
-        has_cmd = bool(ctx.explicit_command) or len(ctx.trailing_args or []) > 1
         grace_managed = bool(ns.get('run.user_overlay')) and not _is_remote(ctx.podman_path)
-        if has_cmd and grace_managed:
-            # An explicit command on re-attach → start the container detached
-            # with keep-alive so it stays up, then exec the command (reusing
-            # _exec_attach). Bare `podrun run` (no command) keeps the foreground
-            # restart below.
+        if grace_managed:
+            # podrun always follows a re-attach with an exec, so force keep-alive
+            # (bypassing any baked command) and start the container DETACHED, then
+            # exec. PID 1 stays the keep-alive loop — closing our exec'd shell
+            # can't kill the container out from under a coexisting devcontainer-CLI
+            # session. Uniform for bare `podrun run` and `podrun run -- <cmd>`.
             start_cmd = [ctx.podman_path] + global_flags + ['start', name]
             if ns.get('root.print_cmd'):
                 print(shlex.join(start_cmd))
                 _exec_attach(ctx, global_flags)  # prints the exec command, exits
                 return
-            _write_grace(ns, _coerce_grace(ns.get('run.start_grace')))
+            grace = _coerce_grace(ns.get('run.start_grace')) or DEFAULT_START_GRACE
+            _write_grace(ns, grace, force=True)
             res = run_os_cmd(shlex.join(start_cmd))
             if res.returncode != 0:
                 print(res.stderr or f'Error: failed to start {name!r}', file=sys.stderr)
                 sys.exit(res.returncode or 1)
             _exec_attach(ctx, global_flags)
             return
-        # Bare restart: foreground re-attach (unchanged behavior), but reset the
-        # grace file to 0 first so a stale keep-alive value can't hijack PID 1.
+        # Non-user-overlay / remote container: foreground re-attach (unchanged).
         cmd = [ctx.podman_path] + global_flags + ['start', '-a']
         if ns.get('run.interactive_overlay') or '-i' in pt or '--interactive' in pt:
             cmd.append('-i')
@@ -6097,8 +6116,6 @@ def _handle_run(ctx: 'PodrunContext'):  # noqa: C901
         if ns.get('root.print_cmd'):
             print(shlex.join(cmd))
             sys.exit(0)
-        if grace_managed:
-            _write_grace(ns, 0)
         _exec_or_subprocess(cmd, os.environ.copy())
 
     if action == 'attach':
